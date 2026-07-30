@@ -5,6 +5,7 @@ const {
     refreshConvergedBaseline,
     validatePendingRecovery,
 } = require('../out/sync/replicaPlanner');
+const { decideReconciliation } = require('../out/sync/reconcile');
 
 function snap(path, hash, fileType = 'doc', entityId, localIdentity) {
     return { path, hash, fileType, entityId, localIdentity, text: fileType === 'doc' ? hash : undefined };
@@ -117,5 +118,172 @@ describe('replica planning', () => {
             new Map(),
             new Map([['main.tex', snap('main.tex', 'base', 'doc', 'doc-1')]]),
         ));
+    });
+
+    it('keeps a merge push pending after the remote write but before local writeback', () => {
+        const pending = {
+            id: 'merge-push', kind: 'push', path: 'main.tex', startedAt: new Date(0).toISOString(),
+            expectedLocalHash: 'local-branch', expectedRemoteHash: 'remote-branch',
+            targetHash: 'merged-target',
+        };
+        const outcome = validatePendingRecovery(
+            pending,
+            new Map([['main.tex', snap('main.tex', 'local-branch')]]),
+            new Map([['main.tex', snap('main.tex', 'merged-target', 'doc', 'doc-1')]]),
+        );
+
+        assert.deepStrictEqual(outcome, { kind: 'strict' });
+        assert.notStrictEqual(pending.expectedLocalHash, pending.targetHash);
+    });
+
+    it('does not claim a push completed when only local remains at target and remote advanced', () => {
+        const pending = {
+            id: 'push', kind: 'push', path: 'main.tex', startedAt: new Date(0).toISOString(),
+            expectedLocalHash: 'target', expectedRemoteHash: 'base', targetHash: 'target',
+        };
+        assert.throws(() => validatePendingRecovery(
+            pending,
+            new Map([['main.tex', snap('main.tex', 'target')]]),
+            new Map([['main.tex', snap('main.tex', 'remote-third', 'doc', 'doc-1')]]),
+        ), /Cannot prove recovery ancestry/);
+    });
+
+    it('commits a landed document pull before treating a newer remote revision as a new delta', () => {
+        const current = state();
+        current.entries['sections/appendix.tex'] = {
+            entityId: 'doc-1', fileType: 'doc', hash: 'base', text: 'base text', localIdentity: '1:2',
+        };
+        const pending = {
+            id: 'pull-1', kind: 'pull', path: 'sections/appendix.tex',
+            startedAt: new Date(0).toISOString(),
+            expectedLocalHash: 'base', expectedRemoteHash: 'pulled', targetHash: 'pulled',
+        };
+        const localTarget = {
+            ...snap('sections/appendix.tex', 'pulled', 'doc', undefined, '1:2'),
+            text: 'pulled text',
+        };
+        const remoteThird = {
+            ...snap('sections/appendix.tex', 'third', 'doc', 'doc-1'),
+            text: 'third text',
+        };
+        const local = new Map([['sections/appendix.tex', localTarget]]);
+        const remote = new Map([['sections/appendix.tex', remoteThird]]);
+
+        const recovery = validatePendingRecovery(
+            pending, local, remote, current.entries['sections/appendix.tex'],
+        );
+        assert.strictEqual(recovery.kind, 'recovered-pull');
+        current.entries['sections/appendix.tex'] = recovery.baseline;
+
+        assert.deepStrictEqual(current.entries['sections/appendix.tex'], {
+            entityId: 'doc-1',
+            fileType: 'doc',
+            hash: 'pulled',
+            text: 'pulled text',
+            treeHash: undefined,
+            localIdentity: '1:2',
+        });
+        assert.deepStrictEqual(decideReconciliation(
+            current.entries['sections/appendix.tex'], localTarget, remoteThird,
+        ), { action: 'pull' });
+    });
+
+    it('commits a landed binary pull before treating newer remote bytes as a new delta', () => {
+        const current = state();
+        current.entries['figures/result.png'] = {
+            entityId: 'file-1', fileType: 'file', hash: 'base', localIdentity: '2:3',
+        };
+        const pending = {
+            id: 'pull-binary', kind: 'pull', path: 'figures/result.png',
+            startedAt: new Date(0).toISOString(),
+            expectedLocalHash: 'base', expectedRemoteHash: 'pulled', targetHash: 'pulled',
+        };
+        const localTarget = snap('figures/result.png', 'pulled', 'file', undefined, '2:3');
+        const remoteThird = snap('figures/result.png', 'third', 'file', 'file-1');
+        const local = new Map([['figures/result.png', localTarget]]);
+        const remote = new Map([['figures/result.png', remoteThird]]);
+
+        const recovery = validatePendingRecovery(
+            pending, local, remote, current.entries['figures/result.png'],
+        );
+        assert.strictEqual(recovery.kind, 'recovered-pull');
+        current.entries['figures/result.png'] = recovery.baseline;
+
+        assert.deepStrictEqual(current.entries['figures/result.png'], {
+            entityId: 'file-1',
+            fileType: 'file',
+            hash: 'pulled',
+            text: undefined,
+            treeHash: undefined,
+            localIdentity: '2:3',
+        });
+        assert.deepStrictEqual(decideReconciliation(
+            current.entries['figures/result.png'], localTarget, remoteThird,
+        ), { action: 'pull' });
+    });
+
+    it('still fails closed when the pull destination is neither its pre-state nor target', () => {
+        const baseline = {
+            entityId: 'doc-1', fileType: 'doc', hash: 'base', text: 'base text',
+        };
+        const pending = {
+            id: 'pull-1', kind: 'pull', path: 'main.tex',
+            startedAt: new Date(0).toISOString(),
+            expectedLocalHash: 'base', expectedRemoteHash: 'target', targetHash: 'target',
+        };
+        assert.throws(() => validatePendingRecovery(
+            pending,
+            new Map([['main.tex', snap('main.tex', 'unrelated')]]),
+            new Map([['main.tex', snap('main.tex', 'target', 'doc', 'doc-1')]]),
+            baseline,
+        ), /Cannot prove recovery ancestry/);
+    });
+
+    it('fails closed when a landed pull now points at a replacement remote entity', () => {
+        const baseline = {
+            entityId: 'doc-1', fileType: 'doc', hash: 'base', text: 'base text',
+        };
+        const pending = {
+            id: 'pull-1', kind: 'pull', path: 'main.tex',
+            startedAt: new Date(0).toISOString(),
+            expectedLocalHash: 'base', expectedRemoteHash: 'target', targetHash: 'target',
+        };
+        assert.throws(() => validatePendingRecovery(
+            pending,
+            new Map([['main.tex', snap('main.tex', 'target')]]),
+            new Map([['main.tex', snap('main.tex', 'third', 'doc', 'replacement-doc')]]),
+            baseline,
+        ), /Cannot prove recovery ancestry/);
+    });
+
+    it('recovers the persisted UniDFKD appendix pull journal without weakening identity checks', () => {
+        const baseline = {
+            entityId: '6a6aeb82ee2d179ed3303093',
+            fileType: 'doc',
+            hash: '28f30d53ab4180a883937a38e6587e8526d5b549b64ae9a8b5f6a2620edc4071',
+            text: 'old appendix',
+        };
+        const pending = {
+            id: '635525d7-0a1b-4b40-8728-5673b3db6393',
+            kind: 'pull',
+            path: 'sections/appendix.tex',
+            startedAt: '2026-07-30T16:43:29.205Z',
+            expectedLocalHash: baseline.hash,
+            expectedRemoteHash: 'bd7bcc89b36a3e80a26b8d09dd29598abff1a499b980c930ac4d480d3752f61c',
+            targetHash: 'bd7bcc89b36a3e80a26b8d09dd29598abff1a499b980c930ac4d480d3752f61c',
+        };
+        const local = new Map([['sections/appendix.tex', {
+            ...snap('sections/appendix.tex', pending.targetHash, 'doc', undefined, '66307:105260143'),
+            text: 'landed appendix',
+        }]]);
+        const remote = new Map([['sections/appendix.tex', {
+            ...snap('sections/appendix.tex', 'later-overleaf-hash', 'doc', baseline.entityId),
+            text: 'later appendix',
+        }]]);
+
+        const recovery = validatePendingRecovery(pending, local, remote, baseline);
+        assert.strictEqual(recovery.kind, 'recovered-pull');
+        assert.strictEqual(recovery.baseline.hash, pending.targetHash);
+        assert.strictEqual(recovery.baseline.text, 'landed appendix');
     });
 });

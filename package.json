@@ -2,7 +2,8 @@
   "name": "overleaf-workshop-safe-sync",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "1.0.0-hershel.7",
+  "version": "1.0.0-hershel.19",
+  "hershelBuildId": "20260730T223000Z-safe-sync-rc19",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -792,6 +793,7 @@
     "lint": "eslint src --ext ts",
     "test": "npm run test:unit",
     "test:unit": "npm run compile:ts && mocha \"test/**/*.test.js\"",
+    "verify:safe-sync-release": "bash scripts/verify-safe-sync-release.sh",
     "prepare": "husky install"
   },
   "dependencies": {

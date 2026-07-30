@@ -154,13 +154,20 @@ export function refreshConvergedBaseline(
     state.entries = nextEntries;
 }
 
+export type PendingRecoveryOutcome =
+    | { kind: 'strict' }
+    | { kind: 'recovered-pull'; baseline: BaselineEntry };
+
 export function validatePendingRecovery(
     pending: PendingReplicaAction,
     local: Map<string, ReplicaSnapshot>,
     remote: Map<string, ReplicaSnapshot>,
-): void {
-    const localHash = local.get(pending.path)?.hash;
-    const remoteHash = remote.get(pending.path)?.hash;
+    baseline?: BaselineEntry,
+): PendingRecoveryOutcome {
+    const localEntry = local.get(pending.path);
+    const remoteEntry = remote.get(pending.path);
+    const localHash = localEntry?.hash;
+    const remoteHash = remoteEntry?.hash;
     const targetLocalHash = pending.targetPath
         ? local.get(pending.targetPath)?.hash
         : localHash;
@@ -193,6 +200,16 @@ export function validatePendingRecovery(
             }
             break;
         case 'pull':
+            if (
+                localEntry
+                && remoteEntry
+                && localEntry.fileType !== 'folder'
+                && localHash === pending.targetHash
+                && remoteHash !== pending.expectedRemoteHash
+                && remoteHash !== pending.targetHash
+            ) {
+                return recoveredPullOutcome(pending, localEntry, remoteEntry, baseline);
+            }
             if (!allowed(
                 remoteHash,
                 pending.expectedRemoteHash === undefined,
@@ -237,6 +254,41 @@ export function validatePendingRecovery(
             }
             break;
     }
+    return { kind: 'strict' };
+}
+
+function recoveredPullOutcome(
+    pending: PendingReplicaAction,
+    localTarget: ReplicaSnapshot,
+    currentRemote: ReplicaSnapshot,
+    baseline: BaselineEntry | undefined,
+): PendingRecoveryOutcome {
+    const expectedType = baseline?.fileType ?? localTarget.fileType;
+    const expectedEntityId = pending.entityId ?? baseline?.entityId;
+    const journalIdentityMismatch = pending.entityId !== undefined
+        && baseline?.entityId !== undefined
+        && pending.entityId !== baseline.entityId;
+    if (
+        journalIdentityMismatch
+        || localTarget.fileType !== expectedType
+        || currentRemote.fileType !== expectedType
+        || expectedEntityId === undefined
+        || currentRemote.entityId !== expectedEntityId
+        || (localTarget.fileType === 'doc' && localTarget.text === undefined)
+    ) {
+        throw new Error(`Cannot prove recovery ancestry for pending pull of ${pending.path}`);
+    }
+    return {
+        kind: 'recovered-pull',
+        baseline: {
+            entityId: currentRemote.entityId!,
+            fileType: localTarget.fileType,
+            hash: localTarget.hash,
+            text: localTarget.fileType === 'doc' ? localTarget.text : undefined,
+            treeHash: localTarget.fileType === 'folder' ? localTarget.treeHash : undefined,
+            localIdentity: localTarget.localIdentity,
+        },
+    };
 }
 
 export function isPathConflicted(path: string, state: ReplicaState): boolean {

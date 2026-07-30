@@ -9,6 +9,7 @@ import { LangIntellisenseProvider } from './intellisense';
 import { LocalReplicaSCMProvider } from './scm/localReplicaSCM';
 import { GlobalStateManager } from './utils/globalStateManager';
 import { registerSafeSyncE2E } from './sync/e2eRunner';
+import { createLocalReplicaBinding, ensureLocalReplicaBinding } from './sync/localBinding';
 
 export async function activate(context: vscode.ExtensionContext) {
     await GlobalStateManager.initialize(context);
@@ -36,6 +37,36 @@ export async function activate(context: vscode.ExtensionContext) {
     // activate vfs for local replica
     LocalReplicaSCMProvider.readSettings()
     .then(async setting => {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.length === 1
+            ? vscode.workspace.workspaceFolders[0].uri
+            : undefined;
+        if (!setting && workspaceRoot?.scheme === 'file') {
+            const matches = GlobalStateManager.findProjectSCMsByBaseUri(
+                context,
+                LocalReplicaSCMProvider.label,
+                workspaceRoot,
+            );
+            if (matches.length > 1) {
+                throw new Error('Multiple Overleaf projects claim this local replica directory');
+            }
+            const match = matches[0];
+            if (match) {
+                const remoteUri = vscode.Uri.parse(
+                    `${URI_SCHEME}://${match.serverName}/${encodeURIComponent(match.project.name)}`
+                    + `?user=${match.project.userId}&project=${match.project.id}`,
+                );
+                await ensureLocalReplicaBinding(
+                    workspaceRoot.fsPath,
+                    createLocalReplicaBinding(
+                        remoteUri.toString(),
+                        match.serverName,
+                        match.project.name,
+                    ),
+                    match.project.id,
+                );
+                setting = await LocalReplicaSCMProvider.readSettings();
+            }
+        }
         if (setting?.uri) {
             const uri = vscode.Uri.parse(setting.uri);
             if (uri.scheme===URI_SCHEME) {
@@ -54,7 +85,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // A local binding may activate before its server credentials have been
         // added to this independent extension. Keep the workspace untouched;
         // login followed by a window reload will retry the prefetch.
-        console.warn('Safe-sync local binding is waiting for Overleaf login', error);
+        console.warn('Safe-sync local binding activation failed', error);
     });
 }
 

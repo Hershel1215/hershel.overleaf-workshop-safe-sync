@@ -40,13 +40,16 @@ server and project. They read credentials only through VS Code SecretStorage,
 write a redacted `safe-sync-e2e.result.json`, isolate fixtures under a unique
 folder, remove those fixtures at the end, and retain the project itself.
 
-The executable remote suite verifies SecretStorage authentication, project
-creation/reuse, byte-exact binary upload/readback, stable entity IDs across
-move/rename, two live clients making concurrent same-revision edits, final
-three-client convergence, and exact catch-up-history replay. The remaining
-crash-injection and local watcher scenarios are covered by the deterministic
-unit/integration harness and must still be exercised manually for a release
-candidate when the VS Code host can be terminated under test control.
+The executable remote suite verifies the exact loaded extension build before
+any mutation. It then exercises the production Local Replica watcher for
+remote-to-local text and binary pulls, local-to-remote text and resource
+uploads, overlapping local/remote text edits, dirty-editor/external-writer OT
+convergence, SVG/PNG classification, concurrent binary conflict archival and
+explicit resolution, ignored conflict artifacts, bidirectional move/rename,
+two-client OT convergence, exact catch-up replay, and residue-free cleanup.
+ACK-loss recovery, reverse server ordering, conflicting tree operations,
+duplicate locks, and every journal action boundary are exercised by the
+deterministic integration suites.
 
 Required scenarios:
 

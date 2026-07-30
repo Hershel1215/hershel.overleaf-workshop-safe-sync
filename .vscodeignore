@@ -5,6 +5,7 @@ test/**
 dist/**
 patches/**
 docs/**
+scripts/**
 .github/**
 .husky/**
 commitlint.config.js

@@ -17,6 +17,7 @@ import {
     validatePendingRecovery,
 } from '../sync/replicaPlanner';
 import { ReplicaLock } from '../sync/replicaLock';
+import { SerialTaskQueue } from '../sync/serialTaskQueue';
 import {
     BaselineEntry,
     ConflictRecord,
@@ -32,6 +33,7 @@ import {
     normalizeRelativePath,
     shouldIgnore,
 } from '../sync/syncPolicy';
+import { createLocalReplicaBinding, ensureLocalReplicaBinding } from '../sync/localBinding';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 const TEXT_DEBOUNCE_MS = 350;
@@ -53,6 +55,26 @@ interface ScanPair {
     remote: Map<string, ReplicaSnapshot>;
 }
 
+export interface LocalReplicaRuntimeStatus {
+    active: boolean;
+    lockHeld: boolean;
+    startupSettled: boolean;
+    paused: boolean;
+    initialized: boolean;
+    pendingAction: boolean;
+    conflictCount: number;
+    settled: boolean;
+    idle: boolean;
+}
+
+export interface LocalReplicaNamespaceCleanup {
+    localRemoved: boolean;
+    remoteRemoved: boolean;
+    removedBaselineEntries: number;
+}
+
+type ConflictResolution = 'remote' | 'local' | 'both';
+
 /**
  * A durable, fail-closed local replica of one Overleaf project.
  *
@@ -62,6 +84,8 @@ interface ScanPair {
  */
 export class LocalReplicaSCMProvider extends BaseSCM {
     public static readonly label = vscode.l10n.t('Local Replica');
+
+    private static readonly activeInstances = new Map<string, LocalReplicaSCMProvider>();
 
     public readonly iconPath: vscode.ThemeIcon = new vscode.ThemeIcon('shield');
 
@@ -74,11 +98,82 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private vfsWatcher?: vscode.FileSystemWatcher;
     private localWatcher?: vscode.FileSystemWatcher;
     private reconcileTimer?: NodeJS.Timeout;
-    private reconcileQueue: Promise<void> = Promise.resolve();
+    private readonly reconcileQueue = new SerialTaskQueue();
     private pausedError?: Error;
     private disposed = false;
+    private lockHeld = false;
+    private startupSettled = false;
+    private activeReconcileCount = 0;
     private lastScan?: ScanPair;
     private lastReport = 'Safe sync has not scanned this replica yet.';
+
+    public static getRuntimeStatus(basePath: string): LocalReplicaRuntimeStatus | undefined {
+        const instance = LocalReplicaSCMProvider.activeInstances.get(path.resolve(basePath));
+        if (!instance) {
+            return undefined;
+        }
+        const pendingAction = instance.state?.pendingAction !== undefined;
+        const conflictCount = Object.keys(instance.state?.conflicts ?? {}).length;
+        const active = !instance.disposed;
+        const settled = active
+            && instance.lockHeld
+            && instance.startupSettled
+            && instance.pausedError === undefined
+            && instance.activeReconcileCount === 0
+            && instance.reconcileQueue.isIdle
+            && instance.reconcileTimer === undefined
+            && instance.pendingReasons.size === 0;
+        return {
+            active,
+            lockHeld: instance.lockHeld,
+            startupSettled: instance.startupSettled,
+            paused: instance.pausedError !== undefined,
+            initialized: instance.state?.initialized === true,
+            pendingAction,
+            conflictCount,
+            settled,
+            idle: settled
+                && instance.status.status === 'idle'
+                && !pendingAction
+                && conflictCount === 0,
+        };
+    }
+
+    public static cleanupNamespace(
+        basePath: string,
+        namespace: string,
+    ): Promise<LocalReplicaNamespaceCleanup> {
+        if (!/^hershel-e2e-[a-zA-Z0-9_-]+$/.test(namespace)) {
+            throw new Error(`Refusing to clean non-E2E namespace: ${namespace}`);
+        }
+        const instance = LocalReplicaSCMProvider.activeInstances.get(path.resolve(basePath));
+        if (!instance) {
+            throw new Error(`No active Local Replica runtime for ${path.resolve(basePath)}`);
+        }
+        return instance.reconcileQueue.run(async () => {
+            instance.activeReconcileCount++;
+            try {
+                return await instance.cleanupReservedNamespace(namespace);
+            } finally {
+                instance.activeReconcileCount--;
+            }
+        });
+    }
+
+    public static resolveE2EConflictUsingRemote(
+        basePath: string,
+        filePath: string,
+    ): Promise<string> {
+        if (!/^hershel-e2e-[a-zA-Z0-9_-]+\/.+/.test(filePath)
+            || filePath.split('/').some(part => part === '' || part === '.' || part === '..')) {
+            throw new Error(`Refusing to resolve non-E2E conflict: ${filePath}`);
+        }
+        const instance = LocalReplicaSCMProvider.activeInstances.get(path.resolve(basePath));
+        if (!instance) {
+            throw new Error(`No active Local Replica runtime for ${path.resolve(basePath)}`);
+        }
+        return instance.enqueueConflictResolution(filePath, 'remote');
+    }
 
     constructor(
         protected readonly vfs: VirtualFileSystem,
@@ -193,14 +288,30 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private async initWatch(): Promise<vscode.Disposable[]> {
         this.disposed = false;
+        this.startupSettled = false;
         if (this.baseUri.scheme !== 'file') {
             throw new Error('Safe local replicas require a file:// directory');
         }
+        await ensureLocalReplicaBinding(
+            this.baseUri.fsPath,
+            createLocalReplicaBinding(
+                this.vfs.origin.toString(),
+                this.vfs.serverName,
+                this.vfs.projectName,
+            ),
+            this.vfs.projectId,
+        );
         this.lock = await ReplicaLock.acquire(
             this.context.globalStorageUri.fsPath,
             this.baseUri.fsPath,
-            { onLost: error => this.failProject(error) },
+            {
+                onLost: error => {
+                    this.lockHeld = false;
+                    this.failProject(error);
+                },
+            },
         );
+        this.lockHeld = true;
         await this.vfs.init();
         try {
             this.state = await this.stateStore.load();
@@ -235,8 +346,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }),
         ];
 
-        if (!this.pausedError) {
-            await this.reconcileUntilStable('startup');
+        LocalReplicaSCMProvider.activeInstances.set(path.resolve(this.baseUri.fsPath), this);
+
+        try {
+            if (!this.pausedError) {
+                await this.enqueueReconcile('startup');
+            }
+        } finally {
+            this.startupSettled = true;
         }
 
         return [
@@ -251,9 +368,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
                 try {
                     this.lock?.releaseSync();
+                    this.lockHeld = false;
                 } catch (error) {
                     console.error('Failed to release safe-sync replica lock', error);
                 }
+                this.unregisterRuntime();
             }),
         ];
     }
@@ -266,10 +385,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         try {
             this.lock?.releaseSync();
+            this.lockHeld = false;
         } catch (error) {
             console.error('Failed to release safe-sync replica lock', error);
         }
+        this.unregisterRuntime();
         this.output.dispose();
+    }
+
+    private unregisterRuntime(): void {
+        const key = path.resolve(this.baseUri.fsPath);
+        if (LocalReplicaSCMProvider.activeInstances.get(key) === this) {
+            LocalReplicaSCMProvider.activeInstances.delete(key);
+        }
     }
 
     private onLocalFileEvent(uri: vscode.Uri, kind: string): void {
@@ -292,9 +420,35 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.reconcileTimer = undefined;
             const reasons = [...this.pendingReasons].join(', ');
             this.pendingReasons.clear();
-            const next = this.reconcileQueue.then(() => this.reconcileUntilStable(reasons));
-            this.reconcileQueue = next.catch(error => this.handleReconcileError(error));
+            void this.enqueueReconcile(reasons);
         }, delayMs);
+    }
+
+    private enqueueReconcile(reason: string): Promise<void> {
+        return this.reconcileQueue
+            .run(async () => {
+                this.activeReconcileCount++;
+                try {
+                    await this.reconcileUntilStable(reason);
+                } finally {
+                    this.activeReconcileCount--;
+                }
+            })
+            .catch(error => this.handleReconcileError(error));
+    }
+
+    private enqueueConflictResolution(
+        filePath: string,
+        resolution: ConflictResolution,
+    ): Promise<string> {
+        return this.reconcileQueue.run(async () => {
+            this.activeReconcileCount++;
+            try {
+                return await this.resolveConflictRecord(filePath, resolution);
+            } finally {
+                this.activeReconcileCount--;
+            }
+        });
     }
 
     private async reconcileUntilStable(reason: string): Promise<void> {
@@ -307,8 +461,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.renderReport(scan, reason);
 
             if (this.state.pendingAction) {
-                validatePendingRecovery(this.state.pendingAction, scan.local, scan.remote);
-                if (this.pendingActionCompleted(this.state.pendingAction, scan)) {
+                const pending = this.state.pendingAction;
+                const recovery = validatePendingRecovery(
+                    pending,
+                    scan.local,
+                    scan.remote,
+                    this.state.entries[pending.path],
+                );
+                if (recovery.kind === 'recovered-pull') {
+                    this.state.entries[pending.path] = recovery.baseline;
+                    this.state.pendingAction = undefined;
+                    await this.stateStore.save(this.state);
+                    continue;
+                }
+                if (this.pendingActionCompleted(pending, scan)) {
                     refreshConvergedBaseline(this.state, scan.local, scan.remote);
                     this.state.pendingAction = undefined;
                     await this.stateStore.save(this.state);
@@ -350,6 +516,70 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
         }
         throw new Error(`Safe sync exceeded ${MAX_RECONCILE_ACTIONS} actions without converging`);
+    }
+
+    private async cleanupReservedNamespace(
+        namespace: string,
+    ): Promise<LocalReplicaNamespaceCleanup> {
+        if (this.disposed || !this.lockHeld || !this.state) {
+            throw new Error('Local Replica runtime is not ready for E2E cleanup');
+        }
+        if (this.pausedError) {
+            throw new Error(`Local Replica is paused: ${this.pausedError.message}`);
+        }
+        if (!this.state.initialized) {
+            throw new Error('Local Replica baseline is not initialized');
+        }
+        if (this.state.pendingAction) {
+            throw new Error(
+                `Cannot clean E2E namespace with pending ${this.state.pendingAction.kind}`,
+            );
+        }
+        if (Object.keys(this.state.conflicts).length > 0) {
+            throw new Error('Cannot clean E2E namespace while conflicts are active');
+        }
+
+        const before = await this.scanBoth();
+        const local = before.local.get(namespace);
+        const remote = before.remote.get(namespace);
+        if (remote) {
+            await this.vfs.remove(this.remoteUri(namespace), true);
+        }
+        if (local) {
+            await this.deleteLocalSnapshot(namespace, local);
+        }
+
+        const after = await this.scanBoth();
+        const remainsIn = (entries: Map<string, ReplicaSnapshot>) => (
+            [...entries.keys()].some(candidate => (
+                candidate === namespace || candidate.startsWith(`${namespace}/`)
+            ))
+        );
+        if (remainsIn(after.remote) || remainsIn(after.local)) {
+            throw new Error(`E2E namespace cleanup did not converge: ${namespace}`);
+        }
+
+        let removedBaselineEntries = 0;
+        for (const filePath of Object.keys(this.state.entries)) {
+            if (filePath === namespace || filePath.startsWith(`${namespace}/`)) {
+                delete this.state.entries[filePath];
+                removedBaselineEntries++;
+            }
+        }
+        for (const filePath of [...this.binaryStability.keys()]) {
+            if (filePath === namespace || filePath.startsWith(`${namespace}/`)) {
+                this.binaryStability.delete(filePath);
+            }
+        }
+        await this.stateStore.save(this.state);
+        this.lastScan = after;
+        this.renderReport(after, `exclusive E2E cleanup: ${namespace}`);
+        this.status = {status: 'idle', message: 'Safe sync converged'};
+        return {
+            localRemoved: local !== undefined,
+            remoteRemoved: remote !== undefined,
+            removedBaselineEntries,
+        };
     }
 
     private async reconcileOne(scan: ScanPair): Promise<ReconcileStep> {
@@ -464,6 +694,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 && remote
                 && remote.entityId !== baseline.entityId
                 && local?.hash !== baseline.hash
+                && (
+                    !local
+                    || local.fileType !== remote.fileType
+                    || local.hash !== remote.hash
+                )
             ) {
                 await this.createConflict(
                     filePath,
@@ -503,11 +738,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 local,
                 scan.remote.get(filePath),
                 contentHash(variants.mergedContent),
-                () => this.writeLocalContent(
+                () => this.writeMergedLocalVariants(
                     filePath,
                     variants.mergedContent!,
-                    variants.editorHash,
-                    true,
+                    variants,
                 ),
             );
             return 'acted';
@@ -790,7 +1024,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             expectedLocalHash: local?.hash,
             expectedRemoteHash: remote?.hash,
             targetHash,
-            entityId,
+            entityId: entityId ?? remote?.entityId,
         };
         await this.stateStore.save(state);
         this.status = {
@@ -1113,6 +1347,64 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         ) {
             throw new StaleLocalSnapshotError(
                 `Local content changed while saving synchronized text: ${filePath}`,
+                visibleAfter,
+            );
+        }
+    }
+
+    private async writeMergedLocalVariants(
+        filePath: string,
+        content: Uint8Array,
+        variants: NonNullable<ReplicaSnapshot['localVariants']>,
+    ): Promise<void> {
+        const uri = this.localUri(filePath);
+        const openDocument = vscode.workspace.textDocuments
+            .find(document => document.uri.fsPath === uri.fsPath);
+        if (!openDocument || !openDocument.isDirty) {
+            throw new StaleLocalSnapshotError(`Dirty editor closed during merge: ${filePath}`);
+        }
+        const diskBefore = await vscode.workspace.fs.readFile(uri);
+        const editorBefore = new TextEncoder().encode(openDocument.getText());
+        if (
+            contentHash(diskBefore) !== variants.diskHash
+            || contentHash(editorBefore) !== variants.editorHash
+        ) {
+            throw new StaleLocalSnapshotError(
+                `Editor or disk content changed during merge: ${filePath}`,
+                editorBefore,
+            );
+        }
+
+        const edit = new vscode.WorkspaceEdit();
+        const end = openDocument.positionAt(openDocument.getText().length);
+        edit.replace(
+            uri,
+            new vscode.Range(new vscode.Position(0, 0), end),
+            new TextDecoder().decode(content),
+        );
+        if (!await vscode.workspace.applyEdit(edit)) {
+            throw new Error(`VS Code could not update the merged editor buffer for ${filePath}`);
+        }
+        const diskAtWrite = await vscode.workspace.fs.readFile(uri);
+        if (contentHash(diskAtWrite) !== variants.diskHash) {
+            throw new StaleLocalSnapshotError(
+                `Disk content changed again during merge: ${filePath}`,
+                new TextEncoder().encode(openDocument.getText()),
+            );
+        }
+
+        // TextDocument.save() intentionally rejects this case because the disk
+        // changed behind a dirty editor. Both variants were archived above, so
+        // materialize the proven OT result to disk after the double hash check.
+        await vscode.workspace.fs.writeFile(uri, content);
+        const diskAfter = await vscode.workspace.fs.readFile(uri);
+        const visibleAfter = new TextEncoder().encode(openDocument.getText());
+        if (
+            contentHash(diskAfter) !== contentHash(content)
+            || contentHash(visibleAfter) !== contentHash(content)
+        ) {
+            throw new StaleLocalSnapshotError(
+                `Merged editor and disk snapshots did not converge: ${filePath}`,
                 visibleAfter,
             );
         }
@@ -1657,31 +1949,92 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (!resolution) {
             return;
         }
-        const scan = await this.scanBoth();
         const record = selected.record;
-        if (resolution === useRemote) {
-            await this.restoreRemotePath(record.path, scan);
-        } else {
-            await this.restoreRemotePath(record.path, scan);
-            delete state.conflicts[record.path];
-            const canonicalScan = await this.scanBoth();
-            refreshConvergedBaseline(state, canonicalScan.local, canonicalScan.remote);
+        const choice: ConflictResolution = resolution === useRemote
+            ? 'remote'
+            : resolution === useLocal ? 'local' : 'both';
+        try {
+            await this.enqueueConflictResolution(record.path, choice);
+        } catch (error) {
+            this.handleReconcileError(error);
+        }
+    }
+
+    private async resolveConflictRecord(
+        filePath: string,
+        resolution: ConflictResolution,
+    ): Promise<string> {
+        const state = this.requireState();
+        if (this.disposed || !this.lockHeld || this.pausedError || !state.initialized) {
+            throw new Error('Local Replica runtime is not ready for conflict resolution');
+        }
+        if (state.pendingAction) {
+            throw new Error(`Cannot resolve a conflict with pending ${state.pendingAction.kind}`);
+        }
+        const record = state.conflicts[filePath];
+        if (!record) {
+            throw new Error(`No active conflict exists for ${filePath}`);
+        }
+
+        const scan = await this.scanBoth();
+        const local = scan.local.get(filePath);
+        const remote = scan.remote.get(filePath);
+        if (remote) {
+            await this.journalAction(
+                'resolve-conflict',
+                filePath,
+                local,
+                remote,
+                remote.hash,
+                () => this.restoreRemotePath(filePath, scan),
+                undefined,
+                remote.entityId,
+            );
+        } else if (local) {
+            await this.journalAction(
+                'delete-local',
+                filePath,
+                local,
+                undefined,
+                undefined,
+                () => this.restoreRemotePath(filePath, scan),
+            );
+        }
+
+        const canonicalScan = await this.scanBoth();
+        if (!this.isSubtreeConverged(filePath, canonicalScan)) {
+            throw new Error(`Conflict resolution did not converge ${filePath}`);
+        }
+        if (state.pendingAction) {
+            if (!this.pendingActionCompleted(state.pendingAction, canonicalScan)) {
+                throw new Error(`Conflict resolution journal did not complete for ${filePath}`);
+            }
+            state.pendingAction = undefined;
+        }
+        delete state.conflicts[filePath];
+        refreshConvergedBaseline(state, canonicalScan.local, canonicalScan.remote);
+        state.conflicts[filePath] = record;
+        await this.stateStore.save(state);
+
+        if (resolution !== 'remote') {
             if (record.localFile) {
-                const target = resolution === keepBoth
+                const target = resolution === 'both'
                     ? this.conflictSibling(record.path)
                     : record.path;
                 await this.copyLocalTree(record.localFile, target);
-            } else if (resolution === useLocal) {
-                const local = canonicalScan.local.get(record.path);
-                if (local) {
-                    await this.deleteLocalSnapshot(record.path, local);
+            } else if (resolution === 'local') {
+                const canonicalLocal = canonicalScan.local.get(record.path);
+                if (canonicalLocal) {
+                    await this.deleteLocalSnapshot(record.path, canonicalLocal);
                 }
             }
         }
+
+        const resolvedArtifactDirectory = await this.moveConflictToResolved(record);
         delete state.conflicts[record.path];
-        await this.moveConflictToResolved(record);
         await this.stateStore.save(state);
         this.scheduleReconcile(`conflict resolved: ${record.path}`, 0);
+        return resolvedArtifactDirectory;
     }
 
     private async restoreRemotePath(
@@ -1778,7 +2131,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    private async moveConflictToResolved(record: ConflictRecord): Promise<void> {
+    private async moveConflictToResolved(record: ConflictRecord): Promise<string> {
         const target = record.artifactDirectory.replace(
             '.overleaf/conflicts/unresolved/',
             '.overleaf/conflicts/resolved/',
@@ -1789,6 +2142,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.localUri(target),
             { overwrite: false },
         );
+        return target;
     }
 
     private conflictSibling(filePath: string): string {
@@ -1843,7 +2197,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.pausedError = undefined;
         try {
             this.state = await this.stateStore.load();
-            await this.reconcileUntilStable('manual retry');
+            await this.enqueueReconcile('manual retry');
         } catch (error) {
             this.failProject(this.asError(error));
         }
@@ -1974,11 +2328,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             {
                 label: 'Synchronize now',
                 callback: async () => {
-                    try {
-                        await this.reconcileUntilStable('manual synchronization');
-                    } catch (error) {
-                        this.handleReconcileError(error);
-                    }
+                    await this.enqueueReconcile('manual synchronization');
                 },
             },
             {

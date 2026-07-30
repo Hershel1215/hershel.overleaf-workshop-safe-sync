@@ -28,6 +28,12 @@ export interface ProjectSCMPersist {
 }
 type ProjectSCMPersistMap = {[name: string]: ProjectSCMPersist};
 
+export interface ProjectSCMPersistMatch {
+    serverName: string;
+    project: ProjectPersist;
+    scm: ProjectSCMPersist;
+}
+
 type PdfViewPersist = {
     frequency: number,
     state: any,
@@ -224,6 +230,34 @@ export class GlobalStateManager {
         const project  = server.login?.projects?.find(project => project.id===projectId);
         const scmPersists = project?.scm ? project.scm as ProjectSCMPersistMap : {};
         return scmPersists;
+    }
+
+    static findProjectSCMsByBaseUri(
+        context: vscode.ExtensionContext,
+        label: string,
+        baseUri: vscode.Uri,
+    ): ProjectSCMPersistMatch[] {
+        const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
+        const matches: ProjectSCMPersistMatch[] = [];
+        for (const server of Object.values(persists)) {
+            for (const project of server.login?.projects ?? []) {
+                const scms = Object.values((project.scm ?? {}) as ProjectSCMPersistMap);
+                for (const scm of scms) {
+                    const configured = scm.baseUri.startsWith('/')
+                        ? vscode.Uri.file(scm.baseUri)
+                        : vscode.Uri.parse(scm.baseUri);
+                    if (
+                        scm.label === label
+                        && (scm.enabled ?? true)
+                        && configured.scheme === 'file'
+                        && configured.fsPath === baseUri.fsPath
+                    ) {
+                        matches.push({ serverName: server.name, project, scm });
+                    }
+                }
+            }
+        }
+        return matches;
     }
 
     static updateServerProjectSCMPersist(context:vscode.ExtensionContext, serverName:string, projectId:string, scmKey:string, scmPersist?:ProjectSCMPersist) {

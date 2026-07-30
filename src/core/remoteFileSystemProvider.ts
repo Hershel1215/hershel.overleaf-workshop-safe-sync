@@ -543,17 +543,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileMoved: (entityId:string, folderId:string) => {
-                const oldPath = this._resolveById(entityId);
-                const newPath = this._resolveById(folderId);
-                if (oldPath && newPath) {
-                    const newParentFolder = newPath.fileEntity as FolderEntity;
-                    this.insertEntity(newParentFolder, oldPath.fileType, oldPath.fileEntity);
-                    this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
-                    this.notify([
-                        {type: vscode.FileChangeType.Deleted, uri: this.pathToUri(oldPath.path)},
-                        {type: vscode.FileChangeType.Created, uri: this.pathToUri(newPath.path, oldPath.fileEntity.name)}
-                    ]);
-                }
+                this.applyRemoteMove(entityId, folderId);
             },
             onFileChanged: (update:UpdateSchema) => {
                 const res = this._resolveById(update.doc);
@@ -600,6 +590,27 @@ export class VirtualFileSystem extends vscode.Disposable {
                 // }
             },
         });
+    }
+
+    private applyRemoteMove(entityId: string, folderId: string): void {
+        const oldPath = this._resolveById(entityId);
+        const destination = this._resolveById(folderId);
+        if (!oldPath || !destination || destination.fileType !== 'folder') {
+            return;
+        }
+        const newParentFolder = destination.fileEntity as FolderEntity;
+        if (oldPath.parentFolder._id === newParentFolder._id) {
+            return;
+        }
+        this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
+        this.insertEntity(newParentFolder, oldPath.fileType, oldPath.fileEntity);
+        this.notify([
+            {type: vscode.FileChangeType.Deleted, uri: this.pathToUri(oldPath.path)},
+            {
+                type: vscode.FileChangeType.Created,
+                uri: this.pathToUri(destination.path, oldPath.fileEntity.name),
+            },
+        ]);
     }
 
     pathToUri(...path: string[]): vscode.Uri {
@@ -1117,16 +1128,15 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (fileType && fileEntity) {
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
             const res = await this.api.deleteEntity(identity, this.projectId, fileType, fileEntity._id);
-            if (res.type==='success') {
-                this.removeEntityById(parentFolder, fileType, fileEntity._id, recursive);
-                this.notify([
-                    {type: vscode.FileChangeType.Deleted, uri: uri},
-                ]);
-            } else {
-                if (res.message!==undefined) {
-                    vscode.window.showErrorMessage(res.message);
-                }
+            if (res.type!=='success') {
+                throw new Error(
+                    `Could not delete remote ${fileType} ${uri.path}: ${res.message ?? 'unknown error'}`,
+                );
             }
+            this.removeEntityById(parentFolder, fileType, fileEntity._id, recursive);
+            this.notify([
+                {type: vscode.FileChangeType.Deleted, uri: uri},
+            ]);
         }
     }
 

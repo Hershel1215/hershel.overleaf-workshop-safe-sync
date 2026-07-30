@@ -78,20 +78,30 @@ class VirtualOtServer {
     }
 }
 
-function randomTarget(value) {
+function seededRandom(seed) {
+    return () => {
+        seed |= 0;
+        seed = seed + 0x6D2B79F5 | 0;
+        let value = Math.imul(seed ^ seed >>> 15, 1 | seed);
+        value = value + Math.imul(value ^ value >>> 7, 61 | value) ^ value;
+        return ((value ^ value >>> 14) >>> 0) / 4294967296;
+    };
+}
+
+function randomTarget(value, random) {
     const boundaries = [0];
     let offset = 0;
     for (const character of value) {
         offset += character.length;
         boundaries.push(offset);
     }
-    const startIndex = Math.floor(Math.random() * boundaries.length);
+    const startIndex = Math.floor(random() * boundaries.length);
     const start = boundaries[startIndex];
     const maxDeletePoints = Math.min(3, boundaries.length - startIndex - 1);
-    const deletePoints = Math.floor(Math.random() * (maxDeletePoints + 1));
+    const deletePoints = Math.floor(random() * (maxDeletePoints + 1));
     const deleteCount = boundaries[startIndex + deletePoints] - start;
     const alphabet = ['L', 'R', '中', '😀', '\n'];
-    const insert = alphabet[Math.floor(Math.random() * alphabet.length)];
+    const insert = alphabet[Math.floor(random() * alphabet.length)];
     return value.slice(0, start) + insert + value.slice(start + deleteCount);
 }
 
@@ -113,24 +123,25 @@ describe('document protocol integration', () => {
     });
 
     it('converges randomized overlapping edits and composed pending edits', async () => {
-        for (let run = 0; run < 75; run++) {
+        for (let run = 1; run <= 250; run++) {
+            const random = seededRandom(run);
             const server = new VirtualOtServer('abcdef');
             const left = await server.addClient(`left-${run}`);
             const right = await server.addClient(`right-${run}`);
-            const firstLeft = randomTarget(left.session.content);
-            const firstRight = randomTarget(right.session.content);
+            const firstLeft = randomTarget(left.session.content, random);
+            const firstRight = randomTarget(right.session.content, random);
             const writes = [
                 left.session.submitSnapshot(firstLeft),
                 right.session.submitSnapshot(firstRight),
             ];
-            const secondLeft = randomTarget(firstLeft);
+            const secondLeft = randomTarget(firstLeft, random);
             writes.push(left.session.submitSnapshot(secondLeft));
             await flush();
 
             await server.drain(run % 2 === 0);
             await Promise.all(writes);
-            assert.strictEqual(left.session.content, server.content);
-            assert.strictEqual(right.session.content, server.content);
+            assert.strictEqual(left.session.content, server.content, `left diverged for seed ${run}`);
+            assert.strictEqual(right.session.content, server.content, `right diverged for seed ${run}`);
             assert.deepStrictEqual(left.errors, []);
             assert.deepStrictEqual(right.errors, []);
             server.dispose();

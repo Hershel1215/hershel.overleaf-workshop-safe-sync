@@ -334,24 +334,36 @@ export class TextOperation {
     }
 
     static fromLegacyEdits(base: string, edits: readonly LegacyTextEdit[], decode = (value: string) => value): TextOperation {
-        let target = base;
+        assertWellFormedUtf16(base);
+        let current = base;
+        let operation = new TextOperation().retain(base.length);
         for (const edit of edits) {
-            if (!Number.isInteger(edit.p) || edit.p < 0 || edit.p > target.length) {
+            if (!Number.isInteger(edit.p) || edit.p < 0 || edit.p > current.length) {
                 throw new Error(`Invalid legacy edit position: ${edit.p}`);
             }
             if (edit.i !== undefined) {
                 const insertion = decode(edit.i);
-                target = target.slice(0, edit.p) + insertion + target.slice(edit.p);
+                const insert = new TextOperation()
+                    .retain(edit.p)
+                    .insert(insertion)
+                    .retain(current.length - edit.p);
+                operation = operation.compose(insert);
+                current = insert.apply(current);
             }
             if (edit.d !== undefined) {
                 const deletion = decode(edit.d);
-                if (target.slice(edit.p, edit.p + deletion.length) !== deletion) {
+                if (current.slice(edit.p, edit.p + deletion.length) !== deletion) {
                     throw new Error('Legacy deletion does not match the current document content');
                 }
-                target = target.slice(0, edit.p) + target.slice(edit.p + deletion.length);
+                const remove = new TextOperation()
+                    .retain(edit.p)
+                    .remove(deletion.length)
+                    .retain(current.length - edit.p - deletion.length);
+                operation = operation.compose(remove);
+                current = remove.apply(current);
             }
         }
-        return TextOperation.fromDiff(base, target);
+        return operation;
     }
 
     private mutableComponents(): MutableComponent[] {

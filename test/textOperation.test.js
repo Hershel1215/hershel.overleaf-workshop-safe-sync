@@ -106,6 +106,20 @@ describe('TextOperation', () => {
         const edits = operation.toLegacyEdits(base);
         const restored = TextOperation.fromLegacyEdits(base, edits);
         assert.strictEqual(restored.apply(base), target);
+        assert.strictEqual(restored.equals(operation), true);
+    });
+
+    it('preserves legacy edit anchors needed by later concurrent operations', () => {
+        const base = 'abcdeRf';
+        const operation = TextOperation.fromJSON([
+            { kind: 'retain', count: 3 },
+            { kind: 'insert', text: 'R' },
+            { kind: 'delete', count: 2 },
+            { kind: 'retain', count: 1 },
+            { kind: 'delete', count: 1 },
+        ]);
+        const restored = TextOperation.fromLegacyEdits(base, operation.toLegacyEdits(base));
+        assert.deepStrictEqual(restored.toJSON(), operation.toJSON());
     });
 
     it('rejects legacy deletions that do not match the base', () => {
