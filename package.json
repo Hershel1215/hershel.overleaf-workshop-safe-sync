@@ -1,14 +1,14 @@
 {
-  "name": "overleaf-workshop",
+  "name": "overleaf-workshop-safe-sync",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.10",
+  "version": "1.0.0-hershel.1",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
     "email": "ychong@petalmail.com"
   },
-  "publisher": "iamhyc",
+  "publisher": "hershel",
   "contributors": [
     {
       "name": "iamhyc",
@@ -779,11 +779,13 @@
     "postinstall": "patch-package && npm run download-pdfjs && npm run download-latex-basics",
     "vscode:prepublish": "npm run compile",
     "update-l10n": "npx @vscode/l10n-dev export -o ./l10n ./src",
-    "compile": "tsc -p ./ && cd views/chat-view && npm run build",
+    "compile:ts": "tsc -p ./",
+    "compile": "npm run compile:ts && cd views/chat-view && npm run build",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js",
+    "test": "npm run test:unit",
+    "test:unit": "npm run compile:ts && mocha \"test/**/*.test.js\"",
     "prepare": "husky install"
   },
   "dependencies": {
@@ -824,5 +826,9 @@
   "extensionKind": [
     "workspace",
     "ui"
-  ]
+  ],
+  "overrides": {
+    "brace-expansion@^1.0.0": "1.1.18",
+    "brace-expansion@^2.0.0": "2.1.4"
+  }
 }

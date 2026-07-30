@@ -60,12 +60,19 @@ export class SCMCollectionProvider extends vscode.Disposable {
     ) {
         // define the dispose behavior
         super(() => {
-            this.scms.forEach(scm => scm.triggers.forEach(t => t.dispose()));
+            this.scms.forEach(({scm, triggers}) => {
+                triggers.forEach(trigger => trigger.dispose());
+                if (scm instanceof LocalReplicaSCMProvider) {
+                    scm.dispose();
+                }
+            });
         });
 
         this.core = new CoreSCMProvider( vfs );
         this.historyDataProvider = new HistoryViewProvider( vfs );
-        this.initSCMs();
+        this.initSCMs().catch(error => {
+            console.error('Failed to initialize Overleaf source controls', error);
+        });
 
         this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         this.statusBarItem.command = `${ROOT_NAME}.projectSCM.configSCM`;
@@ -120,26 +127,46 @@ export class SCMCollectionProvider extends vscode.Disposable {
         this.statusBarItem.show();
     }
 
-    private initSCMs() {
+    private async initSCMs(): Promise<void> {
         const scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, this.vfs.serverName, this.vfs.projectId);
-        Object.values(scmPersists).forEach(async scmPersist => {
+        const records = Object.values(scmPersists);
+        for (const scmPersist of records) {
             const scmProto = supportedSCMs.find(scm => scm.label===scmPersist.label);
             if (scmProto!==undefined) {
                 const enabled = scmPersist.enabled ?? true;
-                const baseUri = vscode.Uri.parse(scmPersist.baseUri);
+                const baseUri = scmPersist.baseUri.startsWith('/')
+                    ? vscode.Uri.file(scmPersist.baseUri)
+                    : vscode.Uri.parse(scmPersist.baseUri);
                 await this.createSCM(scmProto, baseUri, false, enabled);
             }
-        });
+        }
+        if (records.length === 0) {
+            const settings = await LocalReplicaSCMProvider.readSettings();
+            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
+            if (settings?.uri && workspaceRoot?.scheme === 'file') {
+                const configured = vscode.Uri.parse(settings.uri);
+                const configuredProject = new URLSearchParams(configured.query).get('project');
+                if (
+                    configured.authority === this.vfs.serverName
+                    && configuredProject === this.vfs.projectId
+                ) {
+                    // The local metadata is an explicit prior binding. Register a
+                    // fresh fail-closed replica, which will only produce a preview
+                    // until the user selects its first trusted baseline.
+                    await this.createSCM(LocalReplicaSCMProvider, workspaceRoot, true, true);
+                }
+            }
+        }
     }
 
     private async createSCM(scmProto: SupportedSCM, baseUri: vscode.Uri, newSCM=false, enabled=true) {
-        const scm = new scmProto(this.vfs, baseUri);
+        const scm = new scmProto(this.vfs, baseUri, this.context);
         // insert into global state
         if (newSCM) {
             this.vfs.setProjectSCMPersist(scm.scmKey, {
                 enabled: enabled,
                 label: scmProto.label,
-                baseUri: scm.baseUri.path,
+                baseUri: scm.baseUri.toString(),
                 settings: {} as JSON,
             });
         }
@@ -162,6 +189,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
         if (index!==-1) {
             // remove from collection
             item.triggers.forEach(trigger => trigger.dispose());
+            if (item.scm instanceof LocalReplicaSCMProvider) {
+                item.scm.dispose();
+            }
             this.scms.splice(index, 1);
             // remove from global state
             this.vfs.setProjectSCMPersist(item.scm.scmKey, undefined);
@@ -245,7 +275,12 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     break;
                 default:
                     const settingItem = settingItems.find(item => item.label===select.label);
-                    settingItem?.callback();
+                    try {
+                        await settingItem?.callback();
+                    } catch (error) {
+                        const message = error instanceof Error ? error.message : String(error);
+                        vscode.window.showErrorMessage(message);
+                    }
                     break;
             }
         });

@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
-import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
@@ -9,6 +8,10 @@ import { ClientManager } from '../collaboration/clientManager';
 import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
+import { DocumentSession } from '../sync/documentSession';
+import { DocumentStateStore } from '../sync/documentStateStore';
+import { contentHash } from '../sync/syncPolicy';
+import { evaluateSafeSyncCapability } from '../sync/capabilityPolicy';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -75,6 +78,30 @@ export interface ProjectEntity {
     settings: ProjectSettingsSchema,
 }
 
+export interface SafeSyncCapability {
+    writable: boolean;
+    protocol: 'legacy-ot-v1' | 'read-only';
+    reason: string;
+}
+
+export interface AuthoritativeFileSnapshot {
+    content: Uint8Array;
+    entityId: string;
+    fileType: 'doc' | 'file';
+    revision?: number;
+}
+
+export interface CreatedTypedFile {
+    entityId: string;
+    content: Uint8Array;
+}
+
+export class ConcurrentRemoteResourceError extends Error {
+    constructor(readonly path: string) {
+        super(`Remote resource changed after the common baseline: ${path}`);
+    }
+}
+
 export class File implements vscode.FileStat {
     type: vscode.FileType;
     name: string;
@@ -128,6 +155,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     private compileGroup?: string;
     private clsiServerId?: string;
     private pdfDownloadDomain?: string;
+    private readonly documentStateStore: DocumentStateStore;
+    private readonly documentSessions = new Map<string, Promise<DocumentSession>>();
     private notify: (events:vscode.FileChangeEvent[])=>void;
     private clientManagerItem?: {manager: ClientManager, triggers: vscode.Disposable[]};
     private scmCollectionItem?: {collection: SCMCollectionProvider, triggers: vscode.Disposable[]};
@@ -148,6 +177,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.scmCollectionItem = undefined;
             // disconnect socketio
             // this.socket.disconnect();
+            this.resetDocumentSessions();
         });
 
         const {userId,projectId,serverName,projectName} = parseUri(uri);
@@ -158,6 +188,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.projectId = projectId;
         this.context = context;
         this.notify = notify;
+        this.documentStateStore = new DocumentStateStore(context, serverName, projectId);
 
         const res = GlobalStateManager.initSocketIOAPI(this.context, this.serverName, projectId);
         if (res) {
@@ -441,6 +472,10 @@ export class VirtualFileSystem extends vscode.Disposable {
             onDisconnected: () => {
                 if (this.root===undefined) { return; } // bypass the first initialization
                 console.log("Disconnected");
+                // Outstanding operations are already durable. Dispose their
+                // timers and rebuild sessions from the server snapshot after
+                // reconnect instead of guessing whether an ACK was lost.
+                this.resetDocumentSessions();
                 // Debounce: ignore rapid disconnect/reconnect cycles (within 2 seconds)
                 const now = Date.now();
                 if (now - this.lastDisconnectTime < 2000) {
@@ -495,6 +530,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const res = this._resolveById(entityId);
                 if (res) {
                     const {parentFolder, fileType, fileEntity} = res;
+                    const session = this.documentSessions.get(entityId);
+                    session?.then(value => value.dispose()).catch(() => {});
+                    this.documentSessions.delete(entityId);
+                    this.documentStateStore.remove(entityId).catch(error => {
+                        console.error(`[hershel-safe-sync] failed to remove state for ${entityId}`, error);
+                    });
                     this.removeEntity(parentFolder, fileType, fileEntity);
                     this.notify([
                         {type: vscode.FileChangeType.Deleted, uri: this.pathToUri(res.path)}
@@ -519,31 +560,24 @@ export class VirtualFileSystem extends vscode.Disposable {
                 if (res===undefined) { return; }
 
                 const doc = res.fileEntity as DocumentEntity;
-                if (update.v===doc.version) {
-                    doc.version += 1;
-                    if (update.op && doc.remoteCache!==undefined) {
-                        let content = doc.remoteCache;
-                        update.op.forEach((op) => {
-                            if (op.i) {
-                                content = content.slice(0, op.p) + op.i + content.slice(op.p);
-                            } else if (op.d) {
-                                const deleteUtf8 = Buffer.from(op.d, 'ascii').toString('utf-8');
-                                content = content.slice(0, op.p) + content.slice(op.p+deleteUtf8.length);
-                            }
+                const session = this.documentSessions.get(update.doc);
+                if (session) {
+                    session
+                        .then(value => value.receiveUpdate(update))
+                        .catch(error => {
+                            console.error(`[hershel-safe-sync] failed to apply update for ${res.path}`, error);
                         });
-                        const _uri = this.pathToUri(res.path).toString();
-                        const _doc = vscode.workspace.textDocuments.find((doc) => doc.uri.toString()===_uri);
-                        // if doc dirty, local cache should diverge from remote cache
-                        if (_doc && !_doc.isDirty) {doc.localCache = content;}
-                        doc.remoteCache = content;
-                        this.isDirty = true;
+                } else {
+                    // An unopened document has no local operations. Invalidate
+                    // its caches and fetch one authoritative snapshot on demand.
+                    doc.remoteCache = undefined;
+                    doc.localCache = undefined;
+                    doc.version = undefined;
+                    if (update.op) {
                         this.notify([
                             {type: vscode.FileChangeType.Changed, uri: this.pathToUri(res.path)}
                         ]);
                     }
-                } else {
-                    doc.remoteCache = undefined;
-                    doc.localCache = undefined;
                 }
             },
             onSpellCheckLanguageUpdated: (language:string) => {
@@ -570,6 +604,228 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     pathToUri(...path: string[]): vscode.Uri {
         return vscode.Uri.joinPath(this.origin, ...path);
+    }
+
+    get supportsRealtimeTextOt(): boolean {
+        return !this.socket.isUsingAlternativeConnectionScheme;
+    }
+
+    get safeSyncCapability(): SafeSyncCapability {
+        return evaluateSafeSyncCapability(
+            this.serverName,
+            this.supportsRealtimeTextOt,
+            this.root?.features?.hershelSafeSyncProtocol,
+        );
+    }
+
+    private getDocumentSession(doc: DocumentEntity, path: string): Promise<DocumentSession> {
+        const existing = this.documentSessions.get(doc._id);
+        if (existing) {
+            return existing;
+        }
+
+        const created = (async () => {
+            if (!this.supportsRealtimeTextOt) {
+                throw new Error('Safe text synchronization requires the realtime Overleaf OT protocol');
+            }
+            const stored = await this.documentStateStore.load(doc._id);
+            let joined;
+            let catchUpUpdates: UpdateSchema[] | undefined;
+            if (stored) {
+                try {
+                    joined = await this.socket.joinDoc(doc._id, stored.state.revision);
+                    if (!Array.isArray(joined.updates)) {
+                        throw new Error('Server did not return an OT catch-up operation list');
+                    }
+                    const updates = joined.updates as UpdateSchema[];
+                    catchUpUpdates = updates;
+                    if (joined.version - stored.state.revision !== updates.length) {
+                        throw new Error(
+                            `Server returned ${updates.length} catch-up operations for `
+                            + `${joined.version - stored.state.revision} revisions`,
+                        );
+                    }
+                } catch (error) {
+                    console.warn(
+                        `[hershel-safe-sync] exact catch-up unavailable for ${doc._id}; using strict snapshot recovery`,
+                        error,
+                    );
+                    joined = await this.socket.joinDoc(doc._id);
+                    catchUpUpdates = undefined;
+                }
+            } else {
+                joined = await this.socket.joinDoc(doc._id);
+            }
+            if (joined.otType !== 'sharejs-text-ot') {
+                throw new Error(`Unsupported Overleaf document OT type: ${joined.otType}`);
+            }
+            const serverContent = joined.docLines.join('\n');
+            return DocumentSession.create({
+                documentId: doc._id,
+                content: serverContent,
+                revision: joined.version,
+                savedState: stored?.state,
+                catchUpUpdates,
+                sendUpdate: update => this.socket.applyOtUpdate(doc._id, update as UpdateSchema),
+                persist: state => this.documentStateStore.save(doc._id, state),
+                getSourceId: () => this.publicId,
+                onChange: (content, revision, acknowledgedContent) => {
+                    doc.version = revision;
+                    doc.localCache = content;
+                    doc.remoteCache = acknowledgedContent;
+                    this.isDirty = true;
+                    this.notify([
+                        {type: vscode.FileChangeType.Changed, uri: this.pathToUri(path)}
+                    ]);
+                },
+                onError: error => {
+                    doc.localCache = undefined;
+                    doc.remoteCache = undefined;
+                    console.error(`[hershel-safe-sync] document ${doc._id} paused`, error);
+                    vscode.window.showErrorMessage(
+                        vscode.l10n.t('Safe synchronization paused for {path}: {message}', {
+                            path,
+                            message: error.message,
+                        })
+                    );
+                },
+            });
+        })();
+        this.documentSessions.set(doc._id, created);
+        created.catch(() => {
+            // Keep the rejected promise until reconnect so repeated file reads do
+            // not silently retry a fail-closed document in the same session.
+        });
+        return created;
+    }
+
+    private resetDocumentSessions(): void {
+        for (const session of this.documentSessions.values()) {
+            session.then(value => value.dispose()).catch(() => {});
+        }
+        this.documentSessions.clear();
+    }
+
+    /** Read server-authoritative content without recovering or sending a saved local operation. */
+    async readAuthoritativeFile(uri: vscode.Uri): Promise<AuthoritativeFileSnapshot> {
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (!fileEntity || (fileType !== 'doc' && fileType !== 'file')) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        if (fileType === 'doc') {
+            const existing = this.documentSessions.get(fileEntity._id);
+            if (existing) {
+                const session = await existing;
+                return {
+                    content: new TextEncoder().encode(session.acknowledgedContent),
+                    entityId: fileEntity._id,
+                    fileType,
+                    revision: session.revision,
+                };
+            }
+            const joined = await this.socket.joinDoc(fileEntity._id);
+            if (!Number.isInteger(joined.version) || !Array.isArray(joined.docLines)) {
+                throw new Error(`Server returned an invalid OT snapshot for ${uri.path}`);
+            }
+            if (joined.otType !== 'sharejs-text-ot') {
+                throw new Error(`Unsupported Overleaf document OT type: ${joined.otType}`);
+            }
+            return {
+                content: new TextEncoder().encode(joined.docLines.join('\n')),
+                entityId: fileEntity._id,
+                fileType,
+                revision: joined.version,
+            };
+        }
+        return {
+            content: await this.openFile(uri),
+            entityId: fileEntity._id,
+            fileType,
+        };
+    }
+
+    /** Apply a document change against a proven ancestor, preserving newer OT operations. */
+    async writeDocumentAgainstAncestor(
+        uri: vscode.Uri,
+        ancestor: string,
+        target: string,
+    ): Promise<string> {
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (fileType !== 'doc' || !fileEntity) {
+            throw new Error(`Expected an Overleaf document at ${uri.path}`);
+        }
+        const resolved = this._resolveById(fileEntity._id);
+        const session = await this.getDocumentSession(
+            fileEntity as DocumentEntity,
+            resolved?.path ?? fileEntity.name,
+        );
+        return session.submitSnapshotAgainstAncestor(ancestor, target);
+    }
+
+    /** Replace a resource only when its identity and bytes still match the durable baseline. */
+    async writeResourceAgainstBaseline(
+        uri: vscode.Uri,
+        expectedEntityId: string,
+        expectedHash: string,
+        content: Uint8Array,
+    ): Promise<string> {
+        const before = await this.readAuthoritativeFile(uri);
+        if (
+            before.fileType !== 'file'
+            || before.entityId !== expectedEntityId
+            || contentHash(before.content) !== expectedHash
+        ) {
+            throw new ConcurrentRemoteResourceError(uri.path);
+        }
+        await this.createFile(uri, content, true);
+        const after = await this.readAuthoritativeFile(uri);
+        if (after.fileType !== 'file' || contentHash(after.content) !== contentHash(content)) {
+            throw new Error(`Remote resource read-back verification failed for ${uri.path}`);
+        }
+        return after.entityId;
+    }
+
+    /** Create a new entity using an explicit conservative doc/resource classification. */
+    async createTypedFile(
+        uri: vscode.Uri,
+        content: Uint8Array,
+        fileType: 'doc' | 'file',
+    ): Promise<CreatedTypedFile> {
+        const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
+        if (fileEntity) {
+            throw vscode.FileSystemError.FileExists(uri);
+        }
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        let entity: FileEntity | undefined;
+        if (fileType === 'doc') {
+            const response = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
+            if (response.type === 'success') {
+                entity = response.entity;
+            }
+        } else {
+            const response = await this.api.uploadFile(
+                identity,
+                this.projectId,
+                parentFolder._id,
+                fileName,
+                content,
+            );
+            if (response.type === 'success') {
+                entity = response.entity;
+            }
+        }
+        if (!entity?._type) {
+            throw new Error(`Overleaf did not create ${fileType} ${uri.path}`);
+        }
+        this.insertEntity(parentFolder, entity._type, entity);
+        this.notify([{ type: vscode.FileChangeType.Created, uri }]);
+        let authoritativeContent = content;
+        if (fileType === 'doc' && content.byteLength > 0) {
+            const target = new TextDecoder('utf-8', { fatal: true }).decode(content);
+            const actual = await this.writeDocumentAgainstAncestor(uri, '', target);
+            authoritativeContent = new TextEncoder().encode(actual);
+        }
+        return { entityId: entity._id, content: authoritativeContent };
     }
 
     async resolve(uri: vscode.Uri): Promise<File> {
@@ -614,19 +870,10 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         if (fileType==='doc') {
             const doc = fileEntity as DocumentEntity;
-            if (doc.remoteCache!==undefined) {
-                const content = doc.remoteCache;
-                EventBus.fire('fileWillOpenEvent', {uri});
-                return new TextEncoder().encode(content);
-            } else {
-                const res = await this.socket.joinDoc(fileEntity._id);
-                const content = res.docLines.join('\n');
-                doc.version = res.version;
-                doc.remoteCache = content;
-                doc.localCache  = content;
-                EventBus.fire('fileWillOpenEvent', {uri});
-                return new TextEncoder().encode(content);
-            }
+            const resolved = this._resolveById(doc._id);
+            const session = await this.getDocumentSession(doc, resolved?.path ?? fileEntity.name);
+            EventBus.fire('fileWillOpenEvent', {uri});
+            return new TextEncoder().encode(session.content);
         } else if (fileType==='outputs') {
             const {compileGroup, clsiServerId, pdfDownloadDomain} = this;
             return GlobalStateManager.authenticate(this.context, this.serverName)
@@ -655,7 +902,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean) {
-        const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
+        const {parentFolder, fileName, fileEntity, fileType} = await this._resolveUri(uri);
         if (fileEntity && !overwrite) {
             throw vscode.FileSystemError.FileExists(uri);
         }
@@ -680,6 +927,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
         }
         if (res && res._type) {
+            if (fileEntity && fileType) {
+                this.removeEntity(parentFolder, fileType, fileEntity);
+            }
             this.insertEntity(parentFolder, res._type, res);
             this.notify([
                 {type: vscode.FileChangeType.Created, uri: uri},
@@ -835,59 +1085,12 @@ export class VirtualFileSystem extends vscode.Disposable {
         // if exists and is doc --> update
         if (fileType && fileType==='doc' && fileEntity) {
             const doc = fileEntity as DocumentEntity;
-            const _content = new TextDecoder().decode(content);
-            if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
-                return;
-            }
-            const dmp = new DiffMatchPatch();
-            const patches = dmp.patch_make(doc.localCache,  doc.remoteCache);
-
-            const mergeResArray = dmp.patch_apply(patches, _content);
-            const mergeRes = mergeResArray[0] as string;
-            const update = {
-                doc: doc._id,
-                lastV: doc.lastVersion,
-                v: doc.version,
-                // Reference: services/web/frontend/js/vendor/libs/sharejs.js#L1288
-                hash: (()=>{
-                    if (!doc.mtime || Date.now()-doc.mtime>5000) {
-                        doc.mtime = Date.now();
-                        return require('crypto').createHash('sha1').update(
-                            "blob " + mergeRes.length + "\x00" + mergeRes
-                        ).digest('hex');
-                    }
-                })() as string,
-                op: (()=>{
-                    const remoteCacheAscii = Buffer.from(doc.remoteCache, 'utf-8').toString('utf-8');
-                    const mergeResAscii = Buffer.from(mergeRes, 'utf-8').toString('utf-8');
-                    let currentPos = 0;
-                    return dmp.diff_main(remoteCacheAscii, mergeResAscii)
-                                .map((part) => {
-                                    // part[0] === -1: delete, 0: equal, 1: insert; part[1]: compared content
-                                    const incCount = part[0] === -1 ? 0 : part[1].length;
-                                    currentPos += incCount;
-                                    // add op when content not equal
-                                    if (part[0] !== 0) {
-                                        return {
-                                            p: currentPos - incCount,
-                                            i: part[0] ===  1 ?  part[1] : undefined,
-                                            d: part[0] === -1 ?  part[1] : undefined,
-                                        };
-                                    }
-                                })
-                                .filter(x => x) as any;
-                })(),
-            };
-            this.isDirty = (update.op && update.op.length) ? true : false;
-            await this.socket.applyOtUpdate(doc._id, update);
-            doc.localCache = mergeRes;
-            doc.remoteCache = mergeRes;
-            setTimeout(() => {
-                this.notify([
-                    {type: vscode.FileChangeType.Changed, uri: uri}
-                ]);
-            }, 10);
-            doc.lastVersion = doc.version;                
+            const resolved = this._resolveById(doc._id);
+            const session = await this.getDocumentSession(doc, resolved?.path ?? fileEntity.name);
+            const decoded = new TextDecoder('utf-8', {fatal:true}).decode(content);
+            this.isDirty = decoded !== session.content;
+            await session.submitSnapshot(decoded);
+            this.isDirty = false;
         }
     }
 

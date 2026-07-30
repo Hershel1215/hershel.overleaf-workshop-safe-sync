@@ -46,10 +46,13 @@ export interface UpdateSchema {
     v: number, //doc version number
     lastV?: number, //last version number
     hash?: string, //(not needed if lastV is provided)
+    dupIfSource?: string[], //deduplicate retries submitted by earlier socket ids
+    error?: string,
     meta?: {
-        source: string, //socketio client id
-        ts: number, //unix timestamp
-        user_id: string,
+        source?: string, //socketio client id
+        ts?: number, //unix timestamp
+        user_id?: string,
+        [key:string]: unknown,
     }
 }
 
@@ -380,12 +383,15 @@ export class SocketIOAPI {
      * @param {string} docId - The document id.
      * @returns {Promise}
      */
-    async joinDoc(docId:string) {
-        return this.emit('joinDoc', docId, { encodeRanges: true })
-            .then((returns: [Array<string>, number, Array<any>, any]) => {
-                const [docLinesAscii, version, updates, ranges] = returns;
+    async joinDoc(docId:string, fromVersion?:number) {
+        const args = fromVersion === undefined
+            ? [docId, { encodeRanges: true }]
+            : [docId, fromVersion, { encodeRanges: true, age: 0 }];
+        return this.emit('joinDoc', ...args)
+            .then((returns: [Array<string>, number, Array<UpdateSchema>, any, string?]) => {
+                const [docLinesAscii, version, updates, ranges, otType = 'sharejs-text-ot'] = returns;
                 const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
-                return {docLines, version, updates, ranges};
+                return {docLines, version, updates, ranges, otType};
             });
     }
 

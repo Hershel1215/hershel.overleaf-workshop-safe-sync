@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-hershel.1] - 2026-07-30
+
+- Forked independently as `hershel.overleaf-workshop-safe-sync` from upstream
+  `v0.15.10`.
+- Replaced snapshot overwrite sync with durable Overleaf-compatible text OT,
+  exact reconnect catch-up, and fail-closed recovery.
+- Added persistent replica baselines/action journals, single-writer leases,
+  stable tree identity, binary conflict archiving, explicit baseline selection,
+  conflict resolution, capability gating, and SecretStorage credentials.
+
 ## [0.15.10] - 2026-07-11
 ### Changed
 - fix: enhance connection resilience and fix TCP RST causing spurious connection lost (fixes #309)

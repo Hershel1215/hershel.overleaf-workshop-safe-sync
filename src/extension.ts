@@ -7,8 +7,10 @@ import { PdfViewEditorProvider } from './core/pdfViewEditorProvider';
 import { CompileManager } from './compile/compileManager';
 import { LangIntellisenseProvider } from './intellisense';
 import { LocalReplicaSCMProvider } from './scm/localReplicaSCM';
+import { GlobalStateManager } from './utils/globalStateManager';
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
+    await GlobalStateManager.initialize(context);
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);
     context.subscriptions.push( ...remoteFileSystemProvider.triggers );
@@ -45,6 +47,12 @@ export function activate(context: vscode.ExtensionContext) {
                 }
             }
         }
+    })
+    .catch(error => {
+        // A local binding may activate before its server credentials have been
+        // added to this independent extension. Keep the workspace untouched;
+        // login followed by a window reload will retry the prefetch.
+        console.warn('Safe-sync local binding is waiting for Overleaf login', error);
     });
 }
 

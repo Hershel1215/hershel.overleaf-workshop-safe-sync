@@ -1,11 +1,48 @@
-# Overleaf Workshop
+# Hershel Overleaf Workshop Safe Sync
+
+Independent extension ID: `hershel.overleaf-workshop-safe-sync`.
+
+This fork is based on Overleaf Workshop `v0.15.10` and rewrites the local-replica
+path around Overleaf's versioned text OT protocol. It keeps the existing remote
+workspace, compile, PDF, chat, presence, and comment integrations while making
+local synchronization fail closed.
+
+> [!IMPORTANT]
+> Disable `iamhyc.overleaf-workshop` before enabling this fork. Both extensions
+> intentionally retain the `overleaf-workshop://` URI scheme for compatibility,
+> so they must not run in the same extension host.
+
+## Safe-sync guarantees
+
+- Text edits from VS Code, external scripts, formatters, Codex, and Claude are
+  converted from snapshots to UTF-16 OT operations and resolve only after an
+  authoritative `otUpdateApplied` acknowledgement.
+- A durable operation queue and server `joinDoc(fromVersion)` catch-up prevent
+  ACK-loss duplication. If ancestry cannot be proved, the project pauses.
+- Binary conflicts never use timestamps. The remote file remains canonical;
+  every stable local variant is archived under `.overleaf/conflicts/`.
+- File-tree moves use remote entity IDs and local filesystem identity. Ambiguous
+  move/delete/edit cases pause the affected path or subtree.
+- One extension host owns a local replica directory at a time through a lease.
+- A new replica is preview-only until the user explicitly selects its trusted
+  first baseline. `.overleaf/**` is permanently excluded from upload.
+- Credentials are stored in VS Code SecretStorage, not ordinary global state.
+
+The writable capability is currently validated for `10.10.5.4:8888`. Other
+servers remain read-only unless they advertise `hershelSafeSyncProtocol` as
+`legacy-ot-v1`.
+
+See [safe-sync operations](./docs/safe-sync-operations.md),
+[design](./docs/safe-sync-design.md), and [test matrix](./docs/safe-sync-testing.md).
+
+## Upstream features and attribution
 
 [![GitHub Repo stars](https://img.shields.io/github/stars/overleaf-workshop/Overleaf-Workshop)](https://github.com/overleaf-workshop/Overleaf-Workshop)
 [![version](https://vsmarketplacebadges.dev/version-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop)
 [![installs](https://vsmarketplacebadges.dev/installs-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop)
 [![rating](https://vsmarketplacebadges.dev/rating-short/iamhyc.overleaf-workshop.jpg)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop&ssr=false#review-details)
 
-Open Overleaf (ShareLatex) projects in VSCode, with full collaboration support.
+Open Overleaf (ShareLatex) projects in VS Code, with full collaboration support.
 
 ### User Guide
 

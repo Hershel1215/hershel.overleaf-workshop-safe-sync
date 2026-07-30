@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import * as vscode from 'vscode';
 import { Identity, BaseAPI, ProjectPersist } from '../api/base';
 import { SocketIOAPI } from '../api/socketio';
@@ -12,7 +13,8 @@ export interface ServerPersist {
     login?: {
         userId: string;
         username: string;
-        identity: Identity;
+        /** Only present while migrating releases that stored credentials in globalState. */
+        identity?: Identity;
         projects?: ProjectPersist[]
     };
 }
@@ -33,6 +35,38 @@ type PdfViewPersist = {
 type PdfViewPersistMap = {[uri: string]: PdfViewPersist};
 
 export class GlobalStateManager {
+    private static readonly identityCache = new Map<string, Identity>();
+
+    static async initialize(context: vscode.ExtensionContext): Promise<void> {
+        const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
+        let migrated = false;
+        for (const server of Object.values(persists)) {
+            const legacyIdentity = server.login?.identity;
+            if (legacyIdentity) {
+                await this.storeIdentity(context, server.name, legacyIdentity);
+                delete server.login!.identity;
+                migrated = true;
+                continue;
+            }
+            if (!server.login) {
+                continue;
+            }
+            const serialized = await context.secrets.get(this.secretKey(server.name));
+            if (serialized) {
+                const identity = JSON.parse(serialized) as Identity;
+                this.assertIdentity(identity, server.name);
+                this.identityCache.set(this.cacheKey(context, server.name), identity);
+            } else {
+                // A login record without its secret cannot authenticate. Treat it
+                // as logged out instead of leaving a misleading, half-live state.
+                delete server.login;
+                migrated = true;
+            }
+        }
+        if (migrated) {
+            await context.globalState.update(keyServerPersists, persists);
+        }
+    }
 
     static getServers(context:vscode.ExtensionContext): {server:ServerPersist, api:BaseAPI}[] {
         const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
@@ -68,6 +102,11 @@ export class GlobalStateManager {
         if ( persists[name]!==undefined ) {
             delete persists[name];
             context.globalState.update(keyServerPersists, persists);
+            this.identityCache.delete(this.cacheKey(context, name));
+            context.secrets.delete(this.secretKey(name)).then(
+                undefined,
+                (error: unknown) => console.error(error),
+            );
             return true;
         } else {
             return false;
@@ -84,9 +123,9 @@ export class GlobalStateManager {
                 server.login = {
                     userId: res.userInfo.userId,
                     username: auth.email || res.userInfo.userEmail,
-                    identity: res.identity
                 };
-                context.globalState.update(keyServerPersists, persists);
+                await this.storeIdentity(context, name, res.identity);
+                await context.globalState.update(keyServerPersists, persists);
                 return true;
             } else {
                 if (res.message!==undefined) {
@@ -104,9 +143,12 @@ export class GlobalStateManager {
         const server   = persists[name];
 
         if (server.login!==undefined) {
-            await api.logout(server.login.identity);
+            const identity = await this.loadIdentity(context, name);
+            await api.logout(identity);
             delete server.login;
-            context.globalState.update(keyServerPersists, persists);
+            this.identityCache.delete(this.cacheKey(context, name));
+            await context.secrets.delete(this.secretKey(name));
+            await context.globalState.update(keyServerPersists, persists);
             return true;
         } else {
             return false;
@@ -118,10 +160,11 @@ export class GlobalStateManager {
         const server   = persists[name];
 
         if (server.login!==undefined) {
-            let res = await api.getProjectsJson(server.login.identity);
+            const identity = await this.loadIdentity(context, name);
+            let res = await api.getProjectsJson(identity);
             if (res.type!=='success') {
                 // fallback to `userProjectsJson`
-                res = await api.userProjectsJson(server.login.identity);
+                res = await api.userProjectsJson(identity);
             }
             if (res.type==='success' && res.projects!==undefined) {
                 Object.values(res.projects).forEach(project => {
@@ -158,18 +201,19 @@ export class GlobalStateManager {
     static authenticate(context:vscode.ExtensionContext, name:string) {
         const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
         const server   = persists[name];
-        return server.login!==undefined ?
-                Promise.resolve(server.login.identity):
-                Promise.reject();
+        return server.login !== undefined
+            ? this.loadIdentity(context, name)
+            : Promise.reject(new Error(`Server is not logged in: ${name}`));
     }
 
     static initSocketIOAPI(context:vscode.ExtensionContext, name:string, projectId:string) {
         const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
         const server   = persists[name];
+        const identity = this.identityCache.get(this.cacheKey(context, name));
 
-        if (server.login!==undefined) {
+        if (server.login!==undefined && identity) {
             const api = new ExtendedBaseAPI(server.url);
-            const socket = new SocketIOAPI(server.url, api, server.login.identity, projectId);
+            const socket = new SocketIOAPI(server.url, api, identity, projectId);
             return {api, socket};
         }
     }
@@ -227,6 +271,50 @@ export class GlobalStateManager {
         }
 
         context.globalState.update(keyPdfViewPersists, persists);
+    }
+
+    private static async storeIdentity(
+        context: vscode.ExtensionContext,
+        name: string,
+        identity: Identity,
+    ): Promise<void> {
+        this.assertIdentity(identity, name);
+        await context.secrets.store(this.secretKey(name), JSON.stringify(identity));
+        this.identityCache.set(this.cacheKey(context, name), identity);
+    }
+
+    private static async loadIdentity(
+        context: vscode.ExtensionContext,
+        name: string,
+    ): Promise<Identity> {
+        const cacheKey = this.cacheKey(context, name);
+        const cached = this.identityCache.get(cacheKey);
+        if (cached) {
+            return cached;
+        }
+        const serialized = await context.secrets.get(this.secretKey(name));
+        if (!serialized) {
+            throw new Error(`No stored credentials for Overleaf server: ${name}`);
+        }
+        const identity = JSON.parse(serialized) as Identity;
+        this.assertIdentity(identity, name);
+        this.identityCache.set(cacheKey, identity);
+        return identity;
+    }
+
+    private static assertIdentity(identity: Identity, name: string): void {
+        if (!identity || typeof identity.cookies !== 'string' || typeof identity.csrfToken !== 'string') {
+            throw new Error(`Invalid stored credentials for Overleaf server: ${name}`);
+        }
+    }
+
+    private static secretKey(name: string): string {
+        const digest = createHash('sha256').update(name).digest('hex');
+        return `hershel.overleaf-workshop-safe-sync.identity.${digest}`;
+    }
+
+    private static cacheKey(context: vscode.ExtensionContext, name: string): string {
+        return `${context.extension.id}\0${name}`;
     }
 
 }
