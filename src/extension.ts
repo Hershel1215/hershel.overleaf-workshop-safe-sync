@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ROOT_NAME, ELEGANT_NAME } from './consts';
+import { ROOT_NAME, URI_SCHEME } from './consts';
 
 import { RemoteFileSystemProvider, VirtualFileSystem } from './core/remoteFileSystemProvider';
 import { ProjectManagerProvider } from './core/projectManagerProvider';
@@ -8,9 +8,11 @@ import { CompileManager } from './compile/compileManager';
 import { LangIntellisenseProvider } from './intellisense';
 import { LocalReplicaSCMProvider } from './scm/localReplicaSCM';
 import { GlobalStateManager } from './utils/globalStateManager';
+import { registerSafeSyncE2E } from './sync/e2eRunner';
 
 export async function activate(context: vscode.ExtensionContext) {
     await GlobalStateManager.initialize(context);
+    context.subscriptions.push(...registerSafeSyncE2E(context));
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);
     context.subscriptions.push( ...remoteFileSystemProvider.triggers );
@@ -36,9 +38,9 @@ export async function activate(context: vscode.ExtensionContext) {
     .then(async setting => {
         if (setting?.uri) {
             const uri = vscode.Uri.parse(setting.uri);
-            if (uri.scheme===ROOT_NAME) {
+            if (uri.scheme===URI_SCHEME) {
                 // activate vfs
-                const vfs = (await (await vscode.commands.executeCommand('remoteFileSystem.prefetch', uri))) as VirtualFileSystem;
+                const vfs = (await (await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.prefetch`, uri))) as VirtualFileSystem;
                 await vfs.init();
                 vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activate`, true);
                 // activate compile & preview

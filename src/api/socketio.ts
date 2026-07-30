@@ -86,6 +86,7 @@ export class SocketIOAPI {
 
     private socket?: any;
     private emit: any;
+    private _publicId?: string;
     /** Track the scheme used when the socket was last initialized */
     private _socketInitScheme?: ConnectionScheme;
 
@@ -100,6 +101,7 @@ export class SocketIOAPI {
     init() {
         // Clean up old EventBus listeners before creating new socket
         this._cleanupEventBusListeners();
+        this._publicId = undefined;
 
         // CRITICAL: Properly disconnect old socket before creating a new one.
         // Without this, the old TCP connection is abandoned but still alive. When the
@@ -177,6 +179,9 @@ export class SocketIOAPI {
     }
 
     private initInternalHandlers() {
+        this.socket.on('connectionAccepted', (_:any, publicId:string) => {
+            this._publicId = publicId;
+        });
         this.socket.on('connect', () => {
             console.log('SocketIOAPI: connected');
         });
@@ -209,6 +214,7 @@ export class SocketIOAPI {
             this.record = new Promise(resolve => {
                 this.socket.on('joinProjectResponse', (res:any) => {
                     const publicId = res.publicId as string;
+                    this._publicId = publicId;
                     const project = res.project as ProjectEntity;
                     EventBus.fire('socketioConnectedEvent', {publicId});
                     resolve(project);
@@ -223,6 +229,11 @@ export class SocketIOAPI {
 
     get handlers() {
         return this._handlers;
+    }
+
+    /** Socket source id used by Overleaf to identify acknowledgements. */
+    get sourceId(): string | undefined {
+        return this._publicId;
     }
 
     get isUsingAlternativeConnectionScheme() {

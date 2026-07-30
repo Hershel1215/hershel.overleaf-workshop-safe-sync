@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ROOT_NAME } from '../consts';
+import { ROOT_NAME, URI_SCHEME } from '../consts';
 import { RemoteFileSystemProvider } from '../core/remoteFileSystemProvider';
 
 import { IntellisenseProvider } from '.';
@@ -30,16 +30,21 @@ export class LangIntellisenseProvider {
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -2);
         // Enable CSpell
         const config = vscode.workspace.getConfiguration("cSpell");
-        const enabledSchemes = config.get<Record<string, boolean>>("enabledSchemes") || {}; 
-        enabledSchemes[ROOT_NAME] = true; 
-        config.update("enabledSchemes", enabledSchemes, vscode.ConfigurationTarget.Global);
-        
+        if (config.inspect("enabledSchemes")) {
+            const enabledSchemes = {
+                ...(config.get<Record<string, boolean>>("enabledSchemes") || {}),
+                [URI_SCHEME]: true,
+            };
+            config.update("enabledSchemes", enabledSchemes, vscode.ConfigurationTarget.Global)
+                .then(undefined, error => console.warn('Could not enable CSpell for Overleaf URIs', error));
+        }
+
         this.activate();
     }
 
     async activate() {
         const uri = vscode.workspace.workspaceFolders?.[0].uri;
-        if (uri?.scheme!==ROOT_NAME) { return; }
+        if (uri?.scheme!==URI_SCHEME) { return; }
 
         const vfs = uri && await this.vfsm.prefetch(uri);
         const languageItem = vfs?.getSpellCheckLanguage();
@@ -52,7 +57,7 @@ export class LangIntellisenseProvider {
             this.status.text = '';
             this.status.tooltip = '';
         }
-        this.status.command = 'langIntellisense.settings';
+        this.status.command = `${ROOT_NAME}.langIntellisense.settings`;
         this.status.show();
         setTimeout(this.activate.bind(this), 200);
     }

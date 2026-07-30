@@ -45,16 +45,16 @@ describe('OtClientState', () => {
         const remoteResult = state.receive(remote, 0, false);
         assert.strictEqual(remoteResult.localChanged, true);
         assert.strictEqual(state.acknowledgedContent, 'aRb');
-        assert.strictEqual(state.visibleContent, 'aRLXb');
+        assert.strictEqual(state.visibleContent, 'aLXRb');
 
         const transformedOutstanding = state.outstandingOperation;
-        assert.strictEqual(transformedOutstanding.apply('aRb'), 'aRLb');
+        assert.strictEqual(transformedOutstanding.apply('aRb'), 'aLRb');
         const ack = state.receive(transformedOutstanding, 1, true);
         assert.deepStrictEqual(ack.acknowledgedIds, [first.id]);
-        assert.strictEqual(ack.send.operation.apply('aRLb'), 'aRLXb');
+        assert.strictEqual(ack.send.operation.apply('aLRb'), 'aLXRb');
         state.receive(ack.send.operation, 2, true);
-        assert.strictEqual(state.acknowledgedContent, 'aRLXb');
-        assert.strictEqual(state.visibleContent, 'aRLXb');
+        assert.strictEqual(state.acknowledgedContent, 'aLXRb');
+        assert.strictEqual(state.visibleContent, 'aLXRb');
     });
 
     it('restores a valid serialized operation queue', () => {

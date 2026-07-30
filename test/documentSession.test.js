@@ -67,13 +67,13 @@ describe('DocumentSession', () => {
             op: [{ p: 1, i: 'R' }],
             meta: { source: 'other-client' },
         });
-        assert.strictEqual(session.content, 'aRLb');
+        assert.strictEqual(session.content, 'aLRb');
         assert.strictEqual(session.acknowledgedContent, 'aRb');
 
         await session.receiveUpdate({ doc: 'doc-1', v: 1 });
         await write;
-        assert.strictEqual(session.content, 'aRLb');
-        assert.strictEqual(session.acknowledgedContent, 'aRLb');
+        assert.strictEqual(session.content, 'aLRb');
+        assert.strictEqual(session.acknowledgedContent, 'aLRb');
         session.dispose();
     });
 

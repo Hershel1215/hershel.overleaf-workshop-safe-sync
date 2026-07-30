@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ROOT_NAME } from '../consts';
+import { ROOT_NAME, URI_SCHEME } from '../consts';
 import { EventBus } from '../utils/eventBus';
 import { GlobalStateManager } from '../utils/globalStateManager';
 
@@ -10,7 +10,7 @@ export class PdfDocument implements vscode.CustomDocument {
     readonly onDidChange = this._onDidChange.event;
 
     constructor(readonly uri: vscode.Uri) {
-        if (uri.scheme !== ROOT_NAME) {
+        if (uri.scheme !== URI_SCHEME) {
             throw new Error(`Invalid uri scheme: ${uri}`);
         }
         this.uri = uri;
@@ -92,7 +92,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     break;
                 case 'ready':
                     const state = GlobalStateManager.getPdfViewPersist(this.context, doc.uri.toString());
-                    const config = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer');
+                    const config = vscode.workspace.getConfiguration(`${ROOT_NAME}.pdfViewer`);
                     const colorThemes = config.get('themes', undefined);
                     const defaults = {
                         scrollMode: config.get('defaultScrollMode', 'vertical'),

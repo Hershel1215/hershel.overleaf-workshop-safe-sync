@@ -40,7 +40,7 @@ class VirtualOtServer {
         const base = this.snapshots[update.v];
         let operation = TextOperation.fromLegacyEdits(base, update.op);
         for (let version = update.v; version < this.history.length; version++) {
-            [, operation] = TextOperation.transform(this.history[version], operation);
+            [operation] = TextOperation.transform(operation, this.history[version]);
         }
         const version = this.history.length;
         const before = this.content;
@@ -108,7 +108,7 @@ describe('document protocol integration', () => {
         await Promise.all([leftWrite, rightWrite]);
         assert.strictEqual(left.session.content, server.content);
         assert.strictEqual(right.session.content, server.content);
-        assert.strictEqual(server.content, 'aRLb');
+        assert.strictEqual(server.content, 'aLRb');
         server.dispose();
     });
 

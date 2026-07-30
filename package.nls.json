@@ -62,11 +62,11 @@
     "configuration.invisibleMode.inactiveTimeout.markdownDescription": "The timeout (in seconds) to mark a online Collaborator as inactivate in invisible mode.",
     "configuration.formatWithLineBreak.enabled.markdownDescription": "Enable line breaks when formatting.",
 
-    "views.overleaf-workshop.projectManager.name": "Hosts",
-    "views.explorer.overleaf-workshop.projectHistory": "History",
-    "views.explorer.overleaf-workshop.contextualTitle": "Overleaf Project History",
-    "views.explorer.overleaf-workshop.chatWebview.name": "Chat",
-    "views.explorer.overleaf-workshop.chatWebview.contextualTitle": "Overleaf Chat",
+    "views.hershel.overleaf-workshop-safe-sync.projectManager.name": "Hosts",
+    "views.explorer.hershel.overleaf-workshop-safe-sync.projectHistory": "History",
+    "views.explorer.hershel.overleaf-workshop-safe-sync.contextualTitle": "Overleaf Project History",
+    "views.explorer.hershel.overleaf-workshop-safe-sync.chatWebview.name": "Chat",
+    "views.explorer.hershel.overleaf-workshop-safe-sync.chatWebview.contextualTitle": "Overleaf Chat",
 
-    "customEditors.overleaf-workshop.pdfViewer.displayName": "Overleaf Workshop PDF Viewer"
+    "customEditors.hershel.overleaf-workshop-safe-sync.pdfViewer.displayName": "Overleaf Workshop PDF Viewer"
 }

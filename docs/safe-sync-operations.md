@@ -8,6 +8,14 @@
    SecretStorage. Existing plaintext state from an earlier build of this fork is
    migrated on activation. Reload the window once after the first login so an
    already-open local binding can prefetch its project.
+
+All commands, views, settings, diagnostics, and the PDF custom-editor type use
+the `hershel.overleaf-workshop-safe-sync` namespace. The Activity Bar container
+uses the equivalent VS Code-compatible ID `hershel-overleaf-workshop-safe-sync`
+because container IDs cannot contain dots. Only the existing
+`overleaf-workshop://` URI scheme is retained so old `.overleaf/settings.json`
+bindings continue to open; this prevents contribution collisions with an
+installed upstream extension.
 4. Open a local replica. A pre-existing `.overleaf/settings.json` binding is
    detected automatically.
 5. Open the cloud status item, choose **Show safe-sync report**, and review all

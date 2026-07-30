@@ -2,7 +2,7 @@
 import * as vscode from 'vscode';
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
-import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
+import { OUTPUT_FOLDER_NAME, ROOT_NAME, URI_SCHEME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { ClientManager } from '../collaboration/clientManager';
 import { EventBus } from '../utils/eventBus';
@@ -297,7 +297,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
                 project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
                 this.root = project;
-                const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
+                const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==URI_SCHEME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
                 // Register: [collaboration] ClientManager on Statusbar
                 if (activeCondition) {
                     if (this.clientManagerItem?.triggers) {
@@ -1584,7 +1584,7 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     get triggers() {
         return [
             // register file system provider
-            vscode.workspace.registerFileSystemProvider(ROOT_NAME, this, { isCaseSensitive: true }),
+            vscode.workspace.registerFileSystemProvider(URI_SCHEME, this, { isCaseSensitive: true }),
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.refreshLinkedFile`, (uri: vscode.Uri) => {
                 return this.prefetch(uri).then((vfs) => vfs.refreshLinkedFile(uri));
@@ -1595,7 +1595,7 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
                     return this.prefetch(uri).then((vfs) => vfs.createLinkedFile(uri!));
                 }                
             }),
-            vscode.commands.registerCommand('remoteFileSystem.prefetch', (uri: vscode.Uri) => {
+            vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.prefetch`, (uri: vscode.Uri) => {
                 return this.prefetch(uri);
             }),
         ];

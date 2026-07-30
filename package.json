@@ -2,7 +2,7 @@
   "name": "overleaf-workshop-safe-sync",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "1.0.0-hershel.1",
+  "version": "1.0.0-hershel.7",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -59,6 +59,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onFileSystem:overleaf-workshop",
     "workspaceContains:.overleaf/settings.json"
   ],
@@ -116,282 +117,287 @@
     ],
     "commands": [
       {
-        "command": "overleaf-workshop.remoteFileSystem.refreshLinkedFile",
+        "command": "hershel.overleaf-workshop-safe-sync.remoteFileSystem.refreshLinkedFile",
         "title": "%commands.remoteFileSystem.refreshLinkedFile.title%",
         "icon": "$(refresh)",
-        "enablement": "focusedView == 'workbench.explorer.fileView' && (resourceScheme == overleaf-workshop || overleaf-workshop.activate)",
+        "enablement": "focusedView == 'workbench.explorer.fileView' && (resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activate)",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.remoteFileSystem.createLinkedFile",
+        "command": "hershel.overleaf-workshop-safe-sync.remoteFileSystem.createLinkedFile",
         "title": "%commands.remoteFileSystem.createLinkedFile.title%",
-        "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activate",
+        "enablement": "resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activate",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.addServer",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.addServer",
         "title": "%commands.projectManager.addServer.title%",
         "icon": "$(add)",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.removeServer",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.removeServer",
         "title": "%commands.projectManager.removeServer.title%",
         "icon": "$(trash)",
         "enablement": "viewItem == server_login || viewItem == server_no_login",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.loginServer",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.loginServer",
         "title": "%commands.projectManager.loginServer.title%",
         "icon": "$(log-in)",
         "enablement": "viewItem == server_no_login",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.logoutServer",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.logoutServer",
         "title": "%commands.projectManager.logoutServer.title%",
         "icon": "$(debug-disconnect)",
         "enablement": "viewItem == server_login",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.refreshServer",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.refreshServer",
         "title": "%commands.projectManager.refreshServer.title%",
         "icon": "$(refresh)",
         "enablement": "viewItem == server_login",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.newProject",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.newProject",
         "title": "%commands.projectManager.newProject.title%",
         "icon": "$(add)",
         "enablement": "viewItem == server_login",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.copyProject",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.copyProject",
         "title": "%commands.projectManager.copyProject.title%",
         "enablement": "viewItem =~ /^(?!archived).*project/",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.renameProject",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.renameProject",
         "title": "%commands.projectManager.renameProject.title%",
         "icon": "$(edit)",
         "enablement": "viewItem =~ /^(?!archived).*project/",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.deleteProject",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.deleteProject",
         "title": "%commands.projectManager.deleteProject.title%",
         "icon": "$(circle-slash)",
         "enablement": "viewItem == trashed_project",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.archiveProject",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.archiveProject",
         "title": "%commands.projectManager.archiveProject.title%",
         "icon": "$(archive)",
         "enablement": "viewItem =~ /^(?!archived).*project/",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.unarchiveProject",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.unarchiveProject",
         "title": "%commands.projectManager.unarchiveProject.title%",
         "icon": "$(reply)",
         "enablement": "viewItem == archived_project",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.trashProject",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.trashProject",
         "title": "%commands.projectManager.trashProject.title%",
         "icon": "$(trash)",
         "enablement": "viewItem =~ /^(?!trashed).*project/",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.untrashProject",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.untrashProject",
         "title": "%commands.projectManager.untrashProject.title%",
         "icon": "$(reply)",
         "enablement": "viewItem == trashed_project",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.createTag",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.createTag",
         "title": "%commands.projectManager.createTag.title%",
         "icon": "$(tag)",
         "enablement": "viewItem == server_login",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.renameTag",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.renameTag",
         "title": "%commands.projectManager.renameTag.title%",
         "icon": "$(edit)",
         "enablement": "viewItem == tag",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.deleteTag",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.deleteTag",
         "title": "%commands.projectManager.deleteTag.title%",
         "icon": "$(close-all)",
         "enablement": "viewItem == tag",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.addProjectToTag",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.addProjectToTag",
         "title": "%commands.projectManager.addProjectToTag.title%",
         "icon": "$(tag)",
         "enablement": "viewItem == project",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.removeProjectFromTag",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.removeProjectFromTag",
         "title": "%commands.projectManager.removeProjectFromTag.title%",
         "enablement": "viewItem == project_in_tag",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.openProjectInCurrentWindow",
         "title": "%commands.projectManager.openProjectInCurrentWindow.title%",
         "icon": "$(arrow-right)",
         "enablement": "viewItem == project || viewItem == project_in_tag",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.openProjectInNewWindow",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.openProjectInNewWindow",
         "title": "%commands.projectManager.openProjectInNewWindow.title%",
         "icon": "$(empty-window)",
         "enablement": "viewItem == project || viewItem == project_in_tag",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectManager.openProjectLocalReplica",
+        "command": "hershel.overleaf-workshop-safe-sync.projectManager.openProjectLocalReplica",
         "title": "%commands.projectManager.openProjectLocalReplica.title%",
         "icon": "$(file-directory)",
         "enablement": "viewItem == project || viewItem == project_in_tag",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectHistory.refresh",
+        "command": "hershel.overleaf-workshop-safe-sync.projectHistory.refresh",
         "title": "%commands.projectHistory.refresh.title%",
         "icon": "$(refresh)",
         "enablement": "resourceScheme == overleaf-workshop",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectHistory.clearSelection",
+        "command": "hershel.overleaf-workshop-safe-sync.projectHistory.clearSelection",
         "title": "%commands.projectHistory.clearSelection.title%",
         "icon": "$(clear-all)",
-        "enablement": "view == overleaf-workshop.projectHistory",
+        "enablement": "view == hershel.overleaf-workshop-safe-sync.projectHistory",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectHistory.createLabel",
+        "command": "hershel.overleaf-workshop-safe-sync.projectHistory.createLabel",
         "title": "%commands.projectHistory.createLabel.title%",
         "icon": "$(tag)",
         "enablement": "viewItem =~ /historyItem(Labelled)?/",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectHistory.deleteLabel",
+        "command": "hershel.overleaf-workshop-safe-sync.projectHistory.deleteLabel",
         "title": "%commands.projectHistory.deleteLabel.title%",
         "icon": "$(close-all)",
         "enablement": "viewItem == historyItemLabelled",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectHistory.comparePrevious",
+        "command": "hershel.overleaf-workshop-safe-sync.projectHistory.comparePrevious",
         "title": "%commands.projectHistory.comparePrevious.title%",
         "enablement": "viewItem =~ /historyItem(Labelled)?/",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectHistory.compareCurrent",
+        "command": "hershel.overleaf-workshop-safe-sync.projectHistory.compareCurrent",
         "title": "%commands.projectHistory.compareCurrent.title%",
         "enablement": "viewItem =~ /historyItem(Labelled)?/",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectHistory.compareOthers",
+        "command": "hershel.overleaf-workshop-safe-sync.projectHistory.compareOthers",
         "title": "%commands.projectHistory.compareOthers.title%",
         "enablement": "viewItem =~ /historyItem(Labelled)?/",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectHistory.downloadProject",
+        "command": "hershel.overleaf-workshop-safe-sync.projectHistory.downloadProject",
         "title": "%commands.projectHistory.downloadProject.title%",
         "icon": "$(cloud-download)",
         "enablement": "viewItem =~ /historyItem(Labelled)?/",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectHistory.revealHistoryView",
+        "command": "hershel.overleaf-workshop-safe-sync.projectHistory.revealHistoryView",
         "title": "%commands.projectHistory.revealHistoryView.title%",
         "enablement": "resourceScheme == overleaf-workshop",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.projectSCM.configSCM",
+        "command": "hershel.overleaf-workshop-safe-sync.projectSCM.configSCM",
         "title": "%commands.projectSCM.configSCM.title%",
         "icon": "$(gear)",
-        "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activate",
+        "enablement": "resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activate",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.compileManager.compile",
+        "command": "hershel.overleaf-workshop-safe-sync.compileManager.compile",
         "title": "%commands.compileManager.compile.title%",
         "icon": "$(debug-start)",
-        "enablement": "(resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
+        "enablement": "(resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activateCompile) && resourceExtname == .tex",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.compileManager.viewPdf",
+        "command": "hershel.overleaf-workshop-safe-sync.compileManager.viewPdf",
         "title": "%commands.compileManager.viewPdf.title%",
         "icon": "$(open-preview)",
-        "enablement": "(resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
+        "enablement": "(resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activateCompile) && resourceExtname == .tex",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.compileManager.syncCode",
+        "command": "hershel.overleaf-workshop-safe-sync.compileManager.syncCode",
         "title": "%commands.compileManager.syncCode.title%",
-        "enablement": "editorTextFocus && (resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
+        "enablement": "editorTextFocus && (resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activateCompile) && resourceExtname == .tex",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.compileManager.setCompiler",
+        "command": "hershel.overleaf-workshop-safe-sync.compileManager.setCompiler",
         "title": "%commands.compileManager.setCompiler.title%",
-        "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile",
+        "enablement": "resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activateCompile",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.compileManager.setRootDoc",
+        "command": "hershel.overleaf-workshop-safe-sync.compileManager.setRootDoc",
         "title": "%commands.compileManager.setRootDoc.title%",
-        "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile",
+        "enablement": "resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activateCompile",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.collaboration.copyLineRef",
+        "command": "hershel.overleaf-workshop-safe-sync.collaboration.copyLineRef",
         "title": "%commands.collaboration.copyLineRef.title%",
         "enablement": "editorTextFocus && resourceScheme == overleaf-workshop",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.collaboration.insertLineRef",
+        "command": "hershel.overleaf-workshop-safe-sync.collaboration.insertLineRef",
         "title": "%commands.collaboration.insertLineRef.title%",
         "enablement": "editorTextFocus && resourceScheme == overleaf-workshop",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.collaboration.revealChatView",
+        "command": "hershel.overleaf-workshop-safe-sync.collaboration.revealChatView",
         "title": "%commands.collaboration.revealChatView.title%",
-        "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activate",
+        "enablement": "resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activate",
         "category": "%extension.displayName%"
       },
       {
-        "command": "overleaf-workshop.collaboration.jumpToUser",
+        "command": "hershel.overleaf-workshop-safe-sync.collaboration.jumpToUser",
         "title": "%commands.collaboration.jumpToUser.title%",
-        "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activate",
+        "enablement": "resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activate",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "hershel.overleaf-workshop-safe-sync.safeSync.runE2E",
+        "title": "Run Approved Safe Sync E2E",
         "category": "%extension.displayName%"
       }
     ],
@@ -399,45 +405,45 @@
       {
         "key": "ctrl+alt+b",
         "mac": "cmd+alt+b",
-        "command": "overleaf-workshop.compileManager.compile",
-        "when": "editorTextFocus && (resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex"
+        "command": "hershel.overleaf-workshop-safe-sync.compileManager.compile",
+        "when": "editorTextFocus && (resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activateCompile) && resourceExtname == .tex"
       },
       {
         "key": "ctrl+alt+v",
         "mac": "cmd+alt+v",
-        "command": "overleaf-workshop.compileManager.viewPdf",
-        "when": "editorTextFocus && (resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex"
+        "command": "hershel.overleaf-workshop-safe-sync.compileManager.viewPdf",
+        "when": "editorTextFocus && (resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activateCompile) && resourceExtname == .tex"
       },
       {
         "key": "ctrl+alt+j",
         "mac": "cmd+alt+j",
-        "command": "overleaf-workshop.compileManager.syncCode",
-        "when": "editorTextFocus && (resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex"
+        "command": "hershel.overleaf-workshop-safe-sync.compileManager.syncCode",
+        "when": "editorTextFocus && (resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activateCompile) && resourceExtname == .tex"
       },
       {
         "key": "ctrl+shift+c",
         "mac": "cmd+shift+c",
-        "command": "overleaf-workshop.collaboration.copyLineRef",
+        "command": "hershel.overleaf-workshop-safe-sync.collaboration.copyLineRef",
         "when": "editorTextFocus && resourceScheme == overleaf-workshop"
       }
     ],
     "configuration": {
       "title": "%extension.displayName%",
       "properties": {
-        "overleaf-workshop.compileOnSave.enabled": {
+        "hershel.overleaf-workshop-safe-sync.compileOnSave.enabled": {
           "type": "boolean",
           "default": true,
           "scope": "machine",
           "markdownDescription": "%configuration.compileOnSave.enabled.markdownDescription%"
         },
-        "overleaf-workshop.compileOutputFolderName": {
+        "hershel.overleaf-workshop-safe-sync.compileOutputFolderName": {
           "type": "string",
           "default": ".output",
           "scope": "machine",
           "pattern": "^[^\\\\/:*?\"<>|]+$",
           "markdownDescription": "%configuration.compileOutputFolderName.markdownDescription%"
         },
-        "overleaf-workshop.pdfViewer.themes": {
+        "hershel.overleaf-workshop-safe-sync.pdfViewer.themes": {
           "type": "object",
           "default": {
             "default": {
@@ -475,7 +481,7 @@
           "scope": "machine",
           "markdownDescription": "%configuration.pdfViewer.themes.markdownDescription%"
         },
-        "overleaf-workshop.pdfViewer.defaultScrollMode": {
+        "hershel.overleaf-workshop-safe-sync.pdfViewer.defaultScrollMode": {
           "type": "string",
           "enum": [
             "vertical",
@@ -487,7 +493,7 @@
           "scope": "machine",
           "markdownDescription": "%configuration.pdfViewer.defaultScrollMode.markdownDescription%"
         },
-        "overleaf-workshop.pdfViewer.defaultSpreadMode": {
+        "hershel.overleaf-workshop-safe-sync.pdfViewer.defaultSpreadMode": {
           "type": "string",
           "enum": [
             "none",
@@ -498,7 +504,7 @@
           "scope": "machine",
           "markdownDescription": "%configuration.pdfViewer.defaultSpreadMode.markdownDescription%"
         },
-        "overleaf-workshop.invisibleMode.historyRefreshInterval": {
+        "hershel.overleaf-workshop-safe-sync.invisibleMode.historyRefreshInterval": {
           "type": "number",
           "default": 3,
           "scope": "machine",
@@ -506,7 +512,7 @@
           "maximum": 60,
           "markdownDescription": "%configuration.invisibleMode.historyRefreshInterval.markdownDescription%"
         },
-        "overleaf-workshop.invisibleMode.chatMessageRefreshInterval": {
+        "hershel.overleaf-workshop-safe-sync.invisibleMode.chatMessageRefreshInterval": {
           "type": "number",
           "default": 3,
           "scope": "machine",
@@ -514,7 +520,7 @@
           "maximum": 60,
           "markdownDescription": "%configuration.invisibleMode.chatMessageRefreshInterval.markdownDescription%"
         },
-        "overleaf-workshop.invisibleMode.inactiveTimeout": {
+        "hershel.overleaf-workshop-safe-sync.invisibleMode.inactiveTimeout": {
           "type": "number",
           "default": 180,
           "scope": "machine",
@@ -522,7 +528,7 @@
           "maximum": 3600,
           "markdownDescription": "%configuration.invisibleMode.inactiveTimeout.markdownDescription%"
         },
-        "overleaf-workshop.formatWithLineBreak.enabled": {
+        "hershel.overleaf-workshop-safe-sync.formatWithLineBreak.enabled": {
           "type": "boolean",
           "default": true,
           "scope": "machine",
@@ -533,237 +539,237 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "overleaf-workshop",
+          "id": "hershel-overleaf-workshop-safe-sync",
           "title": "%extension.displayName%",
           "icon": "resources/icons/overleaf_bw.svg"
         }
       ]
     },
     "views": {
-      "overleaf-workshop": [
+      "hershel-overleaf-workshop-safe-sync": [
         {
-          "id": "overleaf-workshop.projectManager",
-          "name": "%views.overleaf-workshop.projectManager.name%"
+          "id": "hershel.overleaf-workshop-safe-sync.projectManager",
+          "name": "%views.hershel.overleaf-workshop-safe-sync.projectManager.name%"
         }
       ],
       "explorer": [
         {
-          "id": "overleaf-workshop.projectHistory",
+          "id": "hershel.overleaf-workshop-safe-sync.projectHistory",
           "icon": "$(history)",
-          "name": "%views.explorer.overleaf-workshop.projectHistory%",
-          "contextualTitle": "%views.explorer.overleaf-workshop.contextualTitle%",
+          "name": "%views.explorer.hershel.overleaf-workshop-safe-sync.projectHistory%",
+          "contextualTitle": "%views.explorer.hershel.overleaf-workshop-safe-sync.contextualTitle%",
           "when": "resourceScheme == overleaf-workshop"
         },
         {
           "type": "webview",
-          "id": "overleaf-workshop.chatWebview",
+          "id": "hershel.overleaf-workshop-safe-sync.chatWebview",
           "icon": "$(feedback)",
-          "name": "%views.explorer.overleaf-workshop.chatWebview.name%",
-          "contextualTitle": "%views.explorer.overleaf-workshop.chatWebview.contextualTitle%",
-          "when": "resourceScheme == overleaf-workshop || overleaf-workshop.activate"
+          "name": "%views.explorer.hershel.overleaf-workshop-safe-sync.chatWebview.name%",
+          "contextualTitle": "%views.explorer.hershel.overleaf-workshop-safe-sync.chatWebview.contextualTitle%",
+          "when": "resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activate"
         }
       ]
     },
     "menus": {
       "explorer/context": [
         {
-          "command": "overleaf-workshop.remoteFileSystem.refreshLinkedFile",
-          "when": "(resourceScheme == overleaf-workshop || overleaf-workshop.activate) && !explorerResourceIsFolder"
+          "command": "hershel.overleaf-workshop-safe-sync.remoteFileSystem.refreshLinkedFile",
+          "when": "(resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activate) && !explorerResourceIsFolder"
         },
         {
-          "command": "overleaf-workshop.remoteFileSystem.createLinkedFile",
-          "when": "(resourceScheme == overleaf-workshop || overleaf-workshop.activate) && explorerResourceIsFolder"
+          "command": "hershel.overleaf-workshop-safe-sync.remoteFileSystem.createLinkedFile",
+          "when": "(resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activate) && explorerResourceIsFolder"
         }
       ],
       "editor/context": [
         {
-          "command": "overleaf-workshop.collaboration.copyLineRef",
-          "when": "resourceScheme == overleaf-workshop || overleaf-workshop.activate"
+          "command": "hershel.overleaf-workshop-safe-sync.collaboration.copyLineRef",
+          "when": "resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activate"
         },
         {
-          "command": "overleaf-workshop.collaboration.insertLineRef",
-          "when": "resourceScheme == overleaf-workshop || overleaf-workshop.activate"
+          "command": "hershel.overleaf-workshop-safe-sync.collaboration.insertLineRef",
+          "when": "resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activate"
         }
       ],
       "view/title": [
         {
-          "command": "overleaf-workshop.projectManager.addServer",
-          "when": "view == overleaf-workshop.projectManager",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.addServer",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager",
           "group": "navigation"
         },
         {
-          "command": "overleaf-workshop.projectSCM.configSCM",
-          "when": "view == overleaf-workshop.projectHistory",
+          "command": "hershel.overleaf-workshop-safe-sync.projectSCM.configSCM",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectHistory",
           "group": "navigation@1"
         },
         {
-          "command": "overleaf-workshop.projectHistory.refresh",
-          "when": "view == overleaf-workshop.projectHistory",
+          "command": "hershel.overleaf-workshop-safe-sync.projectHistory.refresh",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectHistory",
           "group": "navigation@2"
         },
         {
-          "command": "overleaf-workshop.projectHistory.clearSelection",
-          "when": "view == overleaf-workshop.projectHistory",
+          "command": "hershel.overleaf-workshop-safe-sync.projectHistory.clearSelection",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectHistory",
           "group": "navigation@3"
         }
       ],
       "editor/title": [
         {
-          "command": "overleaf-workshop.compileManager.compile",
-          "when": "(resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
+          "command": "hershel.overleaf-workshop-safe-sync.compileManager.compile",
+          "when": "(resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activateCompile) && resourceExtname == .tex",
           "group": "navigation@1"
         },
         {
-          "command": "overleaf-workshop.compileManager.viewPdf",
-          "when": "(resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname == .tex",
+          "command": "hershel.overleaf-workshop-safe-sync.compileManager.viewPdf",
+          "when": "(resourceScheme == overleaf-workshop || hershel.overleaf-workshop-safe-sync.activateCompile) && resourceExtname == .tex",
           "group": "navigation@2"
         }
       ],
       "view/item/context": [
         {
-          "command": "overleaf-workshop.projectManager.loginServer",
-          "when": "view == overleaf-workshop.projectManager && viewItem == server_no_login",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.loginServer",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == server_no_login",
           "group": "inline"
         },
         {
-          "command": "overleaf-workshop.projectManager.newProject",
-          "when": "view == overleaf-workshop.projectManager && viewItem == server_login",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.newProject",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == server_login",
           "group": "inline@1"
         },
         {
-          "command": "overleaf-workshop.projectManager.refreshServer",
-          "when": "view == overleaf-workshop.projectManager && viewItem == server_login",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.refreshServer",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == server_login",
           "group": "inline@2"
         },
         {
-          "command": "overleaf-workshop.projectManager.logoutServer",
-          "when": "view == overleaf-workshop.projectManager && viewItem == server_login",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.logoutServer",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == server_login",
           "group": "inline@3"
         },
         {
-          "command": "overleaf-workshop.projectManager.removeServer",
-          "when": "view == overleaf-workshop.projectManager && viewItem == server_login || viewItem == server_no_login"
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.removeServer",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == server_login || viewItem == server_no_login"
         },
         {
-          "command": "overleaf-workshop.projectManager.copyProject",
-          "when": "view == overleaf-workshop.projectManager && viewItem =~ /^(?!archived).*project/",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.copyProject",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem =~ /^(?!archived).*project/",
           "group": "1_editActions"
         },
         {
-          "command": "overleaf-workshop.projectManager.renameProject",
-          "when": "view == overleaf-workshop.projectManager && viewItem =~ /^(?!archived).*project/",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.renameProject",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem =~ /^(?!archived).*project/",
           "group": "1_editActions"
         },
         {
-          "command": "overleaf-workshop.projectManager.deleteProject",
-          "when": "view == overleaf-workshop.projectManager && viewItem == trashed_project",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.deleteProject",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == trashed_project",
           "group": "inline@2"
         },
         {
-          "command": "overleaf-workshop.projectManager.archiveProject",
-          "when": "view == overleaf-workshop.projectManager && viewItem =~ /^(?!archived).*project/",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.archiveProject",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem =~ /^(?!archived).*project/",
           "group": "1_editActions"
         },
         {
-          "command": "overleaf-workshop.projectManager.unarchiveProject",
-          "when": "view == overleaf-workshop.projectManager && viewItem == archived_project",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.unarchiveProject",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == archived_project",
           "group": "inline@1"
         },
         {
-          "command": "overleaf-workshop.projectManager.trashProject",
-          "when": "view == overleaf-workshop.projectManager && viewItem =~ /^(?!trashed).*project/",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.trashProject",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem =~ /^(?!trashed).*project/",
           "group": "1_editActions"
         },
         {
-          "command": "overleaf-workshop.projectManager.untrashProject",
-          "when": "view == overleaf-workshop.projectManager && viewItem == trashed_project",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.untrashProject",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == trashed_project",
           "group": "inline@1"
         },
         {
-          "command": "overleaf-workshop.projectManager.createTag",
-          "when": "view == overleaf-workshop.projectManager && viewItem == server_login"
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.createTag",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == server_login"
         },
         {
-          "command": "overleaf-workshop.projectManager.renameTag",
-          "when": "view == overleaf-workshop.projectManager && viewItem == tag",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.renameTag",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == tag",
           "group": "inline@1"
         },
         {
-          "command": "overleaf-workshop.projectManager.deleteTag",
-          "when": "view == overleaf-workshop.projectManager && viewItem == tag",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.deleteTag",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == tag",
           "group": "inline@2"
         },
         {
-          "command": "overleaf-workshop.projectManager.addProjectToTag",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.addProjectToTag",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == project",
           "group": "1_editActions"
         },
         {
-          "command": "overleaf-workshop.projectManager.removeProjectFromTag",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project_in_tag",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.removeProjectFromTag",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == project_in_tag",
           "group": "1_editActions"
         },
         {
-          "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.openProjectInCurrentWindow",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == project || viewItem == project_in_tag",
           "group": "inline@3"
         },
         {
-          "command": "overleaf-workshop.projectManager.openProjectInNewWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.openProjectInNewWindow",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == project || viewItem == project_in_tag",
           "group": "inline@4"
         },
         {
-          "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.openProjectInCurrentWindow",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == project || viewItem == project_in_tag",
           "group": "1_openActions@1"
         },
         {
-          "command": "overleaf-workshop.projectManager.openProjectInNewWindow",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.openProjectInNewWindow",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == project || viewItem == project_in_tag",
           "group": "1_openActions@2"
         },
         {
-          "command": "overleaf-workshop.projectManager.openProjectLocalReplica",
-          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "command": "hershel.overleaf-workshop-safe-sync.projectManager.openProjectLocalReplica",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectManager && viewItem == project || viewItem == project_in_tag",
           "group": "1_openActions@3"
         },
         {
-          "command": "overleaf-workshop.projectHistory.createLabel",
-          "when": "view == overleaf-workshop.projectHistory && viewItem =~ /historyItem(Labelled)?/",
+          "command": "hershel.overleaf-workshop-safe-sync.projectHistory.createLabel",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectHistory && viewItem =~ /historyItem(Labelled)?/",
           "group": "1_labelActions@0"
         },
         {
-          "command": "overleaf-workshop.projectHistory.deleteLabel",
-          "when": "view == overleaf-workshop.projectHistory && viewItem == historyItemLabelled",
+          "command": "hershel.overleaf-workshop-safe-sync.projectHistory.deleteLabel",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectHistory && viewItem == historyItemLabelled",
           "group": "1_labelActions@1"
         },
         {
-          "command": "overleaf-workshop.projectHistory.comparePrevious",
-          "when": "view == overleaf-workshop.projectHistory && viewItem =~ /historyItem(Labelled)?/",
+          "command": "hershel.overleaf-workshop-safe-sync.projectHistory.comparePrevious",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectHistory && viewItem =~ /historyItem(Labelled)?/",
           "group": "2_scmActions@1"
         },
         {
-          "command": "overleaf-workshop.projectHistory.compareCurrent",
-          "when": "view == overleaf-workshop.projectHistory && viewItem =~ /historyItem(Labelled)?/",
+          "command": "hershel.overleaf-workshop-safe-sync.projectHistory.compareCurrent",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectHistory && viewItem =~ /historyItem(Labelled)?/",
           "group": "2_scmActions@0"
         },
         {
-          "command": "overleaf-workshop.projectHistory.compareOthers",
-          "when": "view == overleaf-workshop.projectHistory && viewItem =~ /historyItem(Labelled)?/",
+          "command": "hershel.overleaf-workshop-safe-sync.projectHistory.compareOthers",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectHistory && viewItem =~ /historyItem(Labelled)?/",
           "group": "2_scmActions@2"
         },
         {
-          "command": "overleaf-workshop.projectHistory.downloadProject",
-          "when": "view == overleaf-workshop.projectHistory && viewItem =~ /historyItem(Labelled)?/",
+          "command": "hershel.overleaf-workshop-safe-sync.projectHistory.downloadProject",
+          "when": "view == hershel.overleaf-workshop-safe-sync.projectHistory && viewItem =~ /historyItem(Labelled)?/",
           "group": "z_downloadAction"
         }
       ]
     },
     "customEditors": [
       {
-        "viewType": "overleaf-workshop.pdfViewer",
-        "displayName": "%customEditors.overleaf-workshop.pdfViewer.displayName%",
+        "viewType": "hershel.overleaf-workshop-safe-sync.pdfViewer",
+        "displayName": "%customEditors.hershel.overleaf-workshop-safe-sync.pdfViewer.displayName%",
         "selector": [
           {
             "filenamePattern": "overleaf-workshop:/**/{*.pdf, .PDF}"
@@ -777,12 +783,12 @@
     "download-pdfjs": "download -o views/pdf-viewer/vendor -e https://github.com/mozilla/pdf.js/releases/download/v3.10.111/pdfjs-3.10.111-dist.zip && cd views/pdf-viewer/vendor && patch -p1 < pdfjs-3.10.111-dist.patch",
     "download-latex-basics": "download -o data/vendor -s 1 -e https://github.com/jlelong/vscode-latex-basics/archive/refs/tags/v1.5.4.zip",
     "postinstall": "patch-package && npm run download-pdfjs && npm run download-latex-basics",
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "patch-package && npm run compile",
     "update-l10n": "npx @vscode/l10n-dev export -o ./l10n ./src",
     "compile:ts": "tsc -p ./",
     "compile": "npm run compile:ts && cd views/chat-view && npm run build",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
+    "pretest": "patch-package && npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "npm run test:unit",
     "test:unit": "npm run compile:ts && mocha \"test/**/*.test.js\"",

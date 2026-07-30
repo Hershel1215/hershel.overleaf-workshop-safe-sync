@@ -246,7 +246,7 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
                     this.refresh();
                 }
             }),
-            vscode.commands.registerCommand('projectHistory.comparePrevious', async (item: HistoryItem) => {
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.comparePreviousLegacy`, async (item: HistoryItem) => {
                 vscode.commands.executeCommand(`${ROOT_NAME}.projectHistory.comparePrevious`, item);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.comparePrevious`, async (item: HistoryItem) => {

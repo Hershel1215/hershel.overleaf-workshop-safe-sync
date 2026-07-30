@@ -111,9 +111,11 @@ export class OtClientState {
     /**
      * Apply the next authoritative server operation.
      *
-     * Remote operations have ordering priority because the server has already
-     * assigned them the current revision. An own operation must match the
-     * transformed outstanding target before it is acknowledged.
+     * Overleaf's ShareJS client transforms the in-flight client operation on
+     * the left and the authoritative server operation on the right. This is
+     * observable for concurrent inserts at the same position: the in-flight
+     * client insertion stays before the server insertion. An own operation
+     * must match that transformed outstanding target before it is acknowledged.
      */
     receive(operation: TextOperation, revision: number, ownOperation: boolean): ReceiveResult {
         if (revision !== this.revision) {
@@ -156,17 +158,17 @@ export class OtClientState {
         let remoteForLocal = operation;
 
         if (this.outstanding) {
-            const [remotePrime, outstandingPrime] = TextOperation.transform(
-                remoteForLocal,
+            const [outstandingPrime, remotePrime] = TextOperation.transform(
                 this.outstanding.operation,
+                remoteForLocal,
             );
             remoteForLocal = remotePrime;
             this.outstanding.operation = outstandingPrime;
         }
         if (this.pending) {
-            const [remotePrime, pendingPrime] = TextOperation.transform(
-                remoteForLocal,
+            const [pendingPrime, remotePrime] = TextOperation.transform(
                 this.pending.operation,
+                remoteForLocal,
             );
             remoteForLocal = remotePrime;
             this.pending.operation = pendingPrime;

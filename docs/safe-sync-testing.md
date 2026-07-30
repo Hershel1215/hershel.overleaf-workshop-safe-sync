@@ -23,11 +23,30 @@ The unit suite covers:
 - stable entity/local identity move planning and folder tree hashes;
 - durable replica state, exclusive locks, stale lease takeover, capability
   policy, ignore policy, and conservative doc/resource classification.
+- presence of the patched legacy Socket.IO credential headers in both the HTTP
+  handshake and WebSocket upgrade paths. `pretest` and `vscode:prepublish`
+  apply `patch-package` explicitly, including after `npm ci --ignore-scripts`.
+- byte-exact multipart upload framing, including the required filename field
+  and `qqfile` binary part when requests are sent through `undici`.
 
 ## Remote E2E project
 
 Use the authorized retained project `hershel-safe-sync-e2e` on
 `10.10.5.4:8888`. Do not run mutation tests against a manuscript.
+
+The contributed **Run Approved Safe Sync E2E** command and the one-time
+`safe-sync-e2e.request.json` global-storage marker are hard-bound to that exact
+server and project. They read credentials only through VS Code SecretStorage,
+write a redacted `safe-sync-e2e.result.json`, isolate fixtures under a unique
+folder, remove those fixtures at the end, and retain the project itself.
+
+The executable remote suite verifies SecretStorage authentication, project
+creation/reuse, byte-exact binary upload/readback, stable entity IDs across
+move/rename, two live clients making concurrent same-revision edits, final
+three-client convergence, and exact catch-up-history replay. The remaining
+crash-injection and local watcher scenarios are covered by the deterministic
+unit/integration harness and must still be exercised manually for a release
+candidate when the VS Code host can be terminated under test control.
 
 Required scenarios:
 

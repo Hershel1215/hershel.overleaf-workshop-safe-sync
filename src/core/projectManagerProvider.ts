@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ROOT_NAME } from '../consts';
+import { ROOT_NAME, URI_SCHEME } from '../consts';
 import { ProjectTagsResponseSchema } from '../api/base';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
@@ -128,7 +128,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
                     // get project items
                     const normalProjects = [], trashedProjects = [], archivedProjects = [];
                     for (const project of projects) {
-                        const uri = `${ROOT_NAME}://${element.name}/${encodeURIComponent(project.name)}?user=${project.userId}&project=${project.id}`;
+                        const uri = `${URI_SCHEME}://${element.name}/${encodeURIComponent(project.name)}?user=${project.userId}&project=${project.id}`;
                         const status = project.archived ? 'archived' : project.trashed ? 'trashed' : 'normal';
                         const item = new ProjectItem(element.api, uri, element, project.id, project.name, status);
                         switch (status) {
@@ -549,7 +549,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     openProjectInCurrentWindow(project: ProjectItem) {
         const uri = vscode.Uri.parse(project.uri);
-        vscode.commands.executeCommand('remoteFileSystem.prefetch', uri)
+        vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.prefetch`, uri)
         .then(() => {
             vscode.commands.executeCommand('vscode.openFolder', uri, false);
             vscode.commands.executeCommand('workbench.view.explorer');
@@ -558,7 +558,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     openProjectInNewWindow(project: ProjectItem) {
         const uri = vscode.Uri.parse(project.uri);
-        vscode.commands.executeCommand('remoteFileSystem.prefetch', uri)
+        vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.prefetch`, uri)
         .then(() => {
             vscode.commands.executeCommand('vscode.openFolder', uri, true);
             vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
@@ -568,7 +568,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     async openProjectLocalReplica(project: ProjectItem) {
         // should close other open vfs firstly
-        const vfsFolder = vscode.workspace.workspaceFolders?.find(folder => folder.uri.scheme===ROOT_NAME);
+        const vfsFolder = vscode.workspace.workspaceFolders?.find(folder => folder.uri.scheme===URI_SCHEME);
         if (vfsFolder) {
             vscode.window.showWarningMessage( vscode.l10n.t('Please close the open remote overleaf folder firstly.') );
             return;
@@ -581,7 +581,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         let replicas = Object.values(scmPersists).filter(scmPersist => scmPersist.label===LocalReplicaSCMProvider.label);
         // if not exist, create new one
         if (replicas.length===0) {
-            const vfs = (await (await vscode.commands.executeCommand('remoteFileSystem.prefetch', uri))) as VirtualFileSystem;
+            const vfs = (await (await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.prefetch`, uri))) as VirtualFileSystem;
             await vfs.init();
             const answer = await vscode.window.showWarningMessage( vscode.l10n.t('No local replica found, create one for project "{label}" ?', {label:project.label}), "Yes", "No");
             if (answer === "Yes") {

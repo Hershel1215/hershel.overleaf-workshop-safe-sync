@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { RemoteFileSystemProvider, parseUri } from '../core/remoteFileSystemProvider';
-import { ROOT_NAME, ELEGANT_NAME, OUTPUT_FOLDER_NAME } from '../consts';
+import { ROOT_NAME, ELEGANT_NAME, OUTPUT_FOLDER_NAME, URI_SCHEME } from '../consts';
 import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
 import { EventBus } from '../utils/eventBus';
@@ -23,7 +23,7 @@ const pdfViewRecord: {
 } = {};
 
 class CompileDiagnosticProvider {
-    private diagnosticCollection = vscode.languages.createDiagnosticCollection(ROOT_NAME);
+    private diagnosticCollection = vscode.languages.createDiagnosticCollection(`${ROOT_NAME}.compile`);
     constructor(private readonly vfsm: RemoteFileSystemProvider) {};
 
     private async getRange(log: ErrorSchema, path: string, vfs: any) {
@@ -143,7 +143,7 @@ export class CompileManager {
         // check if supported vfs
         uri = uri || vscode.window.activeTextEditor?.document.uri;
         uri = uri || vscode.workspace.workspaceFolders?.[0].uri;
-        if (uri?.scheme === ROOT_NAME) {
+        if (uri?.scheme === URI_SCHEME) {
             return uri;
         }
         // check if supported local replica

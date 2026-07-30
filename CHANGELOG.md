@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-hershel.7] - 2026-07-30
+
+- Restored valid multipart file uploads after the upstream `undici` migration
+  by sending the form boundary, filename field, and byte-exact buffered body.
+- Matched Overleaf ShareJS client/server transform ordering for same-position
+  concurrent edits instead of placing the authoritative remote insert first.
+- Passed the approved retained-project E2E suite for binary readback, stable
+  move identity, two-client OT convergence, exact catch-up, and cleanup.
+
+## [1.0.0-hershel.6] - 2026-07-30
+
+- Replaced the remote E2E `.bin` upload with a valid PNG image fixture while
+  preserving byte-exact binary readback verification.
+- Included the sanitized upload response in E2E failure reports.
+
+## [1.0.0-hershel.5] - 2026-07-30
+
+- Made `patch-package` mandatory before tests and VSIX publication so the
+  legacy Socket.IO HTTP/WebSocket credential-header patch is present in the
+  packaged runtime.
+- Added a regression test that inspects both patched transport paths.
+
+## [1.0.0-hershel.4] - 2026-07-30
+
+- Made the live E2E runner follow the production VFS v1-to-v2 socket protocol
+  fallback after an `invalid session` rejection.
+
+## [1.0.0-hershel.3] - 2026-07-30
+
+- Fixed the Activity Bar container ID to satisfy VS Code's alphanumeric,
+  underscore, and hyphen-only contribution constraint.
+- Added a manifest regression test for the container-ID constraint.
+- Activate after startup so the approved one-time E2E request is consumed even
+  when the active window is not rooted at a local Overleaf replica.
+
+## [1.0.0-hershel.2] - 2026-07-30
+
+- Namespaced every VS Code contribution owned by the fork while retaining the
+  existing `overleaf-workshop://` project URI scheme.
+- Added the approved, SecretStorage-backed remote E2E runner and redacted result
+  report for `hershel-safe-sync-e2e`.
+- Avoided writing an unregistered CSpell setting when the CSpell extension is
+  absent.
+
 ## [1.0.0-hershel.1] - 2026-07-30
 
 - Forked independently as `hershel.overleaf-workshop-safe-sync` from upstream

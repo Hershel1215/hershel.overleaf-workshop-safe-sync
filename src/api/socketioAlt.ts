@@ -7,9 +7,9 @@ import { DocumentEntity, FileEntity, ProjectEntity, VirtualFileSystem } from '..
 import { UpdateSchema, UpdateUserSchema } from './socketio';
 import { ROOT_NAME } from '../consts';
 
-const keyHistoryRefreshInterval = `${ROOT_NAME}.invisibleMode.historyRefreshInterval`;
-const keyChatMessageRefreshInterval = `${ROOT_NAME}.invisibleMode.chatMessageRefreshInterval`;
-const keyInactiveTimeout = `${ROOT_NAME}.invisibleMode.inactiveTimeout`;
+const keyHistoryRefreshInterval = 'invisibleMode.historyRefreshInterval';
+const keyChatMessageRefreshInterval = 'invisibleMode.chatMessageRefreshInterval';
+const keyInactiveTimeout = 'invisibleMode.inactiveTimeout';
 
 type EmitCallbackType = (err: Error|undefined, ...data:any[]) => void;
 type EmitEventsSupport = {
@@ -115,7 +115,7 @@ export class SocketIOAlt {
         if (this._vfs) {
             return Promise.resolve(this._vfs);
         } else {
-            return vscode.commands.executeCommand('remoteFileSystem.prefetch', vscode.Uri.parse(this.url))
+            return vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.prefetch`, vscode.Uri.parse(this.url))
                 .then(async (vfsPromise) => {
                     this._vfs = await (vfsPromise as Promise<VirtualFileSystem>);
                     return this._vfs;
@@ -133,11 +133,11 @@ export class SocketIOAlt {
 
     private watchConfigurations() {
         return vscode.workspace.onDidChangeConfiguration((e) => {
-                if (e.affectsConfiguration(`${ROOT_NAME}.invisibleMode.historyRefreshInterval`)) {
+                if (e.affectsConfiguration(`${ROOT_NAME}.${keyHistoryRefreshInterval}`)) {
                     this.vfsRefreshTask.interval = this.historyRefreshInterval;
                 }
 
-                if (e.affectsConfiguration(`${ROOT_NAME}.invisibleMode.chatMessageRefreshInterval`)) {
+                if (e.affectsConfiguration(`${ROOT_NAME}.${keyChatMessageRefreshInterval}`)) {
                     this.msgRefreshTask.interval = this.messageRefreshInterval;
                 }
             });
