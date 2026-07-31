@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { lstat } from 'fs/promises';
+import { lstat, readFile } from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { BaseSCM, CommitItem, SettingItem } from '.';
@@ -16,7 +16,7 @@ import {
     ReplicaSnapshot,
     validatePendingRecovery,
 } from '../sync/replicaPlanner';
-import { ReplicaLock } from '../sync/replicaLock';
+import { ReplicaLock, ReplicaLockedError } from '../sync/replicaLock';
 import { SerialTaskQueue } from '../sync/serialTaskQueue';
 import {
     BaselineEntry,
@@ -47,6 +47,7 @@ import {
     AiWriterLeaseManager,
 } from '../sync/aiWriterLease';
 import { FairTaskScheduler } from '../sync/fairTaskScheduler';
+import { WalCorruptionError } from '../sync/durableWal';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 const TEXT_DEBOUNCE_MS = 350;
@@ -131,6 +132,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private activeReconcileCount = 0;
     private lastScan?: ScanPair;
     private lastReport = 'Safe sync has not scanned this replica yet.';
+    private currentActionPath?: string;
 
     public static getRuntimeStatus(basePath: string): LocalReplicaRuntimeStatus | undefined {
         const instance = LocalReplicaSCMProvider.activeInstances.get(path.resolve(basePath));
@@ -162,6 +164,48 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 && !pendingAction
                 && conflictCount === 0,
         };
+    }
+
+    public static showActiveReport(): void {
+        const instance = LocalReplicaSCMProvider.activeWorkspaceInstance();
+        if (!instance) {
+            vscode.window.showWarningMessage('No active Hershel safe-sync replica in this workspace');
+            return;
+        }
+        if (instance.lastScan) {
+            instance.renderReport(instance.lastScan, 'manual report');
+        }
+        instance.output.clear();
+        instance.output.appendLine(instance.lastReport);
+        instance.output.show(true);
+    }
+
+    public static async copyActiveAiGatewayCommand(): Promise<void> {
+        const instance = LocalReplicaSCMProvider.activeWorkspaceInstance();
+        if (!instance) {
+            vscode.window.showWarningMessage('No active Hershel safe-sync replica in this workspace');
+            return;
+        }
+        const metadataPath = path.join(
+            instance.baseUri.fsPath,
+            '.overleaf',
+            'safe-sync-gateway.json',
+        );
+        const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as {cliPath?: string};
+        if (!metadata.cliPath) {
+            throw new Error('AI gateway CLI path is unavailable');
+        }
+        const command = `node ${shellQuote(metadata.cliPath)} ${shellQuote(metadataPath)}`
+            + ' begin <relative-path> codex';
+        await vscode.env.clipboard.writeText(command);
+        vscode.window.showInformationMessage('Copied the Hershel AI gateway command');
+    }
+
+    private static activeWorkspaceInstance(): LocalReplicaSCMProvider | undefined {
+        const workspace = vscode.workspace.workspaceFolders?.[0]?.uri;
+        return workspace?.scheme === 'file'
+            ? LocalReplicaSCMProvider.activeInstances.get(path.resolve(workspace.fsPath))
+            : undefined;
     }
 
     public static cleanupNamespace(
@@ -489,6 +533,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         const machine = this.textReplicas.get(relative);
         if (machine) {
+            if (kind === 'delete') {
+                this.dropTextReplica(relative);
+                this.scheduleReconcile(`local delete: ${relative}`, 0);
+                return;
+            }
             void this.readLocalText(relative).then(content => this.textTask(
                 relative,
                 'filesystem',
@@ -512,6 +561,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         const machine = this.textReplicas.get(relative);
         if (machine) {
+            if (kind === 'delete') {
+                this.dropTextReplica(relative);
+                this.scheduleReconcile(`remote delete: ${relative}`, 0);
+                return;
+            }
             void this.readRemoteText(relative).then(content => this.textTask(
                 relative,
                 'remote',
@@ -572,16 +626,71 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private async ensureTextReplicas(scan: ScanPair): Promise<void> {
+        // Path-level deletes and type changes belong to the resource planner.
+        // Drop a stale OT machine before it can recreate a deleted path.
+        for (const filePath of [...this.textReplicas.keys()]) {
+            const local = scan.local.get(filePath);
+            const remote = scan.remote.get(filePath);
+            if (local?.fileType !== 'doc' || remote?.fileType !== 'doc') {
+                this.dropTextReplica(filePath);
+            }
+        }
         for (const [filePath, remote] of scan.remote) {
             if (remote.fileType !== 'doc' || remote.text === undefined || isPathConflicted(filePath, this.requireState())) {
                 continue;
             }
-            if (this.textReplicas.has(filePath)) {
+            const local = scan.local.get(filePath);
+            if (local && local.fileType !== 'doc') {
+                // Let the conservative path/type planner create an explicit
+                // conflict instead of overwriting a binary at this path.
                 continue;
             }
-            const local = scan.local.get(filePath);
-            await this.createTextReplica(filePath, remote.text, local);
+            if (!local && this.state?.entries[filePath]) {
+                // A missing local path may be an intentional local delete (or
+                // a delete/edit overlap); preserve that evidence for the
+                // planner rather than projecting the remote document.
+                continue;
+            }
+            const previousActionPath = this.currentActionPath;
+            this.currentActionPath = filePath;
+            let completed = false;
+            try {
+                // The directory scan exposes the last server-acknowledged
+                // snapshot. The VFS projection additionally contains any
+                // local operation that is already durable in the document
+                // journal but has not been acknowledged yet. Never reset a
+                // replica from the older scan snapshot: doing so can roll back
+                // or later duplicate a journaled operation during recovery.
+                const remoteUri = this.remoteUri(filePath);
+                const projection = await this.vfs.readDocumentProjection(remoteUri);
+                if (projection.entityId !== remote.entityId) {
+                    throw new ConcurrentRemoteResourceError(remoteUri.path);
+                }
+                const canonicalContent = projection.content;
+                const existing = this.textReplicas.get(filePath);
+                if (existing) {
+                    if (!existing.isIsolated
+                        && existing.canonical !== canonicalContent
+                        && local?.fileType === 'doc') {
+                        await existing.onCanonicalChanged(canonicalContent);
+                    }
+                } else {
+                    await this.createTextReplica(filePath, canonicalContent, local);
+                }
+                completed = true;
+            } finally {
+                if (completed) {
+                    this.currentActionPath = previousActionPath;
+                }
+            }
         }
+    }
+
+    private dropTextReplica(filePath: string): void {
+        this.textReplicas.get(filePath)?.dispose();
+        this.textReplicas.delete(filePath);
+        this.textSchedulers.get(filePath)?.dispose();
+        this.textSchedulers.delete(filePath);
     }
 
     private async createTextReplica(
@@ -598,16 +707,41 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const diskContent = await this.readLocalText(filePath);
         const editorContent = openDocument?.getText();
         const baseline = this.state?.entries[filePath];
+        const baselineText = baseline?.fileType === 'doc' ? baseline.text : undefined;
+        const editorIsDirty = openDocument?.isDirty === true;
+        const editorAndDiskDiffer = editorContent !== undefined
+            && diskContent !== undefined
+            && editorContent !== diskContent;
+        const dirtyEditorHasProvableBase = editorIsDirty
+            && editorContent !== undefined
+            && baselineText !== undefined
+            && (diskContent === baselineText || editorContent === diskContent);
+
+        if (editorIsDirty && editorContent !== undefined && editorAndDiskDiffer && !dirtyEditorHasProvableBase) {
+            await this.createTextConflict({
+                path: filePath,
+                reason: 'Dirty editor and disk snapshots do not share a provable common base',
+                canonicalContent,
+                editorContent,
+                diskContent,
+            });
+            return;
+        }
 
         const machine = new TextReplicaStateMachine({
             path: filePath,
             canonicalContent,
-            editorContent: editorContent ?? diskContent,
-            editorDirty: openDocument?.isDirty ?? false,
-            diskContent: baseline?.fileType === 'doc' && baseline.text !== undefined
-                ? baseline.text
-                : diskContent,
-            projectionReceipts: this.state?.projectionReceipts,
+            // Seed a dirty editor with its durable base. The first observed
+            // value below is then journaled as an OT operation.
+            editorContent: dirtyEditorHasProvableBase ? baselineText : editorContent ?? diskContent,
+            editorDirty: editorIsDirty,
+            // Keep the baseline as the previous disk observation so an
+            // uncoordinated filesystem write is classified by evidence.
+            diskContent: baselineText ?? diskContent,
+            projectionReceipts: this.state?.projectionReceipts?.filter(receipt => (
+                receipt.path === `editor:${filePath}`
+                || receipt.path === `disk:${filePath}`
+            )),
         }, {
             commit: (ancestor, target, barrier) => this.vfs.acceptDocumentSnapshotAgainstAncestor(
                 this.remoteUri(filePath),
@@ -641,7 +775,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             },
             persistProjectionReceipts: async receipts => {
                 if (this.state) {
-                    this.state.projectionReceipts = receipts;
+                    const ownedPaths = new Set([
+                        `editor:${filePath}`,
+                        `disk:${filePath}`,
+                    ]);
+                    this.state.projectionReceipts = [
+                        ...(this.state.projectionReceipts ?? [])
+                            .filter(receipt => !ownedPaths.has(receipt.path)),
+                        ...receipts,
+                    ];
                     await this.stateStore.save(this.state);
                 }
             },
@@ -651,17 +793,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.textSchedulers.set(filePath, new FairTaskScheduler());
 
         if (!local || local.fileType !== 'doc') {
+            // A remote-only document with no local baseline is a new remote
+            // entity. Project it after recovery, never by calling save().
+            await machine.onCanonicalChanged(canonicalContent);
             return;
         }
         const localText = local.text;
         if (localText === canonicalContent) {
             return;
         }
-        if (baseline?.fileType === 'doc' && baseline.text === canonicalContent && !openDocument?.isDirty) {
+        if (dirtyEditorHasProvableBase) {
+            if (editorContent !== undefined) {
+                await machine.onEditorChanged(editorContent);
+                await machine.flushInput(true);
+            }
+            return;
+        }
+        if (baselineText === canonicalContent && !editorIsDirty) {
             await machine.onDiskObserved(localText);
             return;
         }
-        if (baseline?.fileType === 'doc' && baseline.text === localText && canonicalContent !== localText) {
+        if (baselineText === localText && canonicalContent !== localText) {
             await machine.onCanonicalChanged(canonicalContent);
             return;
         }
@@ -680,21 +832,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return;
         }
         const artifactDirectory = `.overleaf/conflicts/unresolved/${this.timestamp()}-${randomUUID()}`;
-        await this.writeArtifact(
-            `${artifactDirectory}/manifest.json`,
-            new TextEncoder().encode(JSON.stringify({
-                schemaVersion: 2,
-                path: record.path,
-                reason: record.reason,
-                canonicalHash: contentHash(new TextEncoder().encode(record.canonicalContent)),
-                editorHash: record.editorContent === undefined
-                    ? undefined
-                    : contentHash(new TextEncoder().encode(record.editorContent)),
-                diskHash: record.diskContent === undefined
-                    ? undefined
-                    : contentHash(new TextEncoder().encode(record.diskContent)),
-            }, null, 2)),
-        );
+        const baseline = state.entries[record.path];
+        const baseContent = await this.readCommonBase(baseline);
+        const baseFile = baseContent === undefined
+            ? undefined
+            : `${artifactDirectory}/base/${record.path}`;
+        if (baseContent !== undefined && baseFile) {
+            await this.writeArtifact(baseFile, baseContent);
+        }
         await this.writeArtifact(
             `${artifactDirectory}/remote/${record.path}`,
             new TextEncoder().encode(record.canonicalContent),
@@ -711,12 +856,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 new TextEncoder().encode(record.diskContent),
             );
         }
-        state.conflicts[record.path] = {
+        const remote = this.lastScan?.remote.get(record.path);
+        let remoteRevision: number | undefined;
+        try {
+            remoteRevision = (await this.vfs.readDocumentProjection(
+                this.remoteUri(record.path),
+            )).revision;
+        } catch {
+            // The document may be isolated precisely because its live session
+            // cannot be recovered. Entity/hash evidence remains available.
+        }
+        const conflict: ConflictRecord = {
             path: record.path,
             artifactDirectory,
             reason: record.reason,
             createdAt: new Date().toISOString(),
+            baseFile,
+            baseHash: baseline?.hash,
+            baselineEntityId: baseline?.entityId,
             remoteFile: `${artifactDirectory}/remote/${record.path}`,
+            remoteEntityId: remote?.entityId,
+            remoteRevision,
             localFile: record.editorContent === undefined
                 ? record.diskContent === undefined ? undefined : `${artifactDirectory}/local-disk/${record.path}`
                 : `${artifactDirectory}/local-editor/${record.path}`,
@@ -725,6 +885,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 ? record.diskContent === undefined ? undefined : contentHash(new TextEncoder().encode(record.diskContent))
                 : contentHash(new TextEncoder().encode(record.editorContent)),
         };
+        await this.writeArtifact(
+            `${artifactDirectory}/manifest.json`,
+            new TextEncoder().encode(JSON.stringify({
+                schemaVersion: 3,
+                ...conflict,
+                editorHash: record.editorContent === undefined
+                    ? undefined
+                    : contentHash(new TextEncoder().encode(record.editorContent)),
+                diskHash: record.diskContent === undefined
+                    ? undefined
+                    : contentHash(new TextEncoder().encode(record.diskContent)),
+                baseAvailable: baseFile !== undefined,
+            }, null, 2)),
+        );
+        state.conflicts[record.path] = conflict;
         await this.stateStore.save(state);
         this.status = { status: 'need-attention', message: `Isolated text path: ${record.path}` };
         this.renderReport(this.lastScan ?? {local: new Map(), remote: new Map()}, `isolated ${record.path}`);
@@ -841,7 +1016,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 await machine.flushInput(true);
                 const current = await this.vfs.readDocumentProjection(this.remoteUri(filePath));
                 const lease = this.aiLeases.acquire(
-                    projection.entityId,
+                    current.entityId,
                     holder,
                     current.revision,
                 );
@@ -849,14 +1024,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     lease,
                     path: filePath,
                     baseContent: current.content,
-                    entityId: projection.entityId,
+                    entityId: current.entityId,
                 });
                 await this.persistAiLeases();
                 return {
                     leaseId: lease.leaseId,
                     fencingToken: lease.fencingToken,
                     baseRevision: lease.baseRevision,
-                    entityId: projection.entityId,
+                    entityId: current.entityId,
                     path: filePath,
                     content: current.content,
                     revision: current.revision,
@@ -896,17 +1071,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     request.content,
                     true,
                 );
-                this.aiTransactions.delete(lease.leaseId);
-                this.aiLeases.release(
-                    projection.entityId,
-                    lease.leaseId,
-                    lease.fencingToken,
-                );
-                await this.persistAiLeases();
                 await machine.onCanonicalChanged(accepted.content);
-                accepted.acknowledgement.catch(error => {
-                    this.handleTextReplicaError(filePath, error);
-                });
+                // Keep the AI lease through the remote-ack boundary. The
+                // operation is already journaled, so the request can return
+                // promptly; the asynchronous finalizer releases the lease
+                // only after the authoritative update (or a fail-closed
+                // acknowledgement error).
+                accepted.acknowledgement.then(
+                    () => void this.finishAiTransaction(lease.leaseId),
+                    error => void this.finishAiTransaction(lease.leaseId, error),
+                );
                 return {
                     opId: accepted.opId,
                     path: filePath,
@@ -928,6 +1102,31 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
             default:
                 throw new Error(`Unsupported AI gateway method: ${String(request.method)}`);
+        }
+    }
+
+    private async finishAiTransaction(leaseId: string, error?: unknown): Promise<void> {
+        const transaction = this.aiTransactions.get(leaseId);
+        if (!transaction) {
+            return;
+        }
+        this.aiTransactions.delete(leaseId);
+        try {
+            this.aiLeases.release(
+                transaction.entityId,
+                transaction.lease.leaseId,
+                transaction.lease.fencingToken,
+            );
+        } catch {
+            // The lease may have expired and been fenced by a later writer.
+        }
+        try {
+            await this.persistAiLeases();
+        } catch (persistenceError) {
+            this.failProject(this.asError(persistenceError));
+        }
+        if (error) {
+            this.handleTextReplicaError(transaction.path, error);
         }
     }
 
@@ -1039,13 +1238,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         this.state.entries[pending.path],
                     );
                 } catch (error) {
-                    this.state.pendingAction = undefined;
-                    await this.stateStore.save(this.state);
                     await this.createConflict(
                         pending.path,
                         `Pending ${pending.kind} ancestry is not provable: ${this.asError(error).message}`,
                         scan,
                     );
+                    // The recoverable snapshots must be durable before the
+                    // pending action is cleared. A crash between these saves
+                    // therefore re-enters recovery instead of losing ancestry.
+                    if (this.state.pendingAction?.id === pending.id) {
+                        this.state.pendingAction = undefined;
+                        await this.stateStore.save(this.state);
+                    }
                     continue;
                 }
                 if (recovery.kind === 'recovered-pull' || recovery.kind === 'recovered-push') {
@@ -1055,7 +1259,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     continue;
                 }
                 if (this.pendingActionCompleted(pending, scan)) {
-                    refreshConvergedBaseline(this.state, scan.local, scan.remote);
+                    await this.refreshConvergedState(this.state, scan);
                     this.state.pendingAction = undefined;
                     await this.stateStore.save(this.state);
                 } else if (await this.resumePendingAction(this.state.pendingAction, scan)) {
@@ -1088,7 +1292,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         `Pending ${this.state.pendingAction.kind} could not be proven complete`,
                     );
                 }
-                refreshConvergedBaseline(this.state, scan.local, scan.remote);
+                await this.refreshConvergedState(this.state, scan);
                 await this.stateStore.save(this.state);
                 const conflictCount = Object.keys(this.state.conflicts).length;
                 this.status = conflictCount > 0
@@ -1271,9 +1475,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const baseline = state.entries[filePath];
             const local = scan.local.get(filePath);
             const remote = scan.remote.get(filePath);
-            if (local?.fileType === 'doc' || remote?.fileType === 'doc') {
-                // Text documents are owned by TextReplicaStateMachine. The
-                // snapshot planner remains only for binary/tree resources.
+            if (
+                this.textReplicas?.has(filePath)
+                && remote?.fileType === 'doc'
+                && (local?.fileType === 'doc' || baseline === undefined)
+            ) {
+                // An attached OT machine owns an existing document (or a
+                // genuinely new remote document). Creation/deletion/type
+                // changes stay in the conservative resource planner.
                 continue;
             }
             if (
@@ -1651,8 +1860,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             status: kind.includes('local') || kind === 'pull' ? 'pull' : 'push',
             message: `${kind}: ${filePath}${targetPath ? ` -> ${targetPath}` : ''}`,
         };
+        const previousActionPath = this.currentActionPath;
+        this.currentActionPath = filePath;
+        let completed = false;
         try {
             await action();
+            completed = true;
         } catch (error) {
             if (
                 error instanceof StaleLocalSnapshotError
@@ -1665,6 +1878,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 await this.stateStore.save(state);
             }
             throw error;
+        } finally {
+            if (completed) {
+                this.currentActionPath = previousActionPath;
+            }
         }
     }
 
@@ -1734,6 +1951,31 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         state.pendingAction.targetHash = contentHash(content);
         await this.stateStore.save(state);
+    }
+
+    private async refreshConvergedState(state: ReplicaState, scan: ScanPair): Promise<void> {
+        refreshConvergedBaseline(state, scan.local, scan.remote);
+        for (const [filePath, baseline] of Object.entries(state.entries)) {
+            if (baseline.fileType === 'folder') {
+                continue;
+            }
+            const remote = scan.remote.get(filePath);
+            const local = scan.local.get(filePath);
+            if (
+                !remote?.content
+                || !local
+                || remote.fileType !== baseline.fileType
+                || local.fileType !== baseline.fileType
+                || remote.hash !== baseline.hash
+                || local.hash !== baseline.hash
+            ) {
+                continue;
+            }
+            const storedHash = await this.stateStore.saveBaseline(remote.content);
+            if (storedHash !== baseline.hash) {
+                throw new Error(`Common-base snapshot hash changed for ${filePath}`);
+            }
+        }
     }
 
     private async scanBoth(): Promise<ScanPair> {
@@ -2100,6 +2342,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             text: authoritativeText,
             localIdentity,
         };
+        await this.stateStore.saveBaseline(new TextEncoder().encode(authoritativeText));
         state.pendingAction = undefined;
         await this.stateStore.save(state);
     }
@@ -2122,6 +2365,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             hash: contentHash(authoritativeContent),
             localIdentity: current ? await this.localIdentity(uri) : scannedLocal.localIdentity,
         };
+        await this.stateStore.saveBaseline(authoritativeContent);
         state.pendingAction = undefined;
         await this.stateStore.save(state);
     }
@@ -2186,23 +2430,77 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const artifactDirectory = `.overleaf/conflicts/unresolved/${id}`;
         const localFile = await this.archiveSubtree(artifactDirectory, 'local', filePath, scan.local);
         const remoteFile = await this.archiveSubtree(artifactDirectory, 'remote', filePath, scan.remote);
+        const baseline = state.entries[filePath];
+        const baseContent = await this.readCommonBase(baseline);
+        let baseFile = baseContent === undefined
+            ? undefined
+            : `${artifactDirectory}/base/${filePath}`;
+        if (baseContent !== undefined && baseFile) {
+            await this.writeArtifact(baseFile, baseContent);
+        } else if (baseline?.fileType === 'folder') {
+            baseFile = `${artifactDirectory}/base/manifest.json`;
+            const subtreeBaseline = Object.entries(state.entries)
+                .filter(([candidate]) => candidate === filePath || candidate.startsWith(`${filePath}/`))
+                .map(([candidate, entry]) => ({path: candidate, ...entry}));
+            await this.writeArtifact(
+                baseFile,
+                new TextEncoder().encode(JSON.stringify({schemaVersion: 1, entries: subtreeBaseline}, null, 2)),
+            );
+        }
+        const remote = scan.remote.get(filePath);
+        let remoteRevision: number | undefined;
+        if (remote?.fileType === 'doc') {
+            try {
+                remoteRevision = (await this.vfs.readDocumentProjection(
+                    this.remoteUri(filePath),
+                )).revision;
+            } catch {
+                // Conflict evidence is still complete enough to recover the
+                // three snapshots even if the live OT session is unavailable.
+            }
+        }
         const record: ConflictRecord = {
             path: filePath,
             artifactDirectory,
             reason,
             createdAt: new Date().toISOString(),
+            baseFile,
+            baseHash: baseline?.hash,
+            baselineEntityId: baseline?.entityId,
             localFile,
             remoteFile,
             localHash: scan.local.get(filePath)?.hash,
-            remoteHash: scan.remote.get(filePath)?.hash,
+            remoteHash: remote?.hash,
+            remoteEntityId: remote?.entityId,
+            remoteRevision,
         };
         state.conflicts[filePath] = record;
         await this.writeArtifact(
             `${artifactDirectory}/manifest.json`,
-            new TextEncoder().encode(JSON.stringify(record, null, 2)),
+            new TextEncoder().encode(JSON.stringify({
+                schemaVersion: 3,
+                ...record,
+                baseAvailable: baseFile !== undefined,
+            }, null, 2)),
         );
         await this.stateStore.save(state);
         this.status = { status: 'need-attention', message: `Conflict paused: ${filePath}` };
+    }
+
+    private async readCommonBase(
+        baseline: BaselineEntry | undefined,
+    ): Promise<Uint8Array | undefined> {
+        if (!baseline || baseline.fileType === 'folder') {
+            return undefined;
+        }
+        if (baseline.fileType === 'doc' && baseline.text !== undefined) {
+            const content = new TextEncoder().encode(baseline.text);
+            if (contentHash(content) !== baseline.hash) {
+                throw new Error(`Stored text baseline is corrupt: ${baseline.entityId}`);
+            }
+            return content;
+        }
+        return this.stateStore.readBaseline(baseline.hash);
     }
 
     private async archiveLocalWriterMerge(
@@ -2303,6 +2601,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             `Local replica: ${this.baseUri.fsPath}`,
             `Protocol: ${capability.protocol} (${capability.reason})`,
             `Baseline: ${this.state?.initialized ? 'initialized' : 'NOT SELECTED - READ ONLY'}`,
+            `Recovery/observation: ${this.observationReady ? 'READY' : 'RECOVERING'}`,
+            `OT documents: ${this.textReplicas.size}; buffered: ${[...this.textReplicas.values()].filter(machine => machine.hasBufferedInput).length}; isolated: ${[...this.textReplicas.values()].filter(machine => machine.isIsolated).length}`,
+            `AI writer leases: ${this.aiTransactions.size}; projection receipts: ${this.state?.projectionReceipts?.length ?? 0}`,
             `Equal: ${equal}; local only: ${localOnly.length}; remote only: ${remoteOnly.length}; different: ${different.length}`,
             `Active conflicts: ${Object.keys(this.state?.conflicts ?? {}).length}`,
             `Local editor/disk overlaps: ${localWriterOverlaps.length}`,
@@ -2433,7 +2734,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.assertEndpointsEqual(finalScan);
         state.initialized = true;
         state.pendingAction = undefined;
-        refreshConvergedBaseline(state, finalScan.local, finalScan.remote);
+        await this.refreshConvergedState(state, finalScan);
         await this.stateStore.save(state);
     }
 
@@ -2517,7 +2818,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.assertEndpointsEqual(finalScan);
         state.initialized = true;
         state.pendingAction = undefined;
-        refreshConvergedBaseline(state, finalScan.local, finalScan.remote);
+        await this.refreshConvergedState(state, finalScan);
         await this.stateStore.save(state);
     }
 
@@ -2668,7 +2969,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             state.pendingAction = undefined;
         }
         delete state.conflicts[filePath];
-        refreshConvergedBaseline(state, canonicalScan.local, canonicalScan.remote);
+        await this.refreshConvergedState(state, canonicalScan);
         state.conflicts[filePath] = record;
         await this.stateStore.save(state);
 
@@ -2828,15 +3129,96 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    private handleReconcileError(error: unknown): void {
+    private handleReconcileError(error: unknown): void | Promise<void> {
         const normalized = this.asError(error);
+        const actionPath = this.currentActionPath;
         if (normalized instanceof StaleLocalSnapshotError
             || normalized instanceof ConcurrentRemoteResourceError) {
+            this.currentActionPath = undefined;
             this.output.appendLine(`[retry] ${normalized.message}`);
             this.scheduleReconcile(normalized.message, 100);
             return;
         }
-        this.failProject(normalized);
+        if (this.isGlobalFailure(normalized, actionPath)) {
+            this.currentActionPath = undefined;
+            this.failProject(normalized);
+            return;
+        }
+        if (this.isTransientFailure(normalized)) {
+            this.currentActionPath = undefined;
+            this.output.appendLine(`[retry] ${normalized.message}`);
+            this.scheduleReconcile(normalized.message, 1000);
+            return;
+        }
+        const filePath = actionPath ?? this.pathFromError(normalized);
+        if (filePath && this.lastScan) {
+            return this.isolatePathFailure(filePath, normalized, this.lastScan);
+        }
+        // An unscoped document/network failure must not stop unrelated paths.
+        // Keep the queue live and require an explicit report for diagnosis.
+        this.currentActionPath = undefined;
+        this.output.appendLine(`[retry] unscoped safe-sync error: ${normalized.message}`);
+        this.scheduleReconcile(normalized.message, 1000);
+    }
+
+    private async isolatePathFailure(
+        filePath: string,
+        error: Error,
+        scan: ScanPair,
+    ): Promise<void> {
+        const state = this.requireState();
+        try {
+            await this.createConflict(
+                filePath,
+                `Document/path operation was isolated: ${error.message}`,
+                scan,
+            );
+            if (state.pendingAction?.path === filePath) {
+                state.pendingAction = undefined;
+                await this.stateStore.save(state);
+            }
+        } catch (conflictError) {
+            this.failProject(this.asError(conflictError));
+        } finally {
+            this.currentActionPath = undefined;
+        }
+    }
+
+    private isGlobalFailure(error: Error, actionPath?: string): boolean {
+        if (error instanceof ReplicaLockedError || /lock ownership was lost/i.test(error.message)) {
+            return true;
+        }
+        return actionPath === undefined
+            && (
+                error instanceof WalCorruptionError
+                || /WAL|checkpoint|binding/i.test(error.message)
+            );
+    }
+
+    private isTransientFailure(error: Error): boolean {
+        const code = (error as NodeJS.ErrnoException).code;
+        return [
+            'ECONNRESET',
+            'ECONNREFUSED',
+            'ETIMEDOUT',
+            'EAI_AGAIN',
+            'ENETUNREACH',
+            'EPIPE',
+        ].includes(code ?? '')
+            || /timed out|network|socket|disconnected|temporarily unavailable|HTTP [45]\d\d/i.test(
+                error.message,
+            );
+    }
+
+    private pathFromError(error: Error): string | undefined {
+        const match = error.message.match(/(?:for|at|: )([A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*)/);
+        const candidate = match?.[1];
+        if (!candidate || candidate.startsWith('.')) {
+            return undefined;
+        }
+        return this.lastScan?.local.has(candidate) || this.lastScan?.remote.has(candidate)
+            ? candidate
+            : undefined;
     }
 
     private failProject(error: Error): void {
@@ -3055,4 +3437,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     list(): Iterable<CommitItem> { return []; }
     async apply(_commitItem: CommitItem): Promise<void> { return Promise.resolve(); }
     async syncFromSCM(_commits: Iterable<CommitItem>): Promise<void> { return Promise.resolve(); }
+}
+
+function shellQuote(value: string): string {
+    return `'${value.replace(/'/g, `'"'"'`)}'`;
 }

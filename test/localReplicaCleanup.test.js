@@ -362,6 +362,95 @@ describe('converged replacement identity semantics', () => {
     });
 });
 
+describe('Local Replica text projection attachment', () => {
+    it('creates a replica from the journal-visible projection, not the older remote scan', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: true,
+            updatedAt: new Date(0).toISOString(),
+            entries: {},
+            conflicts: {},
+        };
+        provider.textReplicas = new Map();
+        provider.remoteUri = pathname => ({path: `/${pathname}`});
+        provider.vfs = {
+            readDocumentProjection: async () => ({
+                entityId: 'doc-1',
+                revision: 8,
+                content: 'visible journaled text',
+            }),
+        };
+        let attachedCanonical;
+        provider.createTextReplica = async (_filePath, canonicalContent) => {
+            attachedCanonical = canonicalContent;
+        };
+        const scan = {
+            local: new Map([['main.tex', {
+                path: 'main.tex', fileType: 'doc', hash: 'local', text: 'local disk',
+            }]]),
+            remote: new Map([['main.tex', {
+                path: 'main.tex',
+                fileType: 'doc',
+                entityId: 'doc-1',
+                hash: 'acknowledged',
+                text: 'acknowledged remote text',
+            }]]),
+        };
+
+        await provider.ensureTextReplicas(scan);
+
+        assert.strictEqual(attachedCanonical, 'visible journaled text');
+        assert.strictEqual(provider.currentActionPath, undefined);
+    });
+
+    it('refreshes an existing replica from the journal-visible projection', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: true,
+            updatedAt: new Date(0).toISOString(),
+            entries: {},
+            conflicts: {},
+        };
+        let refreshedCanonical;
+        provider.textReplicas = new Map([['main.tex', {
+            isIsolated: false,
+            canonical: 'old canonical',
+            onCanonicalChanged: async content => { refreshedCanonical = content; },
+        }]]);
+        provider.remoteUri = pathname => ({path: `/${pathname}`});
+        provider.vfs = {
+            readDocumentProjection: async () => ({
+                entityId: 'doc-1',
+                revision: 8,
+                content: 'visible journaled text',
+            }),
+        };
+        const scan = {
+            local: new Map([['main.tex', {
+                path: 'main.tex', fileType: 'doc', hash: 'local', text: 'local disk',
+            }]]),
+            remote: new Map([['main.tex', {
+                path: 'main.tex',
+                fileType: 'doc',
+                entityId: 'doc-1',
+                hash: 'acknowledged',
+                text: 'acknowledged remote text',
+            }]]),
+        };
+
+        await provider.ensureTextReplicas(scan);
+
+        assert.strictEqual(refreshedCanonical, 'visible journaled text');
+        assert.strictEqual(provider.currentActionPath, undefined);
+    });
+});
+
 describe('Local Replica pending text action recovery', () => {
     it('commits an OT-transformed push before a subsequent local edit', async () => {
         const LocalReplicaSCMProvider = loadProvider();
@@ -389,6 +478,7 @@ describe('Local Replica pending text action recovery', () => {
         const persisted = [];
         provider.stateStore = {
             save: async state => persisted.push(structuredClone(state)),
+            saveBaseline: async () => {},
         };
         provider.vfs = {
             writeDocumentAgainstAncestor: async () => transformedText,
@@ -498,6 +588,7 @@ describe('Local Replica pending text action recovery', () => {
         const persisted = [];
         provider.stateStore = {
             save: async state => persisted.push(structuredClone(state)),
+            saveBaseline: async () => {},
         };
         const decisions = [];
         provider.reconcileOne = async current => {
@@ -562,6 +653,7 @@ describe('Local Replica pending text action recovery', () => {
         const persisted = [];
         provider.stateStore = {
             save: async state => persisted.push(structuredClone(state)),
+            saveBaseline: async () => {},
         };
         provider.convergeTextToLocal = async () => remoteText;
 
@@ -592,5 +684,108 @@ describe('Local Replica pending text action recovery', () => {
             },
             remote,
         ), {action: 'push'});
+    });
+});
+
+describe('Local Replica failure scope', () => {
+    it('isolates an OT/path failure without pausing unrelated paths', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        provider.currentActionPath = 'main.tex';
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: true,
+            updatedAt: new Date(0).toISOString(),
+            entries: {},
+            conflicts: {},
+            pendingAction: {
+                id: 'pending',
+                kind: 'push',
+                path: 'main.tex',
+                startedAt: new Date(0).toISOString(),
+            },
+        };
+        provider.lastScan = {local: new Map(), remote: new Map()};
+        const persisted = [];
+        provider.stateStore = {
+            save: async state => persisted.push(structuredClone(state)),
+        };
+        provider.renderReport = () => {};
+        let isolated;
+        let pendingAtIsolation;
+        provider.createConflict = async (filePath, reason) => {
+            pendingAtIsolation = structuredClone(provider.state.pendingAction);
+            isolated = {filePath, reason};
+            provider.state.conflicts[filePath] = {
+                path: filePath,
+                reason,
+                artifactDirectory: '.overleaf/conflicts/unresolved/test',
+                createdAt: new Date(0).toISOString(),
+            };
+            await provider.stateStore.save(provider.state);
+        };
+
+        await provider.handleReconcileError(new Error('OT invariant failed'));
+
+        assert.strictEqual(provider.pausedError, undefined);
+        assert.strictEqual(provider.state.pendingAction, undefined);
+        assert.strictEqual(provider.currentActionPath, undefined);
+        assert.strictEqual(pendingAtIsolation.id, 'pending');
+        assert.strictEqual(persisted[0].pendingAction.id, 'pending');
+        assert(persisted[0].conflicts['main.tex']);
+        assert.strictEqual(persisted.at(-1).pendingAction, undefined);
+        assert.deepStrictEqual(isolated, {
+            filePath: 'main.tex',
+            reason: 'Document/path operation was isolated: OT invariant failed',
+        });
+    });
+
+    it('archives common base, remote, local, and version metadata', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: true,
+            updatedAt: new Date(0).toISOString(),
+            entries: {
+                'figure.png': {
+                    entityId: 'baseline-entity',
+                    fileType: 'file',
+                    hash: 'base-hash',
+                },
+            },
+            conflicts: {},
+        };
+        provider.readCommonBase = async () => Buffer.from('base');
+        provider.archiveSubtree = async (_directory, side) => `.overleaf/conflicts/unresolved/id/${side}/figure.png`;
+        provider.timestamp = () => 'time';
+        provider.stateStore = {save: async () => {}};
+        const artifacts = new Map();
+        provider.writeArtifact = async (filePath, content) => {
+            artifacts.set(filePath, Buffer.from(content));
+        };
+        provider.status = {status: 'idle', message: ''};
+        const scan = {
+            local: new Map([['figure.png', {
+                path: 'figure.png', fileType: 'file', hash: 'local-hash', content: Buffer.from('local'),
+            }]]),
+            remote: new Map([['figure.png', {
+                path: 'figure.png', fileType: 'file', hash: 'remote-hash', entityId: 'remote-entity', content: Buffer.from('remote'),
+            }]]),
+        };
+
+        await provider.createConflict('figure.png', 'concurrent binary edit', scan);
+
+        const conflict = provider.state.conflicts['figure.png'];
+        assert.strictEqual(conflict.baseHash, 'base-hash');
+        assert.strictEqual(conflict.baselineEntityId, 'baseline-entity');
+        assert.strictEqual(conflict.remoteEntityId, 'remote-entity');
+        assert.strictEqual(artifacts.get(`${conflict.artifactDirectory}/base/figure.png`).toString(), 'base');
+        const manifest = JSON.parse(artifacts.get(`${conflict.artifactDirectory}/manifest.json`).toString());
+        assert.strictEqual(manifest.schemaVersion, 3);
+        assert.strictEqual(manifest.baseAvailable, true);
+        assert.strictEqual(manifest.reason, 'concurrent binary edit');
     });
 });

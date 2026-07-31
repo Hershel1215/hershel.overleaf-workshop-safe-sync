@@ -300,8 +300,21 @@ export class DurableDocumentSession {
             this.lastHashTimestamp = now;
         }
         this.inflightWire = update;
-        await this.sendUpdate(update);
         this.scheduleInflightTimers();
+        // Journal durability is the caller-visible boundary. A transient
+        // transport rejection must leave the same source-tagged wire in
+        // flight so the retry path can resend it idempotently.
+        void this.sendWire(update);
+    }
+
+    private async sendWire(update: DurableLegacyDocumentUpdate): Promise<void> {
+        try {
+            await this.sendUpdate(update);
+        } catch {
+            // Keep the durable inflight operation. The retry timer resends it
+            // with dupIfSource; a later ACK or the fatal ACK deadline decides
+            // whether the document is acknowledged or isolated.
+        }
     }
 
     private scheduleInflightTimers(): void {
@@ -322,7 +335,7 @@ export class DurableDocumentSession {
                     sources,
                     this.journal.previousSubmittedRevision,
                 );
-                await this.sendUpdate({ ...this.inflightWire, dupIfSource: sources });
+                await this.sendWire({ ...this.inflightWire, dupIfSource: sources });
                 this.scheduleInflightTimers();
             }).catch(error => this.fail(this.normalizeError(error)));
         }, this.retryDelayMs);

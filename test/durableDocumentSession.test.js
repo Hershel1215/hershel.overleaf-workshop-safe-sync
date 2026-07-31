@@ -131,4 +131,30 @@ describe('durable Overleaf document session', () => {
         );
         await journal.close();
     });
+
+    it('keeps a journaled operation alive when the first transport send fails', async () => {
+        let attempts = 0;
+        const harness = await createHarness('ab', 0, {
+            retryDelayMs: 10,
+            fatalDelayMs: 1000,
+            sendUpdate: async update => {
+                attempts++;
+                if (attempts === 1) {
+                    throw new Error('ECONNRESET');
+                }
+                harness.sent.push(update);
+            },
+        });
+        const accepted = await harness.session.acceptSnapshotAgainstAncestor('ab', 'aLb');
+        assert.strictEqual(accepted.content, 'aLb');
+        assert.strictEqual(harness.session.isFailed, false);
+        for (let index = 0; index < 20 && attempts < 2; index++) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        assert(attempts >= 2, 'the durable inflight operation was not retried');
+        await harness.session.receiveUpdate({ doc: 'doc-1', v: 0 });
+        assert.strictEqual(await accepted.acknowledgement, 'aLb');
+        assert.strictEqual(harness.errors.length, 0);
+        await harness.session.close();
+    });
 });

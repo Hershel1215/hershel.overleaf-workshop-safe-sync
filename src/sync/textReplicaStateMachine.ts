@@ -155,12 +155,13 @@ export class TextReplicaStateMachine {
         }
         if (
             content !== undefined
-            && this.diskContent === this.canonicalContent
-            && !this.editorDirty
-            && !this.input.hasBufferedInput
+            && this.diskContent !== undefined
         ) {
             const ancestor = this.diskContent;
             this.diskContent = content;
+            if (this.input.hasBufferedInput) {
+                await this.input.flush(true);
+            }
             const accepted = await this.port.commit(ancestor, content, false);
             this.canonicalContent = accepted.content;
             accepted.acknowledgement.catch(error => {

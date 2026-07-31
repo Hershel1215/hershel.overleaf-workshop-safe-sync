@@ -2,8 +2,8 @@
   "name": "overleaf-workshop-safe-sync",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "1.0.0-hershel.20",
-  "hershelBuildId": "20260731T035525Z-safe-sync-rc20",
+  "version": "1.0.0-hershel.23",
+  "hershelBuildId": "20260731T104939Z-safe-sync-v2-rc23",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -399,6 +399,16 @@
       {
         "command": "hershel.overleaf-workshop-safe-sync.safeSync.runE2E",
         "title": "Run Approved Safe Sync E2E",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "hershel.overleaf-workshop-safe-sync.safeSync.showReport",
+        "title": "Show Safe Sync Report",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "hershel.overleaf-workshop-safe-sync.safeSync.copyAiGatewayCommand",
+        "title": "Copy AI Gateway Command",
         "category": "%extension.displayName%"
       }
     ],

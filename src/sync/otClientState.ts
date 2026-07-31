@@ -83,32 +83,38 @@ export class OtClientState {
         return this.submitOperation(TextOperation.fromDiff(this.localContent, content), id);
     }
 
-    submitOperation(operation: TextOperation, suppliedId?: string): { id?: string; send?: OutgoingOperation } {
+    submitOperation(
+        operation: TextOperation,
+        suppliedId?: string,
+        suppliedIds?: readonly string[],
+    ): { id?: string; send?: OutgoingOperation } {
         if (operation.baseLength !== this.localContent.length) {
             throw new Error('Local operation does not apply to the visible document');
         }
         if (operation.isNoop) {
             return {};
         }
-        const id = suppliedId ?? this.idFactory();
-        if (id.length === 0) {
+        const ids = suppliedIds === undefined
+            ? [suppliedId ?? this.idFactory()]
+            : [...suppliedIds];
+        if (ids.length === 0 || ids.some(id => typeof id !== 'string' || id.length === 0)) {
             throw new Error('Operation id must not be empty');
         }
         this.localContent = operation.apply(this.localContent);
         if (this.outstanding) {
             if (this.pending) {
                 this.pending = {
-                    ids: [...this.pending.ids, id],
+                    ids: [...this.pending.ids, ...ids],
                     operation: this.pending.operation.compose(operation),
                 };
             } else {
-                this.pending = { ids: [id], operation };
+                this.pending = { ids, operation };
             }
-            return { id };
+            return { id: ids[0] };
         }
 
-        this.outstanding = { ids: [id], operation };
-        return { id, send: this.outgoing(this.outstanding) };
+        this.outstanding = { ids, operation };
+        return { id: ids[0], send: this.outgoing(this.outstanding) };
     }
 
     /**

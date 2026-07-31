@@ -35,6 +35,12 @@ The remote projection path must not call `TextDocument.save()`. A dirty editor
 may temporarily lead the disk projection without weakening the journaled
 operation guarantee.
 
+A directory scan is only the last server-acknowledged snapshot. Replica attach
+and reconnect therefore use the coordinator's visible document projection,
+which also contains journaled-but-unacknowledged operations, after verifying
+that its entity identity still matches the scan. The older scan snapshot must
+never reset that projection.
+
 ## Text concurrency
 
 Each document follows Overleaf's centralized, versioned OT model: one
@@ -60,6 +66,11 @@ Binary and tree operations use stable resource identity and a common content
 hash. One-sided changes propagate. Concurrent distinct binary changes,
 delete/edit, divergent moves, and same-path identity collisions preserve all
 candidates in `.overleaf/conflicts` and isolate only the affected path.
+
+Every confirmed file baseline is also retained as a content-addressed snapshot
+outside the replica tree. An unresolved conflict manifest records the baseline
+hash/entity, current remote hash/entity/revision, local candidate hashes, and
+the reason, and archives `base/`, `remote/`, and available local candidates.
 
 ## Failure scope
 

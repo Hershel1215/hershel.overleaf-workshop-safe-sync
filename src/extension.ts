@@ -14,6 +14,16 @@ import { createLocalReplicaBinding, ensureLocalReplicaBinding } from './sync/loc
 export async function activate(context: vscode.ExtensionContext) {
     await GlobalStateManager.initialize(context);
     context.subscriptions.push(...registerSafeSyncE2E(context));
+    context.subscriptions.push(
+        vscode.commands.registerCommand(
+            `${ROOT_NAME}.safeSync.showReport`,
+            () => LocalReplicaSCMProvider.showActiveReport(),
+        ),
+        vscode.commands.registerCommand(
+            `${ROOT_NAME}.safeSync.copyAiGatewayCommand`,
+            () => LocalReplicaSCMProvider.copyActiveAiGatewayCommand(),
+        ),
+    );
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);
     context.subscriptions.push( ...remoteFileSystemProvider.triggers );

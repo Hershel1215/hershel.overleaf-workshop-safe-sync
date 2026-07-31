@@ -3,6 +3,7 @@ const { mkdtemp, readFile, rm } = require('fs/promises');
 const os = require('os');
 const path = require('path');
 const { DocumentJournal } = require('../out/sync/documentJournal');
+const { OtClientState } = require('../out/sync/otClientState');
 const { TextOperation } = require('../out/sync/textOperation');
 
 function edit(base, start, remove, insert) {
@@ -93,5 +94,22 @@ describe('document operation journal', () => {
         const walPath = path.join(directory, 'documents', 'large.wal');
         const walBytes = (await readFile(walPath)).length;
         assert(walBytes < 5000, `operation WAL unexpectedly used ${walBytes} bytes`);
+    });
+
+    it('preserves all ids when importing a composed legacy pending operation', async () => {
+        const legacy = new OtClientState(0, 'ab');
+        await legacy.submitOperation(edit('ab', 1, 0, 'L'), 'legacy-1');
+        await legacy.submitOperation(edit('aLb', 2, 0, 'X'), 'legacy-2');
+        await legacy.submitOperation(edit('aLXb', 3, 0, 'Y'), 'legacy-3');
+        const journal = await open();
+        await journal.seedLegacyState(legacy.serialize());
+        assert.deepStrictEqual(journal.currentOutgoingOperation.ids, ['legacy-1']);
+        await journal.commitRemoteOperation(
+            journal.currentOutgoingOperation.operation,
+            0,
+            true,
+        );
+        assert.deepStrictEqual(journal.currentOutgoingOperation.ids, ['legacy-2', 'legacy-3']);
+        await journal.close();
     });
 });

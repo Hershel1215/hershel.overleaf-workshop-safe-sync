@@ -17,6 +17,8 @@ import { TextComponent, TextOperation } from './textOperation';
 interface LocalOperationEvent {
     kind: 'local-operation';
     opId: string;
+    /** All source operation ids when a legacy pending queue was composed. */
+    opIds?: string[];
     operation: TextComponent[];
 }
 
@@ -184,15 +186,21 @@ export class DocumentJournal {
         operation: TextOperation,
         opId: string,
         barrier = false,
+        opIds: readonly string[] = [opId],
     ): Promise<JournaledLocalOperation> {
         const next = OtClientState.restore(this.state.serialize());
-        const submission = next.submitOperation(operation, opId);
+        const ids = [...opIds];
+        if (ids.length === 0 || ids[0] !== opId) {
+            throw new WalCorruptionError('Local operation ids are not ordered');
+        }
+        const submission = next.submitOperation(operation, opId, ids);
         if (!submission.id) {
             return {};
         }
         await this.wal.append({
             kind: 'local-operation',
             opId,
+            opIds: ids,
             operation: operation.toJSON(),
         }, barrier);
         this.state = next;
@@ -238,7 +246,7 @@ export class DocumentJournal {
         this.lastSubmittedRevision = lastSubmittedRevision;
     }
 
-    /** Import intact rc20 operation envelopes into a fresh v2 journal. */
+    /** Import intact legacy operation envelopes into a fresh v2 journal. */
     async seedLegacyState(saved: SerializedOtClientState): Promise<void> {
         if (this.revision !== saved.revision || this.acknowledgedContent !== saved.serverContent) {
             throw new WalCorruptionError('Legacy document state does not match its journal genesis');
@@ -247,13 +255,14 @@ export class DocumentJournal {
             if (!envelope) {
                 continue;
             }
-            if (envelope.ids.length !== 1) {
-                throw new WalCorruptionError('Legacy composed operation ids cannot be migrated safely');
+            if (envelope.ids.length === 0) {
+                throw new WalCorruptionError('Legacy operation envelope has no source ids');
             }
             await this.commitLocalOperation(
                 TextOperation.fromJSON(envelope.operation),
                 envelope.ids[0],
                 true,
+                envelope.ids,
             );
         }
         await this.commitTransportState(
@@ -309,7 +318,11 @@ function applyEvent(
     let lastSubmittedRevision = currentLastSubmittedRevision;
     switch (event.kind) {
         case 'local-operation':
-            state.submitOperation(TextOperation.fromJSON(event.operation), event.opId);
+            state.submitOperation(
+                TextOperation.fromJSON(event.operation),
+                event.opId,
+                event.opIds ?? [event.opId],
+            );
             break;
         case 'remote-operation':
             state.receive(

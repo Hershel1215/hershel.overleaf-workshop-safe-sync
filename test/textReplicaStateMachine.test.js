@@ -38,7 +38,9 @@ describe('text replica projection state machine', () => {
             canonicalContent: canonical,
             editorContent: initial.editorContent ?? canonical,
             editorDirty: initial.editorDirty ?? false,
-            diskContent: initial.diskContent ?? canonical,
+            diskContent: Object.prototype.hasOwnProperty.call(initial, 'diskContent')
+                ? initial.diskContent
+                : canonical,
         }, port);
         return {
             machine,
@@ -101,8 +103,20 @@ describe('text replica projection state machine', () => {
         state.machine.dispose();
     });
 
-    it('isolates an uncoordinated disk overwrite when canonical text advanced', async () => {
+    it('imports a disk writer against its durable previous canonical base while the editor is dirty', async () => {
         const state = harness({ editorDirty: true });
+        state.setCanonical('aRb');
+        await state.machine.onCanonicalChanged('aRb');
+        await state.machine.onDiskObserved('aDb');
+        assert.strictEqual(state.commits.length, 1);
+        assert.strictEqual(state.commits[0].ancestor, 'ab');
+        assert.strictEqual(state.commits[0].result, 'aRDb');
+        assert.strictEqual(state.isolations.length, 0);
+        state.machine.dispose();
+    });
+
+    it('isolates a disk overwrite when no previous disk base is known', async () => {
+        const state = harness({ editorDirty: true, diskContent: undefined });
         state.setCanonical('aRb');
         await state.machine.onCanonicalChanged('aRb');
         await state.machine.onDiskObserved('aDb');

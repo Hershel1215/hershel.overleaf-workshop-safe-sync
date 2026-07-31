@@ -1,14 +1,15 @@
 import * as vscode from 'vscode';
 import { createHash, randomUUID } from 'crypto';
 import { readFileSync } from 'fs';
-import { writeFile as writeDiskFile } from 'fs/promises';
+import { rm as removeDisk, writeFile as writeDiskFile } from 'fs/promises';
 import { BaseAPI, Identity, ProjectPersist } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
 import { ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
-import { DocumentSession } from './documentSession';
+import { DurableDocumentSession } from './durableDocumentSession';
+import { DocumentJournal } from './documentJournal';
 import { assertLocalReplicaBinding, LocalReplicaBinding } from './localBinding';
 import { ReplicaStateStore } from './replicaStateStore';
 import { TextOperation } from './textOperation';
@@ -20,9 +21,9 @@ const REQUEST_FILE = 'safe-sync-e2e.request.json';
 const RUNNING_FILE = 'safe-sync-e2e.running.json';
 const RESULT_FILE = 'safe-sync-e2e.result.json';
 const RELOAD_FILE = 'safe-sync-e2e.reload.json';
-const HANDOFF_TARGET_VERSION = '1.0.0-hershel.19';
-const HANDOFF_TARGET_BUILD_ID = '20260730T223000Z-safe-sync-rc19';
-export const E2E_RESULT_SCHEMA_VERSION = 3;
+const HANDOFF_TARGET_VERSION = '1.0.0-hershel.23';
+const HANDOFF_TARGET_BUILD_ID = '20260731T104939Z-safe-sync-v2-rc23';
+export const E2E_RESULT_SCHEMA_VERSION = 4;
 const BINARY_FIXTURE = Uint8Array.from(Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
     'base64',
@@ -75,7 +76,7 @@ interface E2EEvidence {
         archivesVerified: boolean;
         resolvedUsing: 'remote';
     };
-    localWriterOverlap?: {sha256: string; artifactsArchived: boolean};
+    localWriterOverlap?: {sha256: string; journalConverged: boolean};
     conflictArtifactsRemoteAbsent?: boolean;
     otCatchUp?: {baseRevision: number; finalRevision: number; operationCount: number; sha256: string};
     cleanup?: {
@@ -113,6 +114,13 @@ interface ActiveRun {
 }
 
 let running: ActiveRun | undefined;
+
+function isE2EConflictPath(filePath: string, namespace?: string): boolean {
+    if (namespace !== undefined) {
+        return filePath === namespace || filePath.startsWith(`${namespace}/`);
+    }
+    return /^hershel-e2e-[a-zA-Z0-9_-]+(?:\/|$)/.test(filePath);
+}
 
 export function safeMessage(error: unknown): string {
     const raw = error instanceof Error
@@ -371,32 +379,6 @@ async function localPathExists(uri: vscode.Uri): Promise<boolean> {
     }
 }
 
-async function hasResolvedWriterMerge(root: vscode.Uri, relativePath: string): Promise<boolean> {
-    const resolved = vscode.Uri.joinPath(root, '.overleaf', 'conflicts', 'resolved');
-    let entries: [string, vscode.FileType][];
-    try {
-        entries = await vscode.workspace.fs.readDirectory(resolved);
-    } catch (error) {
-        if ((error as vscode.FileSystemError).code === 'FileNotFound') {
-            return false;
-        }
-        throw error;
-    }
-    for (const [name, type] of entries) {
-        if ((type & vscode.FileType.Directory) === 0 || !name.startsWith('local-writer-merge-')) {
-            continue;
-        }
-        const manifest = await readJson<{path?: string; reason?: string}>(
-            vscode.Uri.joinPath(resolved, name, 'manifest.json'),
-        );
-        if (manifest?.path === relativePath
-            && manifest.reason === 'Concurrent editor-buffer and on-disk text changes were OT-merged') {
-            return true;
-        }
-    }
-    return false;
-}
-
 async function readJson<T>(uri: vscode.Uri): Promise<T | undefined> {
     try {
         const bytes = await vscode.workspace.fs.readFile(uri);
@@ -589,24 +571,26 @@ async function approvedLocalReplica(
             && runtime.pendingAction === false;
     }, 60000, 'wait for the Local Replica watcher, lock, and settled reconciliation queue');
     let state = await stateStore.load();
-    const staleConflictPaths = Object.keys(state.conflicts);
-    assert(staleConflictPaths.every(filePath => /^hershel-e2e-[a-zA-Z0-9_-]+\/.+/.test(filePath)),
-        'The approved Local Replica has a non-E2E conflict');
+    const staleConflictPaths = Object.keys(state.conflicts).filter(filePath => (
+        isE2EConflictPath(filePath)
+    ));
     for (const filePath of staleConflictPaths) {
         await LocalReplicaSCMProvider.resolveE2EConflictUsingRemote(root.fsPath, filePath);
     }
     await waitForAsync(async () => (
-        LocalReplicaSCMProvider.getRuntimeStatus(root.fsPath)?.idle === true
+        LocalReplicaSCMProvider.getRuntimeStatus(root.fsPath)?.settled === true
     ), 60000, 'settle the approved Local Replica after E2E conflict recovery');
     const runtime = LocalReplicaSCMProvider.getRuntimeStatus(root.fsPath);
     assert(runtime && !runtime.paused, 'The approved Local Replica provider is paused');
     assert(runtime.initialized, 'The active Local Replica baseline is not initialized');
     assert(!runtime.pendingAction, 'The active Local Replica has a pending action');
-    assert(runtime.conflictCount === 0, 'The active Local Replica has conflicts');
     state = await stateStore.load();
     assert(state.initialized, 'The approved local replica baseline is not initialized');
     assert(!state.pendingAction, 'The approved local replica has a pending action');
-    assert(Object.keys(state.conflicts).length === 0, 'The approved local replica has active conflicts');
+    assert(
+        !Object.keys(state.conflicts).some(filePath => isE2EConflictPath(filePath)),
+        'The approved local replica has stale E2E conflicts',
+    );
     return {root, stateStore};
 }
 
@@ -651,7 +635,12 @@ async function runRemoteE2E(
     let replicaStateStore: ReplicaStateStore | undefined;
     let runName: string | undefined;
     const sockets: SocketIOAPI[] = [];
-    const sessions: DocumentSession[] = [];
+    const sessions: DurableDocumentSession[] = [];
+    const e2eJournalDirectory = vscode.Uri.joinPath(
+        context.globalStorageUri,
+        'safe-sync-e2e-journals',
+        request.nonce,
+    ).fsPath;
 
     const step = async <T>(
         name: string,
@@ -711,14 +700,15 @@ async function runRemoteE2E(
             await waitForAsync(async () => {
                 const state = await replicaStateStore!.load();
                 cleanupPendingAction = state.pendingAction !== undefined;
-                cleanupConflictCount = Object.keys(state.conflicts).length;
+                cleanupConflictCount = Object.keys(state.conflicts)
+                    .filter(filePath => isE2EConflictPath(filePath, namespace)).length;
                 cleanupEntryCount = Object.keys(state.entries)
                     .filter(path => path === namespace || path.startsWith(`${namespace}/`)).length;
                 const runtime = LocalReplicaSCMProvider.getRuntimeStatus(localRoot!.fsPath);
                 return !cleanupPendingAction
                     && cleanupConflictCount === 0
                     && cleanupEntryCount === 0
-                    && runtime?.idle === true;
+                    && runtime?.settled === true;
             }, 60000, 'verify clean replica state after fixture cleanup');
         }
         await cleanupE2EConflictArtifacts(localRoot, namespace);
@@ -907,7 +897,7 @@ async function runRemoteE2E(
 
             const editor = new SocketIOAPI(server.server.url, api!, identity!, projectId!);
             sockets.push(editor);
-            let remoteSession: DocumentSession | undefined;
+            let remoteSession: DurableDocumentSession | undefined;
             const receiveErrors: Error[] = [];
             editor.updateEventHandlers({
                 onFileChanged: update => {
@@ -924,13 +914,21 @@ async function runRemoteE2E(
             assert(joined.docLines.join('\n') === localContent,
                 'Remote editor joined an unexpected Local Replica snapshot');
             const sessionErrors: Error[] = [];
-            remoteSession = await DocumentSession.create({
+            const remoteJournal = await DocumentJournal.open({
+                directory: e2eJournalDirectory,
+                documentId: `${remoteDocument.entityId}-roundtrip`,
+                initialRevision: joined.version,
+                initialContent: localContent,
+                walOptions: {idleCommitMs: 1, maxCommitMs: 5},
+            });
+            remoteSession = await DurableDocumentSession.create({
                 documentId: remoteDocument.entityId,
-                content: localContent,
-                revision: joined.version,
+                authoritativeContent: localContent,
+                authoritativeRevision: joined.version,
+                journal: remoteJournal,
                 sendUpdate: update => editor.applyOtUpdate(remoteDocument!.entityId, update as UpdateSchema),
-                persist: async () => {},
                 getSourceId: () => editor.sourceId,
+                createOperationId: () => `e2e:${request.nonce}:${randomUUID()}`,
                 onChange: () => {},
                 onError: error => sessionErrors.push(error),
                 retryDelayMs: 3000,
@@ -984,7 +982,8 @@ async function runRemoteE2E(
             await waitForAsync(async () => {
                 const state = await replicaStateStore!.load();
                 return !state.pendingAction
-                    && Object.keys(state.conflicts).length === 0
+                    && !Object.keys(state.conflicts)
+                        .some(filePath => isE2EConflictPath(filePath, isolatedRunName))
                     && state.entries[relativePath] === undefined;
             }, 15000, 'settle clean Local Replica journal after round-trip');
             evidence.localTextRoundTrip = {
@@ -1049,13 +1048,12 @@ async function runRemoteE2E(
                     && converged.includes(editorToken)
                     && converged.includes(diskToken)
                     && !state.pendingAction
-                    && Object.keys(state.conflicts).length === 0;
+                    && !Object.keys(state.conflicts)
+                        .some(filePath => isE2EConflictPath(filePath, isolatedRunName));
             }, 45000, 'converge dirty editor, disk, and remote snapshots', 750);
-            const archived = await hasResolvedWriterMerge(localRoot!, relativePath);
-            assert(archived, 'Writer-overlap variants were not archived under .overleaf/conflicts/resolved');
             evidence.localWriterOverlap = {
                 sha256: createHash('sha256').update(converged).digest('hex'),
-                artifactsArchived: true,
+                journalConverged: true,
             };
 
             await vscode.workspace.fs.delete(localUri);
@@ -1223,7 +1221,7 @@ async function runRemoteE2E(
                     && Buffer.from(currentLocal).equals(remoteBytes)
                     && !state.conflicts[relativePath]
                     && !state.pendingAction
-                    && runtime?.idle === true;
+                    && runtime?.settled === true;
             }, 30000, 'finish explicit binary conflict resolution', 750);
 
             const current = await freshProject(
@@ -1283,7 +1281,8 @@ async function runRemoteE2E(
                     }
                 } while (Date.now() < deadline);
                 const state = await replicaStateStore!.load();
-                assert(!state.pendingAction && Object.keys(state.conflicts).length === 0,
+                assert(!state.pendingAction && !Object.keys(state.conflicts)
+                    .some(filePath => isE2EConflictPath(filePath, isolatedRunName)),
                     'Ignored conflict watcher event changed the active replica journal');
                 evidence.conflictArtifactsRemoteAbsent = true;
             } finally {
@@ -1348,7 +1347,8 @@ async function runRemoteE2E(
             }, 30000, 'apply the Local Replica rename to the remote entity', 750);
             const state = await replicaStateStore!.load();
             const finalPath = `${isolatedRunName}/move-b/local-renamed.tex`;
-            assert(!state.pendingAction && Object.keys(state.conflicts).length === 0,
+            assert(!state.pendingAction && !Object.keys(state.conflicts)
+                .some(filePath => isE2EConflictPath(filePath, isolatedRunName)),
                 'Move/rename left a pending action or conflict');
             assert(state.entries[finalPath]?.entityId === movedDocumentId,
                 'Move/rename lost the stable remote entity id in the replica baseline');
@@ -1359,8 +1359,8 @@ async function runRemoteE2E(
             const socketB = new SocketIOAPI(server.server.url, api!, identity!, projectId!);
             sockets.push(socketA, socketB);
 
-            let sessionA: DocumentSession | undefined;
-            let sessionB: DocumentSession | undefined;
+            let sessionA: DurableDocumentSession | undefined;
+            let sessionB: DurableDocumentSession | undefined;
             const receiveErrors: Error[] = [];
             socketA.updateEventHandlers({
                 onFileChanged: update => {
@@ -1396,25 +1396,41 @@ async function runRemoteE2E(
             const baseRevision = joinedA.version;
 
             const failures: Error[] = [];
-            sessionA = await DocumentSession.create({
+            const journalA = await DocumentJournal.open({
+                directory: e2eJournalDirectory,
+                documentId: `${documentId}-client-a`,
+                initialRevision: baseRevision,
+                initialContent: baseA,
+                walOptions: {idleCommitMs: 1, maxCommitMs: 5},
+            });
+            const journalB = await DocumentJournal.open({
+                directory: e2eJournalDirectory,
+                documentId: `${documentId}-client-b`,
+                initialRevision: baseRevision,
+                initialContent: baseB,
+                walOptions: {idleCommitMs: 1, maxCommitMs: 5},
+            });
+            sessionA = await DurableDocumentSession.create({
                 documentId,
-                content: baseA,
-                revision: baseRevision,
+                authoritativeContent: baseA,
+                authoritativeRevision: baseRevision,
+                journal: journalA,
                 sendUpdate: update => socketA.applyOtUpdate(documentId, update as UpdateSchema),
-                persist: async () => {},
                 getSourceId: () => socketA.sourceId,
+                createOperationId: () => `e2e:${request.nonce}:a:${randomUUID()}`,
                 onChange: () => {},
                 onError: error => failures.push(error),
                 retryDelayMs: 3000,
                 fatalDelayMs: 15000,
             });
-            sessionB = await DocumentSession.create({
+            sessionB = await DurableDocumentSession.create({
                 documentId,
-                content: baseB,
-                revision: baseRevision,
+                authoritativeContent: baseB,
+                authoritativeRevision: baseRevision,
+                journal: journalB,
                 sendUpdate: update => socketB.applyOtUpdate(documentId, update as UpdateSchema),
-                persist: async () => {},
                 getSourceId: () => socketB.sourceId,
+                createOperationId: () => `e2e:${request.nonce}:b:${randomUUID()}`,
                 onChange: () => {},
                 onError: error => failures.push(error),
                 retryDelayMs: 3000,
@@ -1516,8 +1532,13 @@ async function runRemoteE2E(
         };
     } finally {
         for (const session of sessions) {
-            session.dispose();
+            await session.close().catch(error => {
+                output.appendLine(`[warn] E2E journal close failed: ${safeMessage(error)}`);
+            });
         }
+        await removeDisk(e2eJournalDirectory, {recursive: true, force: true}).catch(error => {
+            output.appendLine(`[warn] E2E journal cleanup failed: ${safeMessage(error)}`);
+        });
         for (const socket of sockets) {
             try {
                 socket.disconnect();

@@ -83,4 +83,17 @@ describe('replica persistence', () => {
         await assert.rejects(() => store.load(), SyntaxError);
         await store.close();
     });
+
+    it('keeps content-addressed common bases outside the replica tree', async () => {
+        const store = new ReplicaStateStore(root, 'server', 'project', '/workspace');
+        const content = Buffer.from('common binary base');
+        const hash = await store.saveBaseline(content);
+        assert.strictEqual(hash, createHash('sha256').update(content).digest('hex'));
+        assert.deepStrictEqual(
+            Buffer.from(await store.readBaseline(hash)),
+            content,
+        );
+        assert.strictEqual(await store.readBaseline('0'.repeat(64)), undefined);
+        await store.close();
+    });
 });

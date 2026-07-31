@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'crypto';
-import { mkdir, open, readFile, rename, rm } from 'fs/promises';
+import { mkdir, open, readFile, rename, rm, stat } from 'fs/promises';
 import * as path from 'path';
 import { ProjectionReceipt } from './projectionTracker';
 import { SerializedAiWriterLeaseState } from './aiWriterLease';
@@ -23,8 +23,13 @@ export interface ConflictRecord {
     createdAt: string;
     localFile?: string;
     remoteFile?: string;
+    baseFile?: string;
+    baseHash?: string;
     localHash?: string;
     remoteHash?: string;
+    baselineEntityId?: string;
+    remoteEntityId?: string;
+    remoteRevision?: number;
 }
 
 export type ReplicaActionKind =
@@ -65,8 +70,10 @@ export interface ReplicaState {
 export class ReplicaStateStore {
     readonly statePath: string;
     private readonly walPath: string;
+    private readonly baselineDirectory: string;
     private wal?: DurableWal<ReplicaState>;
     private lastStablePayload?: string;
+    private saveChain: Promise<void> = Promise.resolve();
 
     constructor(rootDirectory: string, serverName: string, projectId: string, basePath: string) {
         const key = createHash('sha256')
@@ -74,6 +81,7 @@ export class ReplicaStateStore {
             .digest('hex');
         this.statePath = path.join(rootDirectory, 'safe-sync', 'replicas', `${key}.json`);
         this.walPath = path.join(rootDirectory, 'safe-sync', 'replicas', `${key}.wal`);
+        this.baselineDirectory = path.join(rootDirectory, 'safe-sync', 'baselines', key);
     }
 
     async load(): Promise<ReplicaState> {
@@ -107,6 +115,19 @@ export class ReplicaStateStore {
     }
 
     async save(state: ReplicaState): Promise<void> {
+        // Checkpoint replacement and WAL append must share one ordering. A
+        // projection receipt from one document must not overwrite a receipt
+        // or conflict record committed by another document concurrently.
+        const snapshot = JSON.parse(JSON.stringify(state)) as ReplicaState;
+        const write = this.saveChain.then(
+            () => this.saveInternal(snapshot),
+            () => this.saveInternal(snapshot),
+        );
+        this.saveChain = write.then(() => undefined, () => undefined);
+        return write;
+    }
+
+    private async saveInternal(state: ReplicaState): Promise<void> {
         this.wal ??= await DurableWal.open<ReplicaState>(this.walPath);
         const directory = path.dirname(this.statePath);
         await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -154,8 +175,65 @@ export class ReplicaStateStore {
     }
 
     async close(): Promise<void> {
+        await this.saveChain;
         await this.wal?.close();
         this.wal = undefined;
+    }
+
+    /** Persist one content-addressed common-base snapshot outside the project tree. */
+    async saveBaseline(content: Uint8Array): Promise<string> {
+        const hash = createHash('sha256').update(content).digest('hex');
+        await mkdir(this.baselineDirectory, { recursive: true, mode: 0o700 });
+        const destination = path.join(this.baselineDirectory, hash);
+        try {
+            await stat(destination);
+            return hash;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw error;
+            }
+        }
+        const temporary = `${destination}.${randomUUID()}.tmp`;
+        const handle = await open(temporary, 'wx', 0o600);
+        try {
+            await handle.writeFile(content);
+            await handle.sync();
+        } finally {
+            await handle.close();
+        }
+        try {
+            await rename(temporary, destination);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+                throw error;
+            }
+            await rm(temporary, { force: true });
+        }
+        const directoryHandle = await open(this.baselineDirectory, 'r');
+        try {
+            await directoryHandle.sync();
+        } finally {
+            await directoryHandle.close();
+        }
+        return hash;
+    }
+
+    async readBaseline(hash: string): Promise<Uint8Array | undefined> {
+        if (!/^[a-f0-9]{64}$/.test(hash)) {
+            throw new Error(`Invalid safe-sync baseline hash: ${hash}`);
+        }
+        try {
+            const content = await readFile(path.join(this.baselineDirectory, hash));
+            if (createHash('sha256').update(content).digest('hex') !== hash) {
+                throw new Error(`Stored safe-sync baseline is corrupt: ${hash}`);
+            }
+            return content;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+                return undefined;
+            }
+            throw error;
+        }
     }
 
     private validate(state: ReplicaState): void {
