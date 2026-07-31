@@ -41,6 +41,7 @@ describe('replica persistence', () => {
         assert.strictEqual(restored.replicaId, state.replicaId);
         assert.deepStrictEqual(restored.entries, state.entries);
         assert.deepStrictEqual(restored.pendingAction, state.pendingAction);
+        await store.close();
     });
 
     it('allows only one active writer for a replica key', async () => {
@@ -80,5 +81,6 @@ describe('replica persistence', () => {
         await mkdir(path.dirname(store.statePath), { recursive: true });
         await writeFile(store.statePath, '{not-json');
         await assert.rejects(() => store.load(), SyntaxError);
+        await store.close();
     });
 });

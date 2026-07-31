@@ -79,18 +79,21 @@ export class OtClientState {
         return this.outstanding ? this.outgoing(this.outstanding) : undefined;
     }
 
-    submitSnapshot(content: string): { id?: string; send?: OutgoingOperation } {
-        return this.submitOperation(TextOperation.fromDiff(this.localContent, content));
+    submitSnapshot(content: string, id?: string): { id?: string; send?: OutgoingOperation } {
+        return this.submitOperation(TextOperation.fromDiff(this.localContent, content), id);
     }
 
-    submitOperation(operation: TextOperation): { id?: string; send?: OutgoingOperation } {
+    submitOperation(operation: TextOperation, suppliedId?: string): { id?: string; send?: OutgoingOperation } {
         if (operation.baseLength !== this.localContent.length) {
             throw new Error('Local operation does not apply to the visible document');
         }
         if (operation.isNoop) {
             return {};
         }
-        const id = this.idFactory();
+        const id = suppliedId ?? this.idFactory();
+        if (id.length === 0) {
+            throw new Error('Operation id must not be empty');
+        }
         this.localContent = operation.apply(this.localContent);
         if (this.outstanding) {
             if (this.pending) {

@@ -454,6 +454,7 @@ describe('Local Replica pending text action recovery', () => {
             localIdentity: '1:2',
         };
         provider.disposed = false;
+        provider.textReplicas = new Map();
         provider.state = {
             schemaVersion: 1,
             replicaId: 'replica',
@@ -493,6 +494,7 @@ describe('Local Replica pending text action recovery', () => {
         provider.scanBoth = async () => scan;
         provider.renderReport = () => {};
         provider.vfs = {safeSyncCapability: {writable: true}};
+        provider.ensureTextReplicas = async () => {};
         const persisted = [];
         provider.stateStore = {
             save: async state => persisted.push(structuredClone(state)),

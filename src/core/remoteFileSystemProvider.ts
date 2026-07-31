@@ -1,5 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
+import { createHash, randomUUID } from 'crypto';
+import * as path from 'path';
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME, URI_SCHEME } from '../consts';
@@ -8,7 +10,12 @@ import { ClientManager } from '../collaboration/clientManager';
 import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
-import { DocumentSession } from '../sync/documentSession';
+import { DocumentJournal } from '../sync/documentJournal';
+import {
+    AcceptedDocumentOperation,
+    DurableDocumentSession,
+    DurableLegacyDocumentUpdate,
+} from '../sync/durableDocumentSession';
 import { DocumentStateStore } from '../sync/documentStateStore';
 import { contentHash } from '../sync/syncPolicy';
 import { evaluateSafeSyncCapability } from '../sync/capabilityPolicy';
@@ -155,8 +162,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     private compileGroup?: string;
     private clsiServerId?: string;
     private pdfDownloadDomain?: string;
-    private readonly documentStateStore: DocumentStateStore;
-    private readonly documentSessions = new Map<string, Promise<DocumentSession>>();
+    private readonly documentJournalDirectory: string;
+    private readonly legacyDocumentStateStore: DocumentStateStore;
+    private readonly documentSessions = new Map<string, Promise<DurableDocumentSession>>();
     private notify: (events:vscode.FileChangeEvent[])=>void;
     private clientManagerItem?: {manager: ClientManager, triggers: vscode.Disposable[]};
     private scmCollectionItem?: {collection: SCMCollectionProvider, triggers: vscode.Disposable[]};
@@ -188,7 +196,15 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.projectId = projectId;
         this.context = context;
         this.notify = notify;
-        this.documentStateStore = new DocumentStateStore(context, serverName, projectId);
+        const projectKey = createHash('sha256')
+            .update(`${serverName}\0${projectId}`)
+            .digest('hex');
+        this.documentJournalDirectory = path.join(
+            context.globalStorageUri.fsPath,
+            'safe-sync-v2',
+            projectKey,
+        );
+        this.legacyDocumentStateStore = new DocumentStateStore(context, serverName, projectId);
 
         const res = GlobalStateManager.initSocketIOAPI(this.context, this.serverName, projectId);
         if (res) {
@@ -531,9 +547,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                 if (res) {
                     const {parentFolder, fileType, fileEntity} = res;
                     const session = this.documentSessions.get(entityId);
-                    session?.then(value => value.dispose()).catch(() => {});
+                    session?.then(value => value.close()).catch(() => {});
                     this.documentSessions.delete(entityId);
-                    this.documentStateStore.remove(entityId).catch(error => {
+                    DocumentJournal.remove(this.documentJournalDirectory, entityId).catch(error => {
                         console.error(`[hershel-safe-sync] failed to remove state for ${entityId}`, error);
                     });
                     this.removeEntity(parentFolder, fileType, fileEntity);
@@ -629,7 +645,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         );
     }
 
-    private getDocumentSession(doc: DocumentEntity, path: string): Promise<DocumentSession> {
+    private getDocumentSession(doc: DocumentEntity, path: string): Promise<DurableDocumentSession> {
         const existing = this.documentSessions.get(doc._id);
         if (existing) {
             return existing;
@@ -639,47 +655,60 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (!this.supportsRealtimeTextOt) {
                 throw new Error('Safe text synchronization requires the realtime Overleaf OT protocol');
             }
-            const stored = await this.documentStateStore.load(doc._id);
+            let journal = await DocumentJournal.openExisting(this.documentJournalDirectory, doc._id);
+            const legacy = journal
+                ? undefined
+                : await this.legacyDocumentStateStore.load(doc._id);
             let joined;
-            let catchUpUpdates: UpdateSchema[] | undefined;
-            if (stored) {
-                try {
-                    joined = await this.socket.joinDoc(doc._id, stored.state.revision);
-                    if (!Array.isArray(joined.updates)) {
-                        throw new Error('Server did not return an OT catch-up operation list');
-                    }
-                    const updates = joined.updates as UpdateSchema[];
-                    catchUpUpdates = updates;
-                    if (joined.version - stored.state.revision !== updates.length) {
-                        throw new Error(
-                            `Server returned ${updates.length} catch-up operations for `
-                            + `${joined.version - stored.state.revision} revisions`,
-                        );
-                    }
-                } catch (error) {
-                    console.warn(
-                        `[hershel-safe-sync] exact catch-up unavailable for ${doc._id}; using strict snapshot recovery`,
-                        error,
+            let catchUpUpdates: DurableLegacyDocumentUpdate[] | undefined;
+            if (journal || legacy) {
+                const recoveryRevision = journal?.revision ?? legacy!.state.revision;
+                joined = await this.socket.joinDoc(doc._id, recoveryRevision);
+                if (!Array.isArray(joined.updates)) {
+                    throw new Error('Server did not return an OT catch-up operation list');
+                }
+                const updates = joined.updates as DurableLegacyDocumentUpdate[];
+                catchUpUpdates = updates;
+                if (joined.version - recoveryRevision !== updates.length) {
+                    throw new Error(
+                        `Server returned ${updates.length} catch-up operations for `
+                        + `${joined.version - recoveryRevision} revisions`,
                     );
-                    joined = await this.socket.joinDoc(doc._id);
-                    catchUpUpdates = undefined;
                 }
             } else {
                 joined = await this.socket.joinDoc(doc._id);
+                journal = await DocumentJournal.open({
+                    directory: this.documentJournalDirectory,
+                    documentId: doc._id,
+                    initialRevision: joined.version,
+                    initialContent: joined.docLines.join('\n'),
+                });
+            }
+            if (legacy) {
+                journal = await DocumentJournal.open({
+                    directory: this.documentJournalDirectory,
+                    documentId: doc._id,
+                    initialRevision: legacy.state.revision,
+                    initialContent: legacy.state.serverContent,
+                });
+                await journal.seedLegacyState(legacy.state);
+            }
+            if (!journal) {
+                throw new Error(`Document journal was not initialized for ${doc._id}`);
             }
             if (joined.otType !== 'sharejs-text-ot') {
                 throw new Error(`Unsupported Overleaf document OT type: ${joined.otType}`);
             }
             const serverContent = joined.docLines.join('\n');
-            return DocumentSession.create({
+            return DurableDocumentSession.create({
                 documentId: doc._id,
-                content: serverContent,
-                revision: joined.version,
-                savedState: stored?.state,
+                authoritativeContent: serverContent,
+                authoritativeRevision: joined.version,
+                journal,
                 catchUpUpdates,
                 sendUpdate: update => this.socket.applyOtUpdate(doc._id, update as UpdateSchema),
-                persist: state => this.documentStateStore.save(doc._id, state),
                 getSourceId: () => this.publicId,
+                createOperationId: () => `${this.projectId}:${doc._id}:${randomUUID()}`,
                 onChange: (content, revision, acknowledgedContent) => {
                     doc.version = revision;
                     doc.localCache = content;
@@ -692,9 +721,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                 onError: error => {
                     doc.localCache = undefined;
                     doc.remoteCache = undefined;
-                    console.error(`[hershel-safe-sync] document ${doc._id} paused`, error);
-                    vscode.window.showErrorMessage(
-                        vscode.l10n.t('Safe synchronization paused for {path}: {message}', {
+                    console.error(`[hershel-safe-sync] document ${doc._id} isolated`, error);
+                    vscode.window.showWarningMessage(
+                        vscode.l10n.t('Safe synchronization isolated {path}: {message}', {
                             path,
                             message: error.message,
                         })
@@ -712,7 +741,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     private resetDocumentSessions(): void {
         for (const session of this.documentSessions.values()) {
-            session.then(value => value.dispose()).catch(() => {});
+            session.then(value => value.close()).catch(() => {});
         }
         this.documentSessions.clear();
     }
@@ -724,28 +753,16 @@ export class VirtualFileSystem extends vscode.Disposable {
             throw vscode.FileSystemError.FileNotFound(uri);
         }
         if (fileType === 'doc') {
-            const existing = this.documentSessions.get(fileEntity._id);
-            if (existing) {
-                const session = await existing;
-                return {
-                    content: new TextEncoder().encode(session.acknowledgedContent),
-                    entityId: fileEntity._id,
-                    fileType,
-                    revision: session.revision,
-                };
-            }
-            const joined = await this.socket.joinDoc(fileEntity._id);
-            if (!Number.isInteger(joined.version) || !Array.isArray(joined.docLines)) {
-                throw new Error(`Server returned an invalid OT snapshot for ${uri.path}`);
-            }
-            if (joined.otType !== 'sharejs-text-ot') {
-                throw new Error(`Unsupported Overleaf document OT type: ${joined.otType}`);
-            }
+            const resolved = this._resolveById(fileEntity._id);
+            const session = await this.getDocumentSession(
+                fileEntity as DocumentEntity,
+                resolved?.path ?? fileEntity.name,
+            );
             return {
-                content: new TextEncoder().encode(joined.docLines.join('\n')),
+                content: new TextEncoder().encode(session.acknowledgedContent),
                 entityId: fileEntity._id,
                 fileType,
-                revision: joined.version,
+                revision: session.revision,
             };
         }
         return {
@@ -771,6 +788,47 @@ export class VirtualFileSystem extends vscode.Disposable {
             resolved?.path ?? fileEntity.name,
         );
         return session.submitSnapshotAgainstAncestor(ancestor, target);
+    }
+
+    /** Journal a document operation without waiting for its remote acknowledgement. */
+    async acceptDocumentSnapshotAgainstAncestor(
+        uri: vscode.Uri,
+        ancestor: string,
+        target: string,
+        barrier = false,
+    ): Promise<AcceptedDocumentOperation> {
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (fileType !== 'doc' || !fileEntity) {
+            throw new Error(`Expected an Overleaf document at ${uri.path}`);
+        }
+        const resolved = this._resolveById(fileEntity._id);
+        const session = await this.getDocumentSession(
+            fileEntity as DocumentEntity,
+            resolved?.path ?? fileEntity.name,
+        );
+        return session.acceptSnapshotAgainstAncestor(ancestor, target, barrier);
+    }
+
+    /** Read the current canonical visible text and OT revision for a document. */
+    async readDocumentProjection(uri: vscode.Uri): Promise<{
+        content: string;
+        revision: number;
+        entityId: string;
+    }> {
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (fileType !== 'doc' || !fileEntity) {
+            throw new Error(`Expected an Overleaf document at ${uri.path}`);
+        }
+        const resolved = this._resolveById(fileEntity._id);
+        const session = await this.getDocumentSession(
+            fileEntity as DocumentEntity,
+            resolved?.path ?? fileEntity.name,
+        );
+        return {
+            content: session.content,
+            revision: session.revision,
+            entityId: fileEntity._id,
+        };
     }
 
     /** Replace a resource only when its identity and bytes still match the durable baseline. */

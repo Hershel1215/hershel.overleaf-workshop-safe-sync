@@ -34,6 +34,19 @@ import {
     shouldIgnore,
 } from '../sync/syncPolicy';
 import { createLocalReplicaBinding, ensureLocalReplicaBinding } from '../sync/localBinding';
+import {
+    TextReplicaIsolation,
+    TextReplicaStateMachine,
+} from '../sync/textReplicaStateMachine';
+import {
+    AiGatewayRequest,
+    AiGatewayServer,
+} from '../sync/aiGateway';
+import {
+    AiWriterLease,
+    AiWriterLeaseManager,
+} from '../sync/aiWriterLease';
+import { FairTaskScheduler } from '../sync/fairTaskScheduler';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 const TEXT_DEBOUNCE_MS = 350;
@@ -99,6 +112,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private localWatcher?: vscode.FileSystemWatcher;
     private reconcileTimer?: NodeJS.Timeout;
     private readonly reconcileQueue = new SerialTaskQueue();
+    private readonly textReplicas = new Map<string, TextReplicaStateMachine>();
+    private readonly textSchedulers = new Map<string, FairTaskScheduler>();
+    private readonly aiLeases = new AiWriterLeaseManager();
+    private readonly aiTransactions = new Map<string, {
+        lease: AiWriterLease;
+        path: string;
+        baseContent: string;
+        entityId: string;
+    }>();
+    private aiGateway?: AiGatewayServer;
+    private observationReady = false;
+    private readonly recoveryObservations = new Set<string>();
     private pausedError?: Error;
     private disposed = false;
     private lockHeld = false;
@@ -289,6 +314,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async initWatch(): Promise<vscode.Disposable[]> {
         this.disposed = false;
         this.startupSettled = false;
+        this.observationReady = false;
+        this.recoveryObservations.clear();
         if (this.baseUri.scheme !== 'file') {
             throw new Error('Safe local replicas require a file:// directory');
         }
@@ -315,6 +342,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         await this.vfs.init();
         try {
             this.state = await this.stateStore.load();
+            if (this.state.aiLeaseState) {
+                const recovered = this.state.aiLeaseState;
+                this.aiLeases.restore({
+                    nextFencingToken: recovered.nextFencingToken,
+                    leases: [],
+                });
+                this.state.aiLeaseState = this.aiLeases.serialize();
+                await this.stateStore.save(this.state);
+            }
         } catch (error) {
             this.failProject(this.asError(error));
         }
@@ -326,22 +362,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             new vscode.RelativePattern(this.baseUri.fsPath, '**/*'),
         );
         const listeners: vscode.Disposable[] = [
-            this.vfsWatcher.onDidChange(() => this.scheduleReconcile('remote change', 100)),
-            this.vfsWatcher.onDidCreate(() => this.scheduleReconcile('remote create', 100)),
-            this.vfsWatcher.onDidDelete(() => this.scheduleReconcile('remote delete', 100)),
+            this.vfsWatcher.onDidChange(uri => this.onRemoteFileEvent(uri, 'change')),
+            this.vfsWatcher.onDidCreate(uri => this.onRemoteFileEvent(uri, 'create')),
+            this.vfsWatcher.onDidDelete(uri => this.onRemoteFileEvent(uri, 'delete')),
             this.localWatcher.onDidChange(uri => this.onLocalFileEvent(uri, 'change')),
             this.localWatcher.onDidCreate(uri => this.onLocalFileEvent(uri, 'create')),
             this.localWatcher.onDidDelete(uri => this.onLocalFileEvent(uri, 'delete')),
             vscode.workspace.onDidChangeTextDocument(event => {
                 const relative = this.relativeLocalPath(event.document.uri);
                 if (relative !== undefined && !this.isIgnored(relative)) {
-                    this.scheduleReconcile(`text edit: ${relative}`, TEXT_DEBOUNCE_MS);
+                    if (!this.observationReady) {
+                        this.recoveryObservations.add(`editor:${relative}`);
+                    } else {
+                        void this.onLocalTextDocumentChange(relative, event.document);
+                    }
+                }
+            }),
+            vscode.workspace.onWillSaveTextDocument(event => {
+                const relative = this.relativeLocalPath(event.document.uri);
+                const machine = relative === undefined ? undefined : this.textReplicas.get(relative);
+                if (this.observationReady && relative !== undefined && machine && !this.isIgnored(relative)) {
+                    event.waitUntil(machine.beforeEditorSave(event.document.getText()));
                 }
             }),
             vscode.workspace.onDidSaveTextDocument(document => {
                 const relative = this.relativeLocalPath(document.uri);
-                if (relative !== undefined && !this.isIgnored(relative)) {
-                    this.scheduleReconcile(`text save: ${relative}`, 100);
+                const machine = relative === undefined ? undefined : this.textReplicas.get(relative);
+                if (!this.observationReady && relative !== undefined) {
+                    this.recoveryObservations.add(`editor:${relative}`);
+                    this.recoveryObservations.add(`local:${relative}`);
+                } else if (relative !== undefined && machine && !this.isIgnored(relative)) {
+                    machine.onEditorSaved(document.getText());
                 }
             }),
         ];
@@ -351,6 +402,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         try {
             if (!this.pausedError) {
                 await this.enqueueReconcile('startup');
+                await this.startAiGateway();
+                if (!this.pausedError) {
+                    this.observationReady = true;
+                    await this.replayRecoveryObservations();
+                }
             }
         } finally {
             this.startupSettled = true;
@@ -362,6 +418,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ...listeners,
             new vscode.Disposable(() => {
                 this.disposed = true;
+                this.observationReady = false;
+                for (const machine of this.textReplicas.values()) {
+                    machine.dispose();
+                }
+                this.textReplicas.clear();
+                for (const scheduler of this.textSchedulers.values()) {
+                    scheduler.dispose();
+                }
+                this.textSchedulers.clear();
+                void this.stopAiGateway();
+                void this.stateStore.close();
                 if (this.reconcileTimer) {
                     clearTimeout(this.reconcileTimer);
                     this.reconcileTimer = undefined;
@@ -379,6 +446,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     public dispose(): void {
         this.disposed = true;
+        this.observationReady = false;
+        for (const machine of this.textReplicas.values()) {
+            machine.dispose();
+        }
+        this.textReplicas.clear();
+        for (const scheduler of this.textSchedulers.values()) {
+            scheduler.dispose();
+        }
+        this.textSchedulers.clear();
+        void this.stopAiGateway();
+        void this.stateStore.close();
         if (this.reconcileTimer) {
             clearTimeout(this.reconcileTimer);
             this.reconcileTimer = undefined;
@@ -405,7 +483,497 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (relative === undefined || this.isIgnored(relative)) {
             return;
         }
+        if (!this.observationReady) {
+            this.recoveryObservations.add(`local:${relative}`);
+            return;
+        }
+        const machine = this.textReplicas.get(relative);
+        if (machine) {
+            void this.readLocalText(relative).then(content => this.textTask(
+                relative,
+                'filesystem',
+                () => machine.onDiskObserved(content),
+            )).catch(error => {
+                this.handleTextReplicaError(relative, error);
+            });
+            return;
+        }
         this.scheduleReconcile(`local ${kind}: ${relative}`, TEXT_DEBOUNCE_MS);
+    }
+
+    private onRemoteFileEvent(uri: vscode.Uri, kind: string): void {
+        const relative = this.relativeRemotePath(uri);
+        if (relative === undefined || this.isIgnored(relative)) {
+            return;
+        }
+        if (!this.observationReady) {
+            this.recoveryObservations.add(`remote:${relative}`);
+            return;
+        }
+        const machine = this.textReplicas.get(relative);
+        if (machine) {
+            void this.readRemoteText(relative).then(content => this.textTask(
+                relative,
+                'remote',
+                () => machine.onCanonicalChanged(content),
+            )).catch(error => {
+                this.handleTextReplicaError(relative, error);
+            });
+            return;
+        }
+        this.scheduleReconcile(`remote ${kind}: ${relative}`, 100);
+    }
+
+    private async onLocalTextDocumentChange(
+        filePath: string,
+        document: vscode.TextDocument,
+    ): Promise<void> {
+        if (!this.observationReady) {
+            this.recoveryObservations.add(`editor:${filePath}`);
+            return;
+        }
+        const machine = this.textReplicas.get(filePath);
+        if (!machine) {
+            this.scheduleReconcile(`text edit before replica attach: ${filePath}`, TEXT_DEBOUNCE_MS);
+            return;
+        }
+        try {
+            await this.textTask(
+                filePath,
+                'editor',
+                () => machine.onEditorChanged(document.getText()),
+            );
+            this.status = { status: 'push', message: `Journalizing text: ${filePath}` };
+        } catch (error) {
+            this.handleTextReplicaError(filePath, error);
+        }
+    }
+
+    private async replayRecoveryObservations(): Promise<void> {
+        const observations = [...this.recoveryObservations];
+        this.recoveryObservations.clear();
+        for (const encoded of observations) {
+            const separator = encoded.indexOf(':');
+            const source = encoded.slice(0, separator);
+            const filePath = encoded.slice(separator + 1);
+            if (source === 'editor') {
+                const document = vscode.workspace.textDocuments.find(
+                    candidate => candidate.uri.fsPath === this.localUri(filePath).fsPath,
+                );
+                if (document) {
+                    await this.onLocalTextDocumentChange(filePath, document);
+                }
+            } else if (source === 'local') {
+                this.onLocalFileEvent(this.localUri(filePath), 'recovery replay');
+            } else if (source === 'remote') {
+                this.onRemoteFileEvent(this.remoteUri(filePath), 'recovery replay');
+            }
+        }
+    }
+
+    private async ensureTextReplicas(scan: ScanPair): Promise<void> {
+        for (const [filePath, remote] of scan.remote) {
+            if (remote.fileType !== 'doc' || remote.text === undefined || isPathConflicted(filePath, this.requireState())) {
+                continue;
+            }
+            if (this.textReplicas.has(filePath)) {
+                continue;
+            }
+            const local = scan.local.get(filePath);
+            await this.createTextReplica(filePath, remote.text, local);
+        }
+    }
+
+    private async createTextReplica(
+        filePath: string,
+        canonicalContent: string,
+        local: ReplicaSnapshot | undefined,
+    ): Promise<void> {
+        if (this.textReplicas.has(filePath)) {
+            return;
+        }
+        const openDocument = vscode.workspace.textDocuments.find(
+            document => document.uri.fsPath === this.localUri(filePath).fsPath,
+        );
+        const diskContent = await this.readLocalText(filePath);
+        const editorContent = openDocument?.getText();
+        const baseline = this.state?.entries[filePath];
+
+        const machine = new TextReplicaStateMachine({
+            path: filePath,
+            canonicalContent,
+            editorContent: editorContent ?? diskContent,
+            editorDirty: openDocument?.isDirty ?? false,
+            diskContent: baseline?.fileType === 'doc' && baseline.text !== undefined
+                ? baseline.text
+                : diskContent,
+            projectionReceipts: this.state?.projectionReceipts,
+        }, {
+            commit: (ancestor, target, barrier) => this.vfs.acceptDocumentSnapshotAgainstAncestor(
+                this.remoteUri(filePath),
+                ancestor,
+                target,
+                barrier,
+            ),
+            projectEditor: async content => {
+                const document = vscode.workspace.textDocuments.find(
+                    candidate => candidate.uri.fsPath === this.localUri(filePath).fsPath,
+                );
+                if (!document || document.getText() === content) {
+                    return;
+                }
+                const edit = new vscode.WorkspaceEdit();
+                const end = document.positionAt(document.getText().length);
+                edit.replace(document.uri, new vscode.Range(
+                    new vscode.Position(0, 0),
+                    end,
+                ), content);
+                if (!await vscode.workspace.applyEdit(edit)) {
+                    throw new Error(`VS Code rejected internal projection for ${filePath}`);
+                }
+            },
+            projectDisk: async content => {
+                await this.ensureLocalParent(filePath);
+                await vscode.workspace.fs.writeFile(
+                    this.localUri(filePath),
+                    new TextEncoder().encode(content),
+                );
+            },
+            persistProjectionReceipts: async receipts => {
+                if (this.state) {
+                    this.state.projectionReceipts = receipts;
+                    await this.stateStore.save(this.state);
+                }
+            },
+            isolate: record => this.createTextConflict(record),
+        });
+        this.textReplicas.set(filePath, machine);
+        this.textSchedulers.set(filePath, new FairTaskScheduler());
+
+        if (!local || local.fileType !== 'doc') {
+            return;
+        }
+        const localText = local.text;
+        if (localText === canonicalContent) {
+            return;
+        }
+        if (baseline?.fileType === 'doc' && baseline.text === canonicalContent && !openDocument?.isDirty) {
+            await machine.onDiskObserved(localText);
+            return;
+        }
+        if (baseline?.fileType === 'doc' && baseline.text === localText && canonicalContent !== localText) {
+            await machine.onCanonicalChanged(canonicalContent);
+            return;
+        }
+        await this.createTextConflict({
+            path: filePath,
+            reason: 'Text content differed before a v2 operation ancestry could be established',
+            canonicalContent,
+            editorContent,
+            diskContent,
+        });
+    }
+
+    private async createTextConflict(record: TextReplicaIsolation): Promise<void> {
+        const state = this.requireState();
+        if (state.conflicts[record.path]) {
+            return;
+        }
+        const artifactDirectory = `.overleaf/conflicts/unresolved/${this.timestamp()}-${randomUUID()}`;
+        await this.writeArtifact(
+            `${artifactDirectory}/manifest.json`,
+            new TextEncoder().encode(JSON.stringify({
+                schemaVersion: 2,
+                path: record.path,
+                reason: record.reason,
+                canonicalHash: contentHash(new TextEncoder().encode(record.canonicalContent)),
+                editorHash: record.editorContent === undefined
+                    ? undefined
+                    : contentHash(new TextEncoder().encode(record.editorContent)),
+                diskHash: record.diskContent === undefined
+                    ? undefined
+                    : contentHash(new TextEncoder().encode(record.diskContent)),
+            }, null, 2)),
+        );
+        await this.writeArtifact(
+            `${artifactDirectory}/remote/${record.path}`,
+            new TextEncoder().encode(record.canonicalContent),
+        );
+        if (record.editorContent !== undefined) {
+            await this.writeArtifact(
+                `${artifactDirectory}/local-editor/${record.path}`,
+                new TextEncoder().encode(record.editorContent),
+            );
+        }
+        if (record.diskContent !== undefined && record.diskContent !== record.editorContent) {
+            await this.writeArtifact(
+                `${artifactDirectory}/local-disk/${record.path}`,
+                new TextEncoder().encode(record.diskContent),
+            );
+        }
+        state.conflicts[record.path] = {
+            path: record.path,
+            artifactDirectory,
+            reason: record.reason,
+            createdAt: new Date().toISOString(),
+            remoteFile: `${artifactDirectory}/remote/${record.path}`,
+            localFile: record.editorContent === undefined
+                ? record.diskContent === undefined ? undefined : `${artifactDirectory}/local-disk/${record.path}`
+                : `${artifactDirectory}/local-editor/${record.path}`,
+            remoteHash: contentHash(new TextEncoder().encode(record.canonicalContent)),
+            localHash: record.editorContent === undefined
+                ? record.diskContent === undefined ? undefined : contentHash(new TextEncoder().encode(record.diskContent))
+                : contentHash(new TextEncoder().encode(record.editorContent)),
+        };
+        await this.stateStore.save(state);
+        this.status = { status: 'need-attention', message: `Isolated text path: ${record.path}` };
+        this.renderReport(this.lastScan ?? {local: new Map(), remote: new Map()}, `isolated ${record.path}`);
+    }
+
+    private handleTextReplicaError(filePath: string, error: unknown): void {
+        const normalized = this.asError(error);
+        void this.createTextConflict({
+            path: filePath,
+            reason: normalized.message,
+            canonicalContent: this.textReplicas.get(filePath)?.canonical ?? '',
+        }).catch(conflictError => this.failProject(this.asError(conflictError)));
+    }
+
+    private async readRemoteText(filePath: string): Promise<string> {
+        const content = await this.vfs.openFile(this.remoteUri(filePath));
+        return new TextDecoder('utf-8', { fatal: true }).decode(content);
+    }
+
+    private async readLocalText(filePath: string): Promise<string | undefined> {
+        try {
+            const uri = this.localUri(filePath);
+            return new TextDecoder('utf-8', { fatal: true }).decode(
+                await vscode.workspace.fs.readFile(uri),
+            );
+        } catch (error) {
+            if (this.isFileNotFound(error)) {
+                return undefined;
+            }
+            throw error;
+        }
+    }
+
+    private relativeRemotePath(uri: vscode.Uri): string | undefined {
+        if (uri.scheme !== this.vfs.origin.scheme) {
+            return undefined;
+        }
+        const prefix = this.vfs.origin.path.replace(/\/$/, '');
+        const relative = uri.path.startsWith(prefix) ? uri.path.slice(prefix.length) : undefined;
+        return relative === undefined ? undefined : normalizeRelativePath(relative);
+    }
+
+    private async startAiGateway(): Promise<void> {
+        if (this.aiGateway || this.disposed) {
+            return;
+        }
+        const metadataPath = path.join(this.baseUri.fsPath, '.overleaf', 'safe-sync-gateway.json');
+        this.aiGateway = new AiGatewayServer(metadataPath, {
+            handle: request => this.handleAiGatewayRequest(request),
+        }, undefined, this.context.asAbsolutePath('out/sync/aiGatewayCli.js'));
+        try {
+            const metadata = await this.aiGateway.start();
+            this.output.appendLine(`AI gateway ready: ${metadataPath}`);
+            this.output.appendLine(
+                `AI gateway CLI: node ${metadata.cliPath} ${metadataPath} begin <path> <holder>`,
+            );
+        } catch (error) {
+            this.aiGateway = undefined;
+            this.output.appendLine(`[ai-gateway] unavailable: ${this.asError(error).message}`);
+            vscode.window.showWarningMessage(
+                `Safe-sync AI gateway unavailable: ${this.asError(error).message}`,
+            );
+        }
+    }
+
+    private async stopAiGateway(): Promise<void> {
+        const gateway = this.aiGateway;
+        this.aiGateway = undefined;
+        if (gateway) {
+            await gateway.stop().catch(error => {
+                this.output.appendLine(`[ai-gateway] stop failed: ${this.asError(error).message}`);
+            });
+        }
+    }
+
+    private async handleAiGatewayRequest(request: AiGatewayRequest): Promise<unknown> {
+        const filePath = typeof request.path === 'string'
+            ? normalizeRelativePath(request.path)
+            : undefined;
+        const scheduler = filePath === undefined ? undefined : this.textSchedulers.get(filePath);
+        if (!scheduler) {
+            return this.handleAiGatewayRequestInternal(request);
+        }
+        return scheduler.run('ai', () => this.handleAiGatewayRequestInternal(request));
+    }
+
+    private async handleAiGatewayRequestInternal(request: AiGatewayRequest): Promise<unknown> {
+        if (!this.observationReady) {
+            throw new Error('Safe-sync recovery is still in progress; retry after READY');
+        }
+        const filePath = typeof request.path === 'string'
+            ? normalizeRelativePath(request.path)
+            : undefined;
+        if (!filePath || filePath.split('/').some(part => part === '' || part === '.' || part === '..')) {
+            throw new Error('AI gateway requires a safe relative document path');
+        }
+        if (this.isIgnored(filePath)) {
+            throw new Error(`AI gateway refuses ignored path ${filePath}`);
+        }
+        if (!this.state?.initialized) {
+            throw new Error('Safe-sync baseline is not initialized');
+        }
+        await this.ensureTextMachineForGateway(filePath);
+        const machine = this.textReplicas.get(filePath);
+        if (!machine || machine.isIsolated) {
+            throw new Error(`Document is isolated or unavailable: ${filePath}`);
+        }
+        const projection = await this.vfs.readDocumentProjection(this.remoteUri(filePath));
+        switch (request.method) {
+            case 'begin': {
+                const holder = typeof request.holder === 'string' && request.holder.length > 0
+                    ? request.holder
+                    : 'unknown-ai';
+                await machine.flushInput(true);
+                const current = await this.vfs.readDocumentProjection(this.remoteUri(filePath));
+                const lease = this.aiLeases.acquire(
+                    projection.entityId,
+                    holder,
+                    current.revision,
+                );
+                this.aiTransactions.set(lease.leaseId, {
+                    lease,
+                    path: filePath,
+                    baseContent: current.content,
+                    entityId: projection.entityId,
+                });
+                await this.persistAiLeases();
+                return {
+                    leaseId: lease.leaseId,
+                    fencingToken: lease.fencingToken,
+                    baseRevision: lease.baseRevision,
+                    entityId: projection.entityId,
+                    path: filePath,
+                    content: current.content,
+                    revision: current.revision,
+                };
+            }
+            case 'heartbeat': {
+                const lease = this.requireAiLease(request, projection.entityId);
+                const renewed = this.aiLeases.heartbeat(
+                    projection.entityId,
+                    lease.leaseId,
+                    lease.fencingToken,
+                );
+                const transaction = this.aiTransactions.get(lease.leaseId);
+                if (transaction) {
+                    transaction.lease = renewed;
+                }
+                await this.persistAiLeases();
+                return renewed;
+            }
+            case 'commit': {
+                const lease = this.requireAiLease(request, projection.entityId);
+                const transaction = this.aiTransactions.get(lease.leaseId);
+                if (!transaction || transaction.path !== filePath) {
+                    throw new Error(`AI transaction is not active for ${filePath}`);
+                }
+                if (typeof request.content !== 'string') {
+                    throw new Error('AI commit requires target content');
+                }
+                this.aiLeases.assertCanCommit(
+                    projection.entityId,
+                    lease.leaseId,
+                    lease.fencingToken,
+                );
+                const accepted = await this.vfs.acceptDocumentSnapshotAgainstAncestor(
+                    this.remoteUri(filePath),
+                    transaction.baseContent,
+                    request.content,
+                    true,
+                );
+                this.aiTransactions.delete(lease.leaseId);
+                this.aiLeases.release(
+                    projection.entityId,
+                    lease.leaseId,
+                    lease.fencingToken,
+                );
+                await this.persistAiLeases();
+                await machine.onCanonicalChanged(accepted.content);
+                accepted.acknowledgement.catch(error => {
+                    this.handleTextReplicaError(filePath, error);
+                });
+                return {
+                    opId: accepted.opId,
+                    path: filePath,
+                    content: accepted.content,
+                    journaled: true,
+                    remoteAcknowledged: false,
+                };
+            }
+            case 'abort': {
+                const lease = this.requireAiLease(request, projection.entityId);
+                this.aiTransactions.delete(lease.leaseId);
+                this.aiLeases.release(
+                    projection.entityId,
+                    lease.leaseId,
+                    lease.fencingToken,
+                );
+                await this.persistAiLeases();
+                return { aborted: true };
+            }
+            default:
+                throw new Error(`Unsupported AI gateway method: ${String(request.method)}`);
+        }
+    }
+
+    private async ensureTextMachineForGateway(filePath: string): Promise<void> {
+        if (this.textReplicas.has(filePath)) {
+            return;
+        }
+        const scan = this.lastScan ?? await this.scanBoth();
+        await this.ensureTextReplicas(scan);
+        if (!this.textReplicas.has(filePath)) {
+            throw new Error(`No editable Overleaf document exists at ${filePath}`);
+        }
+    }
+
+    private textTask<T>(
+        filePath: string,
+        source: string,
+        task: () => Promise<T>,
+    ): Promise<T> {
+        const scheduler = this.textSchedulers.get(filePath);
+        return scheduler
+            ? scheduler.run(source, task)
+            : task();
+    }
+
+    private requireAiLease(request: AiGatewayRequest, entityId: string): AiWriterLease {
+        if (typeof request.leaseId !== 'string' || !Number.isInteger(request.fencingToken)) {
+            throw new Error('AI gateway request lacks lease credentials');
+        }
+        const transaction = this.aiTransactions.get(request.leaseId);
+        if (
+            !transaction
+            || transaction.entityId !== entityId
+            || transaction.lease.fencingToken !== request.fencingToken
+        ) {
+            throw new Error('AI gateway lease does not match the document');
+        }
+        return transaction.lease;
+    }
+
+    private async persistAiLeases(): Promise<void> {
+        if (!this.state) {
+            return;
+        }
+        this.state.aiLeaseState = this.aiLeases.serialize();
+        await this.stateStore.save(this.state);
     }
 
     private scheduleReconcile(reason: string, delayMs = TEXT_DEBOUNCE_MS): void {
@@ -462,12 +1030,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
             if (this.state.pendingAction) {
                 const pending = this.state.pendingAction;
-                const recovery = validatePendingRecovery(
-                    pending,
-                    scan.local,
-                    scan.remote,
-                    this.state.entries[pending.path],
-                );
+                let recovery;
+                try {
+                    recovery = validatePendingRecovery(
+                        pending,
+                        scan.local,
+                        scan.remote,
+                        this.state.entries[pending.path],
+                    );
+                } catch (error) {
+                    this.state.pendingAction = undefined;
+                    await this.stateStore.save(this.state);
+                    await this.createConflict(
+                        pending.path,
+                        `Pending ${pending.kind} ancestry is not provable: ${this.asError(error).message}`,
+                        scan,
+                    );
+                    continue;
+                }
                 if (recovery.kind === 'recovered-pull' || recovery.kind === 'recovered-push') {
                     this.state.entries[pending.path] = recovery.baseline;
                     this.state.pendingAction = undefined;
@@ -495,6 +1075,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 };
                 return;
             }
+
+            await this.ensureTextReplicas(scan);
 
             const step = await this.reconcileOne(scan);
             if (step === 'waiting') {
@@ -689,6 +1271,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const baseline = state.entries[filePath];
             const local = scan.local.get(filePath);
             const remote = scan.remote.get(filePath);
+            if (local?.fileType === 'doc' || remote?.fileType === 'doc') {
+                // Text documents are owned by TextReplicaStateMachine. The
+                // snapshot planner remains only for binary/tree resources.
+                continue;
+            }
             if (
                 baseline
                 && remote
@@ -719,6 +1306,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async reconcileLocalWriterOverlap(scan: ScanPair): Promise<ReconcileStep> {
         const state = this.requireState();
         for (const [filePath, local] of scan.local) {
+            if (this.textReplicas.has(filePath)) {
+                continue;
+            }
             const variants = local.localVariants;
             if (!variants || isPathConflicted(filePath, state)) {
                 continue;
@@ -1243,7 +1833,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     const editorContent = new TextEncoder().encode(openDocument.getText());
                     const diskHash = contentHash(diskContent);
                     const editorHash = contentHash(editorContent);
-                    if (diskHash === editorHash) {
+                    if (this.textReplicas.has(filePath)) {
+                        // The text state machine owns editor/disk ancestry. Do
+                        // not synthesize a snapshot merge in the resource scan.
+                        content = editorContent;
+                    } else if (diskHash === editorHash) {
                         content = editorContent;
                     } else {
                         const storedBaseline = this.state?.entries[filePath];
@@ -1361,9 +1955,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const edit = new vscode.WorkspaceEdit();
             const end = openDocument.positionAt(openDocument.getText().length);
             edit.replace(uri, new vscode.Range(new vscode.Position(0, 0), end), new TextDecoder().decode(content));
-            if (!await vscode.workspace.applyEdit(edit) || !await openDocument.save()) {
-                throw new Error(`VS Code could not save synchronized content for ${filePath}`);
+            if (!await vscode.workspace.applyEdit(edit)) {
+                throw new Error(`VS Code could not project synchronized content for ${filePath}`);
             }
+            // Projection is not mutation: materialize the same proven bytes
+            // without making TextDocument.save() part of the remote transaction.
+            await vscode.workspace.fs.writeFile(uri, content);
         } else {
             await vscode.workspace.fs.writeFile(uri, content);
         }
