@@ -443,7 +443,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     void this.textTask(
                         relative,
                         'editor-save',
-                        async () => { machine.onEditorSaved(document.getText()); },
+                        () => machine.onEditorSaved(document.getText()),
                     ).catch(error => {
                         this.handleTextReplicaError(relative, error);
                     });
@@ -655,6 +655,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 // conflict instead of overwriting a binary at this path.
                 continue;
             }
+            if (local?.localVariants) {
+                // The resource planner owns the proved editor/disk fork. It
+                // archives and merges both local branches before the OT
+                // document attaches and rebases that result onto Overleaf.
+                continue;
+            }
             if (!local && this.state?.entries[filePath]) {
                 // A missing local path may be an intentional local delete (or
                 // a delete/edit overlap); preserve that evidence for the
@@ -788,6 +794,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             },
             readDisk: () => this.readLocalText(filePath),
+            onConverged: content => this.advanceTextBaselineIfAuthoritative(
+                filePath,
+                content,
+            ),
             persistProjectionReceipts: async receipts => {
                 if (this.state) {
                     const ownedPaths = new Set([
@@ -839,6 +849,77 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             editorContent,
             diskContent,
         });
+    }
+
+    /**
+     * Advance the resource baseline only when the OT session says the server
+     * acknowledged these exact bytes and the disk still projects them. This
+     * closes the projection-to-delete window without treating an unacked
+     * journal operation as a shared ancestor.
+     */
+    private async advanceTextBaselineIfAuthoritative(
+        filePath: string,
+        content: string,
+    ): Promise<void> {
+        const state = this.requireState();
+        if (
+            !state.initialized
+            || isPathConflicted(filePath, state)
+            || state.pendingAction?.path === filePath
+        ) {
+            return;
+        }
+        let remote;
+        try {
+            remote = await this.vfs.readAuthoritativeFile(this.remoteUri(filePath));
+        } catch (error) {
+            if (this.isFileNotFound(error)) {
+                return;
+            }
+            throw error;
+        }
+        if (remote.fileType !== 'doc') {
+            return;
+        }
+        const bytes = new TextEncoder().encode(content);
+        const hash = contentHash(bytes);
+        if (contentHash(remote.content) !== hash) {
+            // The operation is journaled locally but not server-acknowledged.
+            return;
+        }
+        if (await this.readLocalText(filePath) !== content) {
+            // A raw writer already produced the next local operation.
+            return;
+        }
+        let localIdentity: string;
+        try {
+            localIdentity = await this.localIdentity(this.localUri(filePath));
+        } catch (error) {
+            if (this.isFileNotFound(error)) {
+                return;
+            }
+            throw error;
+        }
+        const storedHash = await this.stateStore.saveBaseline(bytes);
+        if (storedHash !== hash) {
+            throw new Error(`Common-base snapshot hash changed for ${filePath}`);
+        }
+        // Re-check conflict/pending state after the asynchronous reads. A
+        // parallel resource action must retain ownership of its ancestry.
+        if (
+            isPathConflicted(filePath, state)
+            || state.pendingAction?.path === filePath
+        ) {
+            return;
+        }
+        state.entries[filePath] = {
+            entityId: remote.entityId,
+            fileType: 'doc',
+            hash,
+            text: content,
+            localIdentity,
+        };
+        await this.stateStore.save(state);
     }
 
     private async createTextConflict(record: TextReplicaIsolation): Promise<void> {

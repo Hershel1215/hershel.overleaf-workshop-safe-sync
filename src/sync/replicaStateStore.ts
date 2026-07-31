@@ -114,6 +114,15 @@ export class ReplicaStateStore {
         }
     }
 
+    /** Reopen the WAL so an independent read-only verifier sees external appends. */
+    async reload(): Promise<ReplicaState> {
+        await this.saveChain;
+        await this.wal?.close();
+        this.wal = undefined;
+        this.lastStablePayload = undefined;
+        return this.load();
+    }
+
     async save(state: ReplicaState): Promise<void> {
         // Checkpoint replacement and WAL append must share one ordering. A
         // projection receipt from one document must not overwrite a receipt

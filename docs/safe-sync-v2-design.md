@@ -32,8 +32,9 @@ identity and content hash. Matching watcher events consume that projection
 receipt and never re-enter the operation stream as user edits.
 
 The remote projection path must not call `TextDocument.save()`. A dirty editor
-may temporarily lead the disk projection without weakening the journaled
-operation guarantee.
+may temporarily lead the disk while input is still buffered, but once every
+visible branch is journaled the canonical result is projected directly to both
+editor and disk without changing VS Code's saved/dirty UI semantics.
 
 A directory scan is only the last server-acknowledged snapshot. Replica attach
 and reconnect therefore use the coordinator's visible document projection,
@@ -45,6 +46,12 @@ Each document has one serialized task queue for editor saves, filesystem
 watchers, remote OT arrivals, AI transactions, and reconciliation refreshes.
 Before a plugin disk projection is written, the current disk bytes are checked
 against the last observed projection; an unexpected value is imported first.
+Once the OT session reports those exact bytes as server-acknowledged and the
+clean editor/disk projections match, the resource journal advances them as the
+next common baseline before later delete or move planning.
+If a scan finds a dirty editor and a distinct disk snapshot with a retained
+common base, their two local branches are archived and transformed first; only
+the merged local branch is then attached to the remote OT session.
 
 ## Text concurrency
 

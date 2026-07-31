@@ -21,6 +21,8 @@ export interface TextReplicaPort {
     projectDisk: (content: string) => Promise<void>;
     /** Read the current disk projection before a plugin write can overwrite it. */
     readDisk?: () => Promise<string | undefined>;
+    /** Persist a common baseline only after all local projections converge. */
+    onConverged?: (content: string) => Promise<void>;
     isolate: (record: TextReplicaIsolation) => Promise<void>;
     persistProjectionReceipts?: (receipts: ProjectionReceipt[]) => Promise<void>;
 }
@@ -48,6 +50,7 @@ export class TextReplicaStateMachine {
     private editorContent?: string;
     private editorDirty: boolean;
     private diskContent?: string;
+    private allowDirtyDiskProjection = false;
     private isolatedReason?: string;
 
     constructor(initial: TextReplicaInitialState, port: TextReplicaPort) {
@@ -108,6 +111,7 @@ export class TextReplicaStateMachine {
         if (this.projections.observe(editorProjectionPath(this.path), observation).kind === 'projection') {
             this.editorContent = content;
             await this.persistProjectionReceipts();
+            await this.notifyConverged();
             return;
         }
         const ancestor = this.editorContent ?? this.canonicalContent;
@@ -127,13 +131,14 @@ export class TextReplicaStateMachine {
         await this.persistProjectionReceipts();
     }
 
-    onEditorSaved(content: string): void {
+    async onEditorSaved(content: string): Promise<void> {
         if (this.isIsolated) {
             return;
         }
         this.editorContent = content;
         this.editorDirty = false;
         this.diskContent = content;
+        await this.notifyConverged();
     }
 
     async onDiskObserved(content: string | undefined): Promise<void> {
@@ -149,10 +154,12 @@ export class TextReplicaStateMachine {
         if (this.projections.observe(diskProjectionPath(this.path), observation).kind === 'projection') {
             this.diskContent = content;
             await this.persistProjectionReceipts();
+            await this.notifyConverged();
             return;
         }
         if (content === this.canonicalContent) {
             this.diskContent = content;
+            await this.notifyConverged();
             return;
         }
         if (
@@ -166,6 +173,10 @@ export class TextReplicaStateMachine {
             }
             const accepted = await this.port.commit(ancestor, content, false);
             this.canonicalContent = accepted.content;
+            // This exact raw disk branch is now journaled into canonical, so
+            // one direct disk projection is safe even while VS Code keeps the
+            // editor's dirty UI flag.
+            this.allowDirtyDiskProjection = true;
             accepted.acknowledgement.catch(error => {
                 void this.isolate(`Remote acknowledgement failed: ${error.message}`);
             });
@@ -196,7 +207,10 @@ export class TextReplicaStateMachine {
             await this.port.projectEditor(this.canonicalContent);
             this.editorContent = this.canonicalContent;
         }
-        if (!this.editorDirty && this.diskContent !== this.canonicalContent) {
+        if (
+            this.diskContent !== this.canonicalContent
+            && (!this.editorDirty || this.allowDirtyDiskProjection)
+        ) {
             // A raw filesystem writer may have changed the file before the
             // watcher callback ran. Import that snapshot against the last
             // observed disk base instead of overwriting it with remote text.
@@ -214,11 +228,28 @@ export class TextReplicaStateMachine {
             await this.persistProjectionReceipts();
             await this.port.projectDisk(this.canonicalContent);
             this.diskContent = this.canonicalContent;
+            this.allowDirtyDiskProjection = false;
         }
+        await this.notifyConverged();
     }
 
     private async persistProjectionReceipts(): Promise<void> {
         await this.port.persistProjectionReceipts?.(this.projections.serialize());
+    }
+
+    private async notifyConverged(): Promise<void> {
+        if (
+            this.isIsolated
+            || this.input.hasBufferedInput
+            || this.diskContent !== this.canonicalContent
+            || (
+                this.editorContent !== undefined
+                && this.editorContent !== this.canonicalContent
+            )
+        ) {
+            return;
+        }
+        await this.port.onConverged?.(this.canonicalContent);
     }
 
     private async isolate(reason: string): Promise<void> {

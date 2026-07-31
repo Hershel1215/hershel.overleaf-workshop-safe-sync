@@ -16,6 +16,7 @@ describe('text replica projection state machine', () => {
         const editorProjections = [];
         const diskProjections = [];
         const isolations = [];
+        const convergences = [];
         let diskActual = Object.prototype.hasOwnProperty.call(initial, 'diskContent')
             ? initial.diskContent
             : canonical;
@@ -36,6 +37,7 @@ describe('text replica projection state machine', () => {
                 await machine.onDiskObserved(content);
             },
             readDisk: async () => diskActual,
+            onConverged: async content => { convergences.push(content); },
             isolate: async record => { isolations.push(record); },
         };
         machine = new TextReplicaStateMachine({
@@ -53,6 +55,7 @@ describe('text replica projection state machine', () => {
             editorProjections,
             diskProjections,
             isolations,
+            convergences,
             setCanonical(value) { canonical = value; },
             setDisk(value) { diskActual = value; },
         };
@@ -82,6 +85,41 @@ describe('text replica projection state machine', () => {
         assert.deepStrictEqual(state.diskProjections, ['aRb']);
         assert.deepStrictEqual(state.commits, []);
         assert.deepStrictEqual(state.isolations, []);
+        state.machine.dispose();
+    });
+
+    it('announces convergence only after clean local projections match canonical text', async () => {
+        const state = harness();
+        state.setCanonical('aRb');
+        await state.machine.onCanonicalChanged('aRb');
+
+        assert(state.convergences.length >= 1);
+        assert(state.convergences.every(content => content === 'aRb'));
+        assert.deepStrictEqual(state.isolations, []);
+        state.machine.dispose();
+    });
+
+    it('does not overwrite disk for a remote-only change behind a dirty editor', async () => {
+        const state = harness({editorDirty: true});
+        state.setCanonical('aRb');
+        await state.machine.onCanonicalChanged('aRb');
+
+        assert.deepStrictEqual(state.diskProjections, []);
+        assert.deepStrictEqual(state.convergences, []);
+        state.machine.dispose();
+    });
+
+    it('converges dirty editor and raw disk branches through the journal', async () => {
+        const state = harness({canonicalContent: 'BASE\n', editorDirty: true});
+        await state.machine.onEditorChanged('EDITOR\nBASE\n');
+        state.setDisk('BASE\nDISK\n');
+        await state.machine.onDiskObserved('BASE\nDISK\n');
+
+        assert.strictEqual(state.commits.length, 2);
+        assert(state.machine.canonical.includes('EDITOR\n'));
+        assert(state.machine.canonical.includes('DISK\n'));
+        assert.strictEqual(state.diskProjections.at(-1), state.machine.canonical);
+        assert.strictEqual(state.editorProjections.at(-1), state.machine.canonical);
         state.machine.dispose();
     });
 
@@ -129,6 +167,7 @@ describe('text replica projection state machine', () => {
         const state = harness({ editorDirty: true });
         state.setCanonical('aRb');
         await state.machine.onCanonicalChanged('aRb');
+        state.setDisk('aDb');
         await state.machine.onDiskObserved('aDb');
         assert.strictEqual(state.commits.length, 1);
         assert.strictEqual(state.commits[0].ancestor, 'ab');

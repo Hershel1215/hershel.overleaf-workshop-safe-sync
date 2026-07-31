@@ -44,6 +44,26 @@ describe('replica persistence', () => {
         await store.close();
     });
 
+    it('reopens a cached reader to observe another store append', async () => {
+        const writer = new ReplicaStateStore(root, 'server', 'project', '/workspace');
+        const reader = new ReplicaStateStore(root, 'server', 'project', '/workspace');
+        const state = await writer.load();
+        await reader.load();
+
+        state.initialized = true;
+        state.entries['main.tex'] = {
+            entityId: 'doc-1',
+            fileType: 'doc',
+            hash: 'acknowledged',
+            text: 'acknowledged text',
+        };
+        await writer.save(state);
+
+        const refreshed = await reader.reload();
+        assert.strictEqual(refreshed.entries['main.tex'].text, 'acknowledged text');
+        await Promise.all([writer.close(), reader.close()]);
+    });
+
     it('allows only one active writer for a replica key', async () => {
         const first = await ReplicaLock.acquire(root, '/workspace', {
             heartbeatMs: 100000,

@@ -21,8 +21,8 @@ const REQUEST_FILE = 'safe-sync-e2e.request.json';
 const RUNNING_FILE = 'safe-sync-e2e.running.json';
 const RESULT_FILE = 'safe-sync-e2e.result.json';
 const RELOAD_FILE = 'safe-sync-e2e.reload.json';
-const HANDOFF_TARGET_VERSION = '1.0.0-hershel.26';
-const HANDOFF_TARGET_BUILD_ID = '20260731T132713Z-safe-sync-v2-rc26';
+const HANDOFF_TARGET_VERSION = '1.0.0-hershel.30';
+const HANDOFF_TARGET_BUILD_ID = '20260731T145150Z-safe-sync-v2-rc30';
 export const E2E_RESULT_SCHEMA_VERSION = 4;
 const BINARY_FIXTURE = Uint8Array.from(Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
@@ -570,7 +570,7 @@ async function approvedLocalReplica(
         return runtime?.settled === true
             && runtime.pendingAction === false;
     }, 60000, 'wait for the Local Replica watcher, lock, and settled reconciliation queue');
-    let state = await stateStore.load();
+    let state = await stateStore.reload();
     const staleConflictPaths = Object.keys(state.conflicts).filter(filePath => (
         isE2EConflictPath(filePath)
     ));
@@ -584,7 +584,7 @@ async function approvedLocalReplica(
     assert(runtime && !runtime.paused, 'The approved Local Replica provider is paused');
     assert(runtime.initialized, 'The active Local Replica baseline is not initialized');
     assert(!runtime.pendingAction, 'The active Local Replica has a pending action');
-    state = await stateStore.load();
+    state = await stateStore.reload();
     assert(state.initialized, 'The approved local replica baseline is not initialized');
     assert(!state.pendingAction, 'The approved local replica has a pending action');
     assert(
@@ -698,7 +698,7 @@ async function runRemoteE2E(
         let cleanupEntryCount = 0;
         if (replicaStateStore) {
             await waitForAsync(async () => {
-                const state = await replicaStateStore!.load();
+                const state = await replicaStateStore!.reload();
                 cleanupPendingAction = state.pendingAction !== undefined;
                 cleanupConflictCount = Object.keys(state.conflicts)
                     .filter(filePath => isE2EConflictPath(filePath, namespace)).length;
@@ -980,7 +980,7 @@ async function runRemoteE2E(
                 return parent !== undefined && !parent.docs.some(item => item.name === fileName);
             }, 30000, 'push Local Replica delete to authoritative remote', 750);
             await waitForAsync(async () => {
-                const state = await replicaStateStore!.load();
+                const state = await replicaStateStore!.reload();
                 return !state.pendingAction
                     && !Object.keys(state.conflicts)
                         .some(filePath => isE2EConflictPath(filePath, isolatedRunName))
@@ -1001,7 +1001,7 @@ async function runRemoteE2E(
             const base = `BASE-${request.nonce}\n`;
             await vscode.workspace.fs.writeFile(localUri, Buffer.from(base, 'utf8'));
             await waitForAsync(async () => {
-                const state = await replicaStateStore!.load();
+                const state = await replicaStateStore!.reload();
                 // The persisted baseline is produced only after the Local
                 // Replica has scanned and accepted the authoritative remote
                 // snapshot. Avoid requiring a second fresh project-directory
@@ -1034,7 +1034,7 @@ async function runRemoteE2E(
                         runFolderId!,
                         fileName,
                     ),
-                    replicaStateStore!.load(),
+                    replicaStateStore!.reload(),
                 ]);
                 if (!local || !remote) {
                     return false;
@@ -1063,7 +1063,7 @@ async function runRemoteE2E(
                     runFolderId!,
                     fileName,
                 );
-                const state = await replicaStateStore!.load();
+                const state = await replicaStateStore!.reload();
                 return remote === undefined
                     && state.entries[relativePath] === undefined
                     && !state.pendingAction;
@@ -1157,7 +1157,7 @@ async function runRemoteE2E(
 
             let artifactDirectory = '';
             await waitForAsync(async () => {
-                const state = await replicaStateStore!.load();
+                const state = await replicaStateStore!.reload();
                 const record = state.conflicts[relativePath];
                 if (!record?.localFile || !record.remoteFile || state.pendingAction) {
                     return false;
@@ -1195,7 +1195,7 @@ async function runRemoteE2E(
 
             await waitForAsync(async () => {
                 const [state, currentLocal, current] = await Promise.all([
-                    replicaStateStore!.load(),
+                    replicaStateStore!.reload(),
                     readLocalBytes(localUri),
                     freshProject(
                         server.server.url,
@@ -1277,7 +1277,7 @@ async function runRemoteE2E(
                         await new Promise(resolve => setTimeout(resolve, 500));
                     }
                 } while (Date.now() < deadline);
-                const state = await replicaStateStore!.load();
+                const state = await replicaStateStore!.reload();
                 assert(!state.pendingAction && !Object.keys(state.conflicts)
                     .some(filePath => isE2EConflictPath(filePath, isolatedRunName)),
                     'Ignored conflict watcher event changed the active replica journal');
@@ -1342,7 +1342,7 @@ async function runRemoteE2E(
                 return remoteEntity?.parentId === folderB._id
                     && remoteEntity.entity.name === 'local-renamed.tex';
             }, 30000, 'apply the Local Replica rename to the remote entity', 750);
-            const state = await replicaStateStore!.load();
+            const state = await replicaStateStore!.reload();
             const finalPath = `${isolatedRunName}/move-b/local-renamed.tex`;
             assert(!state.pendingAction && !Object.keys(state.conflicts)
                 .some(filePath => isE2EConflictPath(filePath, isolatedRunName)),

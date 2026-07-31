@@ -384,6 +384,111 @@ describe('converged replacement identity semantics', () => {
 });
 
 describe('Local Replica text projection attachment', () => {
+    it('defers attachment until proved editor and disk variants are locally merged', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: true,
+            updatedAt: new Date(0).toISOString(),
+            entries: {},
+            conflicts: {},
+        };
+        provider.textReplicas = new Map();
+        provider.vfs = {
+            readDocumentProjection: async () => {
+                throw new Error('variant merge must run before document attachment');
+            },
+        };
+        provider.remoteUri = pathname => ({path: `/${pathname}`});
+        const scan = {
+            local: new Map([['main.tex', {
+                path: 'main.tex',
+                fileType: 'doc',
+                hash: 'editor',
+                text: 'editor',
+                localVariants: {
+                    diskContent: new TextEncoder().encode('disk'),
+                    editorContent: new TextEncoder().encode('editor'),
+                    diskHash: 'disk',
+                    editorHash: 'editor',
+                    mergedContent: new TextEncoder().encode('merged'),
+                },
+            }]]),
+            remote: new Map([['main.tex', {
+                path: 'main.tex',
+                fileType: 'doc',
+                entityId: 'doc-1',
+                hash: 'base',
+                text: 'base',
+            }]]),
+        };
+
+        await provider.ensureTextReplicas(scan);
+
+        assert.strictEqual(provider.textReplicas.size, 0);
+    });
+
+    it('advances an acknowledged OT projection before a following local delete', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        const base = 'BASE\n';
+        const merged = 'REMOTE\nLOCAL\nBASE\n';
+        const encoder = new TextEncoder();
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: true,
+            updatedAt: new Date(0).toISOString(),
+            entries: {
+                'main.tex': {
+                    entityId: 'doc-1',
+                    fileType: 'doc',
+                    hash: contentHash(encoder.encode(base)),
+                    text: base,
+                    localIdentity: '1:2',
+                },
+            },
+            conflicts: {},
+        };
+        provider.remoteUri = pathname => ({path: `/${pathname}`});
+        provider.localUri = pathname => ({fsPath: `/replica/${pathname}`});
+        provider.vfs = {
+            readAuthoritativeFile: async () => ({
+                entityId: 'doc-1',
+                fileType: 'doc',
+                content: encoder.encode(merged),
+                revision: 3,
+            }),
+        };
+        provider.readLocalText = async () => merged;
+        provider.localIdentity = async () => '1:2';
+        provider.stateStore = {
+            saveBaseline: async content => contentHash(content),
+            save: async () => {},
+        };
+
+        await provider.advanceTextBaselineIfAuthoritative('main.tex', merged);
+
+        const baseline = provider.state.entries['main.tex'];
+        assert.strictEqual(baseline.text, merged);
+        assert.deepStrictEqual(
+            decideReconciliation(
+                baseline,
+                undefined,
+                {
+                    path: 'main.tex',
+                    entityId: 'doc-1',
+                    fileType: 'doc',
+                    hash: contentHash(encoder.encode(merged)),
+                    text: merged,
+                },
+            ),
+            {action: 'delete-remote'},
+        );
+    });
+
     it('creates a replica from the journal-visible projection, not the older remote scan', async () => {
         const LocalReplicaSCMProvider = loadProvider();
         const provider = Object.create(LocalReplicaSCMProvider.prototype);
