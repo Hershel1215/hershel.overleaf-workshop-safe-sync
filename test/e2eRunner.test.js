@@ -32,8 +32,8 @@ describe('safe-sync E2E runner lifecycle', () => {
         extension: {
             id: 'hershel.overleaf-workshop-safe-sync',
             packageJSON: {
-                version: '1.0.0-hershel.19',
-                hershelBuildId: '20260730T223000Z-safe-sync-rc19',
+                version: '1.0.0-hershel.20',
+                hershelBuildId: '20260731T035525Z-safe-sync-rc20',
             },
             extensionPath: '/tmp/hershel-extension',
         },
@@ -72,8 +72,8 @@ describe('safe-sync E2E runner lifecycle', () => {
     it('records an explicit result schema and extension build identity', () => {
         assert.strictEqual(runner.E2E_RESULT_SCHEMA_VERSION, 3);
         assert.strictEqual(identity.extensionId, 'hershel.overleaf-workshop-safe-sync');
-        assert.strictEqual(identity.extensionVersion, '1.0.0-hershel.19');
-        assert.strictEqual(identity.buildId, '20260730T223000Z-safe-sync-rc19');
+        assert.strictEqual(identity.extensionVersion, '1.0.0-hershel.20');
+        assert.strictEqual(identity.buildId, '20260731T035525Z-safe-sync-rc20');
         assert.strictEqual(identity.extensionPath, '/tmp/hershel-extension');
         assert.match(identity.runnerSha256, /^[a-f0-9]{64}$/);
         assert.doesNotThrow(() => runner.assertExpectedBuild(request(), identity));

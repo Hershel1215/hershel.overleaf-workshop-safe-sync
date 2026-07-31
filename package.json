@@ -2,8 +2,8 @@
   "name": "overleaf-workshop-safe-sync",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "1.0.0-hershel.19",
-  "hershelBuildId": "20260730T223000Z-safe-sync-rc19",
+  "version": "1.0.0-hershel.20",
+  "hershelBuildId": "20260731T035525Z-safe-sync-rc20",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",

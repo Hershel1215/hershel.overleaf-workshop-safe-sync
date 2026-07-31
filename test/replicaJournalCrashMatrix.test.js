@@ -4,12 +4,13 @@ const { validatePendingRecovery } = require('../out/sync/replicaPlanner');
 const STRICT = { kind: 'strict' };
 const STARTED_AT = new Date(0).toISOString();
 
-function snapshot(path, hash, entityId = 'entity-1') {
+function snapshot(path, hash, entityId = 'entity-1', localIdentity) {
     return {
         path,
         hash,
         fileType: 'doc',
         entityId,
+        localIdentity,
         text: hash,
     };
 }
@@ -32,11 +33,34 @@ function assertAllowed(action, local, remote) {
     assert.deepStrictEqual(validatePendingRecovery(action, local, remote), STRICT);
 }
 
-function assertRejected(action, local, remote) {
+function assertRejected(action, local, remote, baseline) {
     assert.throws(
-        () => validatePendingRecovery(action, local, remote),
+        () => validatePendingRecovery(action, local, remote, baseline),
         /Cannot prove recovery ancestry/,
     );
+}
+
+function directPushRecoveryFixture() {
+    const baseline = {
+        entityId: 'entity-1',
+        fileType: 'doc',
+        hash: 'remote-before',
+        text: 'remote-before',
+        localIdentity: 'inode-1',
+    };
+    const direct = pending('push', {
+        expectedLocalHash: 'direct-target',
+        expectedRemoteHash: 'remote-before',
+        targetHash: 'direct-target',
+        entityId: 'entity-1',
+    });
+    const newerLocal = entries(snapshot(
+        'source.tex',
+        'newer-local',
+        undefined,
+        'inode-1',
+    ));
+    return {baseline, direct, newerLocal};
 }
 
 describe('replica journal crash recovery matrix', () => {
@@ -88,6 +112,50 @@ describe('replica journal crash recovery matrix', () => {
             create,
             entries(snapshot('source.tex', 'created')),
             entries(snapshot('source.tex', 'unrelated')),
+        );
+    });
+
+    it('rejects recovery when OT transformed the direct-push target', () => {
+        const {baseline, direct, newerLocal} = directPushRecoveryFixture();
+        assertRejected(
+            {
+                ...direct,
+                expectedLocalHash: 'local-branch',
+                targetHash: 'transformed-target',
+            },
+            newerLocal,
+            entries(snapshot('source.tex', 'transformed-target', 'entity-1')),
+            baseline,
+        );
+    });
+
+    it('rejects direct-push recovery after a third remote revision', () => {
+        const {baseline, direct, newerLocal} = directPushRecoveryFixture();
+        assertRejected(
+            direct,
+            newerLocal,
+            entries(snapshot('source.tex', 'remote-third', 'entity-1')),
+            baseline,
+        );
+    });
+
+    it('rejects direct-push recovery for a replacement remote entity', () => {
+        const {baseline, direct, newerLocal} = directPushRecoveryFixture();
+        assertRejected(
+            direct,
+            newerLocal,
+            entries(snapshot('source.tex', 'direct-target', 'replacement-entity')),
+            baseline,
+        );
+    });
+
+    it('rejects direct-push recovery after the local inode changes', () => {
+        const {baseline, direct} = directPushRecoveryFixture();
+        assertRejected(
+            direct,
+            entries(snapshot('source.tex', 'newer-local', undefined, 'inode-2')),
+            entries(snapshot('source.tex', 'direct-target', 'entity-1')),
+            baseline,
         );
     });
 

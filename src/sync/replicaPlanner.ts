@@ -156,6 +156,7 @@ export function refreshConvergedBaseline(
 
 export type PendingRecoveryOutcome =
     | { kind: 'strict' }
+    | { kind: 'recovered-push'; baseline: BaselineEntry }
     | { kind: 'recovered-pull'; baseline: BaselineEntry };
 
 export function validatePendingRecovery(
@@ -196,6 +197,19 @@ export function validatePendingRecovery(
                 pending.expectedRemoteHash,
                 pending.targetHash,
             )) {
+                if (
+                    localEntry
+                    && remoteEntry
+                    && remoteHash === pending.targetHash
+                    && pending.targetHash === pending.expectedLocalHash
+                ) {
+                    return recoveredDirectPushOutcome(
+                        pending,
+                        localEntry,
+                        remoteEntry,
+                        baseline,
+                    );
+                }
                 throw new Error(`Cannot prove recovery ancestry for pending push of ${pending.path}`);
             }
             break;
@@ -255,6 +269,45 @@ export function validatePendingRecovery(
             break;
     }
     return { kind: 'strict' };
+}
+
+function recoveredDirectPushOutcome(
+    pending: PendingReplicaAction,
+    currentLocal: ReplicaSnapshot,
+    remoteTarget: ReplicaSnapshot,
+    baseline: BaselineEntry | undefined,
+): PendingRecoveryOutcome {
+    if (
+        !baseline
+        || baseline.fileType !== 'doc'
+        || currentLocal.fileType !== 'doc'
+        || remoteTarget.fileType !== 'doc'
+        || baseline.text === undefined
+        || currentLocal.text === undefined
+        || remoteTarget.text === undefined
+        || pending.entityId === undefined
+        || pending.entityId !== baseline.entityId
+        || remoteTarget.entityId !== baseline.entityId
+        || pending.expectedRemoteHash !== baseline.hash
+        || pending.expectedLocalHash === undefined
+        || pending.targetHash !== pending.expectedLocalHash
+        || remoteTarget.hash !== pending.targetHash
+        || baseline.localIdentity === undefined
+        || currentLocal.localIdentity !== baseline.localIdentity
+    ) {
+        throw new Error(`Cannot prove recovery ancestry for pending push of ${pending.path}`);
+    }
+    return {
+        kind: 'recovered-push',
+        baseline: {
+            entityId: remoteTarget.entityId!,
+            fileType: remoteTarget.fileType,
+            hash: remoteTarget.hash,
+            text: remoteTarget.text,
+            treeHash: remoteTarget.treeHash,
+            localIdentity: currentLocal.localIdentity,
+        },
+    };
 }
 
 function recoveredPullOutcome(

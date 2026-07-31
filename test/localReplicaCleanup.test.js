@@ -1,6 +1,8 @@
 const assert = require('assert');
 const Module = require('module');
 const path = require('path');
+const {decideReconciliation} = require('../out/sync/reconcile');
+const {contentHash} = require('../out/sync/syncPolicy');
 
 function loadProvider() {
     const originalLoad = Module._load;
@@ -357,5 +359,236 @@ describe('converged replacement identity semantics', () => {
             remote: new Map([['figure.png', remote]]),
         }), 'none');
         assert.deepStrictEqual(decision, {action: 'baseline'});
+    });
+});
+
+describe('Local Replica pending text action recovery', () => {
+    it('commits an OT-transformed push before a subsequent local edit', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        const encoder = new TextEncoder();
+        const baselineText = 'shared base';
+        const localText = 'shared base\nlocal first edit';
+        const transformedText = 'remote edit\nshared base\nlocal first edit';
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: true,
+            updatedAt: new Date(0).toISOString(),
+            entries: {
+                'main.tex': {
+                    entityId: 'doc-1',
+                    fileType: 'doc',
+                    hash: contentHash(encoder.encode(baselineText)),
+                    text: baselineText,
+                    localIdentity: '1:2',
+                },
+            },
+            conflicts: {},
+        };
+        const persisted = [];
+        provider.stateStore = {
+            save: async state => persisted.push(structuredClone(state)),
+        };
+        provider.vfs = {
+            writeDocumentAgainstAncestor: async () => transformedText,
+        };
+        provider.remoteUri = pathname => ({path: `/${pathname}`});
+        provider.convergeTextToLocal = async () => transformedText;
+
+        await provider.pushLocalSnapshot(
+            'main.tex',
+            provider.state.entries['main.tex'],
+            {
+                path: 'main.tex',
+                fileType: 'doc',
+                hash: contentHash(encoder.encode(localText)),
+                content: encoder.encode(localText),
+                text: localText,
+                localIdentity: '1:2',
+            },
+            {
+                path: 'main.tex',
+                fileType: 'doc',
+                entityId: 'doc-1',
+                hash: contentHash(encoder.encode(baselineText)),
+                text: baselineText,
+            },
+        );
+
+        const committed = persisted.at(-1);
+        assert.strictEqual(committed.pendingAction, undefined);
+        assert.deepStrictEqual(committed.entries['main.tex'], {
+            entityId: 'doc-1',
+            fileType: 'doc',
+            hash: contentHash(encoder.encode(transformedText)),
+            text: transformedText,
+            localIdentity: '1:2',
+        });
+        assert.deepStrictEqual(decideReconciliation(
+            committed.entries['main.tex'],
+            {
+                path: 'main.tex',
+                fileType: 'doc',
+                hash: contentHash(encoder.encode(`${transformedText}\nlocal second edit`)),
+                text: `${transformedText}\nlocal second edit`,
+            },
+            {
+                path: 'main.tex',
+                fileType: 'doc',
+                entityId: 'doc-1',
+                hash: contentHash(encoder.encode(transformedText)),
+                text: transformedText,
+            },
+        ), {action: 'push'});
+    });
+
+    it('atomically commits the landed push before processing a newer local edit', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        const baseline = {
+            entityId: 'doc-1',
+            fileType: 'doc',
+            hash: 'base',
+            text: 'base text',
+            localIdentity: '1:2',
+        };
+        provider.disposed = false;
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: true,
+            updatedAt: new Date(0).toISOString(),
+            entries: {'main.tex': baseline},
+            conflicts: {},
+            pendingAction: {
+                id: 'direct-push',
+                kind: 'push',
+                path: 'main.tex',
+                startedAt: new Date(0).toISOString(),
+                expectedLocalHash: 'pushed',
+                expectedRemoteHash: 'base',
+                targetHash: 'pushed',
+                entityId: 'doc-1',
+            },
+        };
+        const newerLocal = {
+            path: 'main.tex',
+            fileType: 'doc',
+            hash: 'newer-local',
+            text: 'pushed text plus another local edit',
+            localIdentity: '1:2',
+        };
+        const landedRemote = {
+            path: 'main.tex',
+            fileType: 'doc',
+            entityId: 'doc-1',
+            hash: 'pushed',
+            text: 'pushed text',
+        };
+        const scan = {
+            local: new Map([['main.tex', newerLocal]]),
+            remote: new Map([['main.tex', landedRemote]]),
+        };
+        provider.scanBoth = async () => scan;
+        provider.renderReport = () => {};
+        provider.vfs = {safeSyncCapability: {writable: true}};
+        const persisted = [];
+        provider.stateStore = {
+            save: async state => persisted.push(structuredClone(state)),
+        };
+        const decisions = [];
+        provider.reconcileOne = async current => {
+            decisions.push(decideReconciliation(
+                provider.state.entries['main.tex'],
+                current.local.get('main.tex'),
+                current.remote.get('main.tex'),
+            ));
+            return 'waiting';
+        };
+
+        await provider.reconcileUntilStable('second local edit after push');
+
+        assert.strictEqual(persisted.length, 1);
+        assert.strictEqual(persisted[0].pendingAction, undefined);
+        assert.deepStrictEqual(persisted[0].entries['main.tex'], {
+            entityId: 'doc-1',
+            fileType: 'doc',
+            hash: 'pushed',
+            text: 'pushed text',
+            treeHash: undefined,
+            localIdentity: '1:2',
+        });
+        assert.deepStrictEqual(decisions, [{action: 'push'}]);
+    });
+
+    it('commits a landed pull before a subsequent local edit', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        const encoder = new TextEncoder();
+        const baselineText = 'shared base';
+        const remoteText = 'shared base\nremote edit';
+        const baseline = {
+            entityId: 'doc-1',
+            fileType: 'doc',
+            hash: contentHash(encoder.encode(baselineText)),
+            text: baselineText,
+            localIdentity: '1:2',
+        };
+        const local = {
+            path: 'main.tex',
+            fileType: 'doc',
+            hash: baseline.hash,
+            text: baselineText,
+            localIdentity: '1:2',
+        };
+        const remote = {
+            path: 'main.tex',
+            fileType: 'doc',
+            entityId: 'doc-1',
+            hash: contentHash(encoder.encode(remoteText)),
+            text: remoteText,
+        };
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: true,
+            updatedAt: new Date(0).toISOString(),
+            entries: {'main.tex': baseline},
+            conflicts: {},
+        };
+        const persisted = [];
+        provider.stateStore = {
+            save: async state => persisted.push(structuredClone(state)),
+        };
+        provider.convergeTextToLocal = async () => remoteText;
+
+        await provider.applyDecision(
+            'main.tex',
+            baseline,
+            local,
+            remote,
+            {action: 'pull'},
+            {local: new Map(), remote: new Map()},
+        );
+
+        const committed = persisted.at(-1);
+        assert.strictEqual(committed.pendingAction, undefined);
+        assert.deepStrictEqual(committed.entries['main.tex'], {
+            entityId: 'doc-1',
+            fileType: 'doc',
+            hash: remote.hash,
+            text: remoteText,
+            localIdentity: '1:2',
+        });
+        assert.deepStrictEqual(decideReconciliation(
+            committed.entries['main.tex'],
+            {
+                ...local,
+                hash: contentHash(encoder.encode(`${remoteText}\nlocal edit`)),
+                text: `${remoteText}\nlocal edit`,
+            },
+            remote,
+        ), {action: 'push'});
     });
 });

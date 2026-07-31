@@ -136,6 +136,48 @@ describe('replica planning', () => {
         assert.notStrictEqual(pending.expectedLocalHash, pending.targetHash);
     });
 
+    it('commits an exact landed direct push before treating a newer same-inode edit as a new delta', () => {
+        const baseline = {
+            entityId: 'doc-1', fileType: 'doc', hash: 'base', text: 'base text', localIdentity: '1:2',
+        };
+        const pending = {
+            id: 'direct-push', kind: 'push', path: 'main.tex', startedAt: new Date(0).toISOString(),
+            expectedLocalHash: 'pushed', expectedRemoteHash: 'base', targetHash: 'pushed',
+            entityId: 'doc-1',
+        };
+        const newerLocal = {
+            ...snap('main.tex', 'newer-local', 'doc', undefined, '1:2'),
+            text: 'pushed text plus another local edit',
+        };
+        const landedRemote = {
+            ...snap('main.tex', 'pushed', 'doc', 'doc-1'),
+            text: 'pushed text',
+        };
+
+        const recovery = validatePendingRecovery(
+            pending,
+            new Map([['main.tex', newerLocal]]),
+            new Map([['main.tex', landedRemote]]),
+            baseline,
+        );
+
+        assert.deepStrictEqual(recovery, {
+            kind: 'recovered-push',
+            baseline: {
+                entityId: 'doc-1',
+                fileType: 'doc',
+                hash: 'pushed',
+                text: 'pushed text',
+                treeHash: undefined,
+                localIdentity: '1:2',
+            },
+        });
+        assert.deepStrictEqual(
+            decideReconciliation(recovery.baseline, newerLocal, landedRemote),
+            { action: 'push' },
+        );
+    });
+
     it('does not claim a push completed when only local remains at target and remote advanced', () => {
         const pending = {
             id: 'push', kind: 'push', path: 'main.tex', startedAt: new Date(0).toISOString(),

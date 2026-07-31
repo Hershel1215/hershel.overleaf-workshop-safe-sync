@@ -468,7 +468,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     scan.remote,
                     this.state.entries[pending.path],
                 );
-                if (recovery.kind === 'recovered-pull') {
+                if (recovery.kind === 'recovered-pull' || recovery.kind === 'recovered-push') {
                     this.state.entries[pending.path] = recovery.baseline;
                     this.state.pendingAction = undefined;
                     await this.stateStore.save(this.state);
@@ -818,17 +818,29 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
                 await this.journalAction(
                     'pull', filePath, local, remote, remote.hash,
-                    () => remote.fileType === 'doc'
-                        && local?.fileType === 'doc'
-                        && remote.text !== undefined
-                        && local.text !== undefined
-                        ? this.convergeTextToLocal(
-                            filePath,
-                            remote.text,
-                            local.text!,
-                            local.hash,
-                        )
-                        : this.writeLocalSnapshot(remote, local?.hash),
+                    async () => {
+                        if (
+                            remote.fileType === 'doc'
+                            && local?.fileType === 'doc'
+                            && remote.text !== undefined
+                            && local.text !== undefined
+                        ) {
+                            const converged = await this.convergeTextToLocal(
+                                filePath,
+                                remote.text,
+                                local.text,
+                                local.hash,
+                            );
+                            await this.commitConvergedTextAction(
+                                filePath,
+                                remote.entityId,
+                                converged,
+                                local.localIdentity,
+                            );
+                            return;
+                        }
+                        await this.writeLocalSnapshot(remote, local?.hash);
+                    },
                 );
                 return 'acted';
             case 'push':
@@ -893,11 +905,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             decision.content,
                         );
                         await this.updatePendingTarget(new TextEncoder().encode(actual));
-                        await this.convergeTextToLocal(
+                        const converged = await this.convergeTextToLocal(
                             filePath,
                             actual,
                             local.text!,
                             local.hash,
+                        );
+                        await this.commitConvergedTextAction(
+                            filePath,
+                            remote.entityId,
+                            converged,
+                            local.localIdentity,
                         );
                     },
                 );
@@ -954,11 +972,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     );
                     await this.updatePendingTarget(created.content);
                     if (local.fileType === 'doc' && local.text !== undefined) {
-                        await this.convergeTextToLocal(
+                        const converged = await this.convergeTextToLocal(
                             filePath,
                             new TextDecoder().decode(created.content),
                             local.text,
                             local.hash,
+                        );
+                        await this.commitConvergedTextAction(
+                            filePath,
+                            created.entityId,
+                            converged,
+                            local.localIdentity,
                         );
                     } else {
                         await this.advanceBinaryBaselineIfLocalChanged(
@@ -980,11 +1004,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         local.text,
                     );
                     await this.updatePendingTarget(new TextEncoder().encode(actual));
-                    await this.convergeTextToLocal(
+                    const converged = await this.convergeTextToLocal(
                         filePath,
                         actual,
                         local.text,
                         local.hash,
+                    );
+                    await this.commitConvergedTextAction(
+                        filePath,
+                        remote.entityId,
+                        converged,
+                        local.localIdentity,
                     );
                     return;
                 }
@@ -1415,7 +1445,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         authoritativeText: string,
         expectedLocalText: string,
         expectedLocalHash: string,
-    ): Promise<void> {
+    ): Promise<string> {
         let remoteText = authoritativeText;
         let localAncestor = expectedLocalText;
         let localHash = expectedLocalHash;
@@ -1427,7 +1457,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     localHash,
                     true,
                 );
-                return;
+                return remoteText;
             } catch (error) {
                 if (!(error instanceof StaleLocalSnapshotError) || !error.actualContent) {
                     throw error;
@@ -1446,6 +1476,35 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
         }
         throw new Error(`Local text kept changing during synchronization: ${filePath}`);
+    }
+
+    private async commitConvergedTextAction(
+        filePath: string,
+        entityId: string | undefined,
+        authoritativeText: string,
+        localIdentity: string | undefined,
+    ): Promise<void> {
+        const state = this.requireState();
+        if (
+            !state.pendingAction
+            || (
+                state.pendingAction.kind !== 'push'
+                && state.pendingAction.kind !== 'pull'
+            )
+            || state.pendingAction.path !== filePath
+            || !entityId
+        ) {
+            throw new Error(`Text sync completed without a matching journal for ${filePath}`);
+        }
+        state.entries[filePath] = {
+            entityId,
+            fileType: 'doc',
+            hash: contentHash(new TextEncoder().encode(authoritativeText)),
+            text: authoritativeText,
+            localIdentity,
+        };
+        state.pendingAction = undefined;
+        await this.stateStore.save(state);
     }
 
     private async advanceBinaryBaselineIfLocalChanged(
