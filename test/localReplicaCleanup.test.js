@@ -217,6 +217,27 @@ describe('Local Replica exclusive E2E cleanup', () => {
         LocalReplicaSCMProvider.activeInstances.delete(path.resolve(basePath));
     });
 
+    it('does not let an unrelated path conflict block namespace cleanup', async () => {
+        const events = [];
+        const basePath = '/tmp/hershel-cleanup-unrelated-conflict';
+        const provider = createProvider(LocalReplicaSCMProvider, basePath, events);
+        provider.state.conflicts['kept.tex'] = {
+            path: 'kept.tex',
+            reason: 'preserved audit record',
+            artifactDirectory: '.overleaf/conflicts/unresolved/kept',
+            createdAt: new Date(0).toISOString(),
+        };
+
+        const result = await LocalReplicaSCMProvider.cleanupNamespace(
+            basePath,
+            'hershel-e2e-stale',
+        );
+
+        assert.strictEqual(result.localRemoved, true);
+        assert(provider.state.conflicts['kept.tex']);
+        LocalReplicaSCMProvider.activeInstances.delete(path.resolve(basePath));
+    });
+
     it('rejects paths outside the reserved top-level E2E namespace', () => {
         assert.throws(
             () => LocalReplicaSCMProvider.cleanupNamespace('/tmp/unused', '../hershel-e2e-run'),
@@ -423,6 +444,7 @@ describe('Local Replica text projection attachment', () => {
             canonical: 'old canonical',
             onCanonicalChanged: async content => { refreshedCanonical = content; },
         }]]);
+        provider.textSchedulers = new Map();
         provider.remoteUri = pathname => ({path: `/${pathname}`});
         provider.vfs = {
             readDocumentProjection: async () => ({

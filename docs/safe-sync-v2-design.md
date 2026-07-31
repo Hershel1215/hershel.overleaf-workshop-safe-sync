@@ -41,6 +41,11 @@ which also contains journaled-but-unacknowledged operations, after verifying
 that its entity identity still matches the scan. The older scan snapshot must
 never reset that projection.
 
+Each document has one serialized task queue for editor saves, filesystem
+watchers, remote OT arrivals, AI transactions, and reconciliation refreshes.
+Before a plugin disk projection is written, the current disk bytes are checked
+against the last observed projection; an unexpected value is imported first.
+
 ## Text concurrency
 
 Each document follows Overleaf's centralized, versioned OT model: one
@@ -78,6 +83,9 @@ Project-wide blocking is reserved for an invalid project binding or corrupted
 project WAL/checkpoint. Document ancestry and content failures are document
 states. Binary and tree conflicts are path states. Other documents and paths
 continue to make progress.
+
+Reserved E2E fixture cleanup is namespace-scoped: an unrelated user conflict
+remains auditable and must not prevent cleanup of an isolated test namespace.
 
 ## Release gate
 

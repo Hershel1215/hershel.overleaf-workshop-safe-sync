@@ -16,6 +16,9 @@ describe('text replica projection state machine', () => {
         const editorProjections = [];
         const diskProjections = [];
         const isolations = [];
+        let diskActual = Object.prototype.hasOwnProperty.call(initial, 'diskContent')
+            ? initial.diskContent
+            : canonical;
         let machine;
         const port = {
             commit: async (ancestor, target, barrier) => {
@@ -29,8 +32,10 @@ describe('text replica projection state machine', () => {
             },
             projectDisk: async content => {
                 diskProjections.push(content);
+                diskActual = content;
                 await machine.onDiskObserved(content);
             },
+            readDisk: async () => diskActual,
             isolate: async record => { isolations.push(record); },
         };
         machine = new TextReplicaStateMachine({
@@ -49,8 +54,25 @@ describe('text replica projection state machine', () => {
             diskProjections,
             isolations,
             setCanonical(value) { canonical = value; },
+            setDisk(value) { diskActual = value; },
         };
     }
+
+    it('imports a raw disk write before projecting a concurrent remote edit', async () => {
+        const state = harness({canonicalContent: 'BASE\n', editorContent: undefined});
+        // This models a completed filesystem write whose watcher callback has
+        // not reached the document queue yet.
+        state.setDisk('LOCAL\nBASE\n');
+        state.setCanonical('REMOTE\nBASE\n');
+        await state.machine.onCanonicalChanged('REMOTE\nBASE\n');
+
+        assert.strictEqual(state.commits.length, 1);
+        assert(state.machine.canonical.includes('LOCAL\n'));
+        assert(state.machine.canonical.includes('REMOTE\n'));
+        assert(state.diskProjections.at(-1).includes('LOCAL\n'));
+        assert(state.diskProjections.at(-1).includes('REMOTE\n'));
+        state.machine.dispose();
+    });
 
     it('does not re-import an editor or disk projection as a mutation', async () => {
         const state = harness();

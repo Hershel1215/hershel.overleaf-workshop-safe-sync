@@ -426,7 +426,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const relative = this.relativeLocalPath(event.document.uri);
                 const machine = relative === undefined ? undefined : this.textReplicas.get(relative);
                 if (this.observationReady && relative !== undefined && machine && !this.isIgnored(relative)) {
-                    event.waitUntil(machine.beforeEditorSave(event.document.getText()));
+                    event.waitUntil(this.textTask(
+                        relative,
+                        'editor-save',
+                        () => machine.beforeEditorSave(event.document.getText()),
+                    ));
                 }
             }),
             vscode.workspace.onDidSaveTextDocument(document => {
@@ -436,7 +440,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     this.recoveryObservations.add(`editor:${relative}`);
                     this.recoveryObservations.add(`local:${relative}`);
                 } else if (relative !== undefined && machine && !this.isIgnored(relative)) {
-                    machine.onEditorSaved(document.getText());
+                    void this.textTask(
+                        relative,
+                        'editor-save',
+                        async () => { machine.onEditorSaved(document.getText()); },
+                    ).catch(error => {
+                        this.handleTextReplicaError(relative, error);
+                    });
                 }
             }),
         ];
@@ -538,11 +548,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 this.scheduleReconcile(`local delete: ${relative}`, 0);
                 return;
             }
-            void this.readLocalText(relative).then(content => this.textTask(
-                relative,
-                'filesystem',
-                () => machine.onDiskObserved(content),
-            )).catch(error => {
+            // Read inside the document queue. Reading before enqueueing lets a
+            // concurrent remote projection overwrite the file first, causing
+            // the watcher to observe the plugin's bytes instead of the user's
+            // write.
+            void this.textTask(relative, 'filesystem', async () => {
+                await machine.onDiskObserved(await this.readLocalText(relative));
+            }).catch(error => {
                 this.handleTextReplicaError(relative, error);
             });
             return;
@@ -566,11 +578,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 this.scheduleReconcile(`remote delete: ${relative}`, 0);
                 return;
             }
-            void this.readRemoteText(relative).then(content => this.textTask(
-                relative,
-                'remote',
-                () => machine.onCanonicalChanged(content),
-            )).catch(error => {
+            void this.textTask(relative, 'remote', async () => {
+                await machine.onCanonicalChanged(await this.readRemoteText(relative));
+            }).catch(error => {
                 this.handleTextReplicaError(relative, error);
             });
             return;
@@ -672,7 +682,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     if (!existing.isIsolated
                         && existing.canonical !== canonicalContent
                         && local?.fileType === 'doc') {
-                        await existing.onCanonicalChanged(canonicalContent);
+                        await this.textTask(
+                            filePath,
+                            'remote-scan',
+                            () => existing.onCanonicalChanged(canonicalContent),
+                        );
                     }
                 } else {
                     await this.createTextReplica(filePath, canonicalContent, local);
@@ -773,6 +787,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     new TextEncoder().encode(content),
                 );
             },
+            readDisk: () => this.readLocalText(filePath),
             persistProjectionReceipts: async receipts => {
                 if (this.state) {
                     const ownedPaths = new Set([
@@ -1321,8 +1336,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 `Cannot clean E2E namespace with pending ${this.state.pendingAction.kind}`,
             );
         }
-        if (Object.keys(this.state.conflicts).length > 0) {
-            throw new Error('Cannot clean E2E namespace while conflicts are active');
+        const namespaceConflict = Object.keys(this.state.conflicts).find(filePath => (
+            filePath === namespace || filePath.startsWith(`${namespace}/`)
+        ));
+        if (namespaceConflict) {
+            throw new Error(
+                `Cannot clean E2E namespace while ${namespaceConflict} is conflicted`,
+            );
         }
 
         const before = await this.scanBoth();

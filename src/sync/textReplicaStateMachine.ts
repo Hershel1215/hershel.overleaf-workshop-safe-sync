@@ -19,6 +19,8 @@ export interface TextReplicaPort {
     ) => Promise<AcceptedDocumentOperation>;
     projectEditor: (content: string) => Promise<void>;
     projectDisk: (content: string) => Promise<void>;
+    /** Read the current disk projection before a plugin write can overwrite it. */
+    readDisk?: () => Promise<string | undefined>;
     isolate: (record: TextReplicaIsolation) => Promise<void>;
     persistProjectionReceipts?: (receipts: ProjectionReceipt[]) => Promise<void>;
 }
@@ -195,6 +197,16 @@ export class TextReplicaStateMachine {
             this.editorContent = this.canonicalContent;
         }
         if (!this.editorDirty && this.diskContent !== this.canonicalContent) {
+            // A raw filesystem writer may have changed the file before the
+            // watcher callback ran. Import that snapshot against the last
+            // observed disk base instead of overwriting it with remote text.
+            if (this.port.readDisk) {
+                const observedDisk = await this.port.readDisk();
+                if (observedDisk !== this.diskContent) {
+                    await this.onDiskObserved(observedDisk);
+                    return;
+                }
+            }
             this.projections.record(diskProjectionPath(this.path), {
                 kind: this.diskContent === undefined ? 'create' : 'change',
                 hash: textHash(this.canonicalContent),

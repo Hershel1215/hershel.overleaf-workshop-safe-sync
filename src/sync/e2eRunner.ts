@@ -21,8 +21,8 @@ const REQUEST_FILE = 'safe-sync-e2e.request.json';
 const RUNNING_FILE = 'safe-sync-e2e.running.json';
 const RESULT_FILE = 'safe-sync-e2e.result.json';
 const RELOAD_FILE = 'safe-sync-e2e.reload.json';
-const HANDOFF_TARGET_VERSION = '1.0.0-hershel.23';
-const HANDOFF_TARGET_BUILD_ID = '20260731T104939Z-safe-sync-v2-rc23';
+const HANDOFF_TARGET_VERSION = '1.0.0-hershel.26';
+const HANDOFF_TARGET_BUILD_ID = '20260731T132713Z-safe-sync-v2-rc26';
 export const E2E_RESULT_SCHEMA_VERSION = 4;
 const BINARY_FIXTURE = Uint8Array.from(Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
@@ -1001,16 +1001,13 @@ async function runRemoteE2E(
             const base = `BASE-${request.nonce}\n`;
             await vscode.workspace.fs.writeFile(localUri, Buffer.from(base, 'utf8'));
             await waitForAsync(async () => {
-                const remote = await freshDocument(
-                    server.server.url,
-                    api!,
-                    identity!,
-                    projectId!,
-                    runFolderId!,
-                    fileName,
-                );
                 const state = await replicaStateStore!.load();
-                return remote?.content === base
+                // The persisted baseline is produced only after the Local
+                // Replica has scanned and accepted the authoritative remote
+                // snapshot. Avoid requiring a second fresh project-directory
+                // socket here: Overleaf's directory listing can lag the OT
+                // stream even after the document itself is acknowledged.
+                return state.entries[relativePath]?.fileType === 'doc'
                     && state.entries[relativePath]?.hash
                         === createHash('sha256').update(base).digest('hex')
                     && !state.pendingAction;
