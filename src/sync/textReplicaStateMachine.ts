@@ -17,14 +17,19 @@ export interface TextReplicaPort {
         target: string,
         barrier: boolean,
     ) => Promise<AcceptedDocumentOperation>;
-    projectEditor: (content: string) => Promise<void>;
+    /** Apply only if the visible editor still equals expectedContent. */
+    projectEditor: (content: string, expectedContent: string) => Promise<boolean | void>;
     projectDisk: (content: string) => Promise<void>;
+    /** Read the visible editor before a plugin edit can overwrite pending input. */
+    readEditor?: () => Promise<string | undefined>;
     /** Read the current disk projection before a plugin write can overwrite it. */
     readDisk?: () => Promise<string | undefined>;
     /** Persist a common baseline only after all local projections converge. */
     onConverged?: (content: string) => Promise<void>;
     isolate: (record: TextReplicaIsolation) => Promise<void>;
     persistProjectionReceipts?: (receipts: ProjectionReceipt[]) => Promise<void>;
+    /** True while earlier VS Code observations still await this document queue. */
+    hasPendingEditorObservations?: () => boolean;
 }
 
 export interface TextReplicaInitialState {
@@ -51,7 +56,12 @@ export class TextReplicaStateMachine {
     private editorDirty: boolean;
     private diskContent?: string;
     private allowDirtyDiskProjection = false;
+    private diskMutationInProgress = false;
     private isolatedReason?: string;
+    private disposed = false;
+    private projectionInProgress = false;
+    private projectionPending = false;
+    private readonly projectionRetirementWaiters: Array<() => void> = [];
 
     constructor(initial: TextReplicaInitialState, port: TextReplicaPort) {
         this.path = initial.path;
@@ -65,13 +75,18 @@ export class TextReplicaStateMachine {
             onError: error => void this.isolate(error.message),
             commit: async (ancestor, target, barrier) => {
                 const accepted = await this.port.commit(ancestor, target, barrier);
-                this.canonicalContent = accepted.content;
                 accepted.acknowledgement.catch(error => {
-                    void this.isolate(`Remote acknowledgement failed: ${error.message}`);
+                    if (!this.disposed) {
+                        void this.isolate(`Remote acknowledgement failed: ${error.message}`);
+                    }
                 });
-                await this.projectCanonical();
+                if (this.disposed) {
+                    return accepted;
+                }
+                this.canonicalContent = accepted.content;
                 return accepted;
             },
+            onIdle: () => this.projectCanonical(),
         });
     }
 
@@ -92,19 +107,33 @@ export class TextReplicaStateMachine {
     }
 
     async onCanonicalChanged(content: string): Promise<void> {
-        if (this.isIsolated) {
+        if (this.disposed || this.isIsolated) {
             return;
         }
         this.canonicalContent = content;
+        if (this.diskMutationInProgress) {
+            this.projectionPending = true;
+            return;
+        }
         if (this.input.hasBufferedInput) {
-            await this.input.flush(true);
+            // The VFS OT session already owns the remote operation. Keep the
+            // editor batch in memory until its normal idle/hard deadline, then
+            // commit it against its event-time ancestor; the document session
+            // transforms it over this newer canonical content. Projecting is
+            // forbidden while the batch exists, so no durability is traded
+            // for avoiding one WAL/fsync per remote callback.
+            this.projectionPending = true;
             return;
         }
         await this.projectCanonical();
     }
 
-    async onEditorChanged(content: string): Promise<void> {
-        if (this.isIsolated) {
+    async onEditorChanged(
+        content: string,
+        observedAncestor?: string,
+        requireObservedAncestor = false,
+    ): Promise<void> {
+        if (this.disposed || this.isIsolated) {
             return;
         }
         const observation = { kind: 'change' as const, hash: textHash(content) };
@@ -112,16 +141,39 @@ export class TextReplicaStateMachine {
             this.editorContent = content;
             await this.persistProjectionReceipts();
             await this.notifyConverged();
+            await this.projectCanonical();
             return;
         }
-        const ancestor = this.editorContent ?? this.canonicalContent;
+        if (content === this.editorContent) {
+            // A duplicate event may invalidate a stale receipt, but it is not
+            // another user operation.
+            await this.persistProjectionReceipts();
+            await this.notifyConverged();
+            await this.projectCanonical();
+            return;
+        }
+        if (content === this.canonicalContent) {
+            // A file reload or coalesced editor notification can lack an
+            // adjacent VS Code version while still observing the exact
+            // canonical bytes. Missing metadata is not a content conflict.
+            this.editorContent = content;
+            await this.persistProjectionReceipts();
+            await this.notifyConverged();
+            await this.projectCanonical();
+            return;
+        }
+        if (requireObservedAncestor && observedAncestor === undefined) {
+            await this.isolate('Cannot prove the event-time ancestor of a VS Code edit');
+            return;
+        }
+        const ancestor = observedAncestor ?? this.editorContent ?? this.canonicalContent;
         this.editorContent = content;
         this.editorDirty = true;
-        this.input.update(ancestor, content);
+        await this.input.updateTransition(ancestor, content);
     }
 
     async beforeEditorSave(content: string): Promise<void> {
-        if (this.isIsolated) {
+        if (this.disposed || this.isIsolated) {
             return;
         }
         this.projections.record(diskProjectionPath(this.path), {
@@ -132,7 +184,7 @@ export class TextReplicaStateMachine {
     }
 
     async onEditorSaved(content: string): Promise<void> {
-        if (this.isIsolated) {
+        if (this.disposed || this.isIsolated) {
             return;
         }
         this.editorContent = content;
@@ -142,7 +194,7 @@ export class TextReplicaStateMachine {
     }
 
     async onDiskObserved(content: string | undefined): Promise<void> {
-        if (this.isIsolated) {
+        if (this.disposed || this.isIsolated) {
             return;
         }
         const observation = {
@@ -167,19 +219,36 @@ export class TextReplicaStateMachine {
             && this.diskContent !== undefined
         ) {
             const ancestor = this.diskContent;
-            this.diskContent = content;
-            if (this.input.hasBufferedInput) {
-                await this.input.flush(true);
+            this.diskMutationInProgress = true;
+            try {
+                this.diskContent = content;
+                if (this.input.hasBufferedInput) {
+                    await this.input.flush(true);
+                }
+                if (this.disposed || this.isIsolated) {
+                    return;
+                }
+                const accepted = await this.port.commit(ancestor, content, false);
+                accepted.acknowledgement.catch(error => {
+                    if (!this.disposed) {
+                        void this.isolate(`Remote acknowledgement failed: ${error.message}`);
+                    }
+                });
+                if (this.disposed || this.isIsolated) {
+                    return;
+                }
+                this.canonicalContent = accepted.content;
+                // This exact raw disk branch is now journaled into canonical,
+                // so one direct disk projection is safe even while VS Code
+                // keeps the editor's dirty UI flag.
+                this.allowDirtyDiskProjection = true;
+            } catch (error) {
+                const normalized = error instanceof Error ? error : new Error(String(error));
+                await this.isolate(normalized.message);
+                throw normalized;
+            } finally {
+                this.diskMutationInProgress = false;
             }
-            const accepted = await this.port.commit(ancestor, content, false);
-            this.canonicalContent = accepted.content;
-            // This exact raw disk branch is now journaled into canonical, so
-            // one direct disk projection is safe even while VS Code keeps the
-            // editor's dirty UI flag.
-            this.allowDirtyDiskProjection = true;
-            accepted.acknowledgement.catch(error => {
-                void this.isolate(`Remote acknowledgement failed: ${error.message}`);
-            });
             await this.projectCanonical();
             return;
         }
@@ -187,28 +256,124 @@ export class TextReplicaStateMachine {
     }
 
     async flushInput(barrier = true): Promise<void> {
+        if (this.disposed || this.isIsolated) {
+            return;
+        }
         await this.input.flush(barrier);
     }
 
     dispose(): void {
+        this.disposed = true;
         this.input.dispose();
     }
 
+    async disposeAndWait(): Promise<void> {
+        this.disposed = true;
+        const projectionRetirement = this.waitForProjectionRetirement();
+        await Promise.all([
+            this.input.disposeAndWait(),
+            projectionRetirement,
+        ]);
+    }
+
     private async projectCanonical(): Promise<void> {
-        if (this.isIsolated || this.input.hasBufferedInput) {
+        if (
+            this.disposed
+            || this.isIsolated
+            || this.input.hasBufferedInput
+            || this.diskMutationInProgress
+        ) {
+            if (this.diskMutationInProgress) {
+                this.projectionPending = true;
+            }
             return;
         }
-        if (this.editorContent !== undefined && this.editorContent !== this.canonicalContent) {
+        if (this.projectionInProgress) {
+            this.projectionPending = true;
+            return;
+        }
+        this.projectionInProgress = true;
+        try {
+            do {
+                this.projectionPending = false;
+                await this.projectCanonicalOnce();
+            } while (
+                this.projectionPending
+                && !this.disposed
+                && !this.isIsolated
+            );
+        } catch (error) {
+            const normalized = error instanceof Error ? error : new Error(String(error));
+            await this.isolate(normalized.message);
+            throw normalized;
+        } finally {
+            this.projectionInProgress = false;
+            for (const resolve of this.projectionRetirementWaiters.splice(0)) {
+                resolve();
+            }
+        }
+    }
+
+    private async projectCanonicalOnce(): Promise<void> {
+        if (this.disposed || this.isIsolated || this.input.hasBufferedInput) {
+            return;
+        }
+        // Frozen editor observations are causal transitions, not latest-value
+        // notifications. Let the document queue consume them before a remote
+        // projection can advance the editor head they are based on.
+        if (this.port.hasPendingEditorObservations?.()) {
+            return;
+        }
+        const editorTarget = this.canonicalContent;
+        if (this.editorContent !== undefined && this.editorContent !== editorTarget) {
+            if (await this.importUnobservedEditor()) {
+                return;
+            }
+        }
+        if (this.input.hasBufferedInput) {
+            await this.input.flush(true);
+            return;
+        }
+        if (this.editorContent !== undefined && this.editorContent !== editorTarget) {
             this.projections.record(editorProjectionPath(this.path), {
                 kind: 'change',
-                hash: textHash(this.canonicalContent),
+                hash: textHash(editorTarget),
             });
             await this.persistProjectionReceipts();
-            await this.port.projectEditor(this.canonicalContent);
-            this.editorContent = this.canonicalContent;
+            if (this.disposed || this.isIsolated) {
+                return;
+            }
+            if (this.input.hasBufferedInput) {
+                await this.input.flush(true);
+                return;
+            }
+            try {
+                const applied = await this.port.projectEditor(
+                    editorTarget,
+                    this.editorContent,
+                );
+                if (applied === false) {
+                    return;
+                }
+            } catch (error) {
+                if (await this.importUnobservedEditor()) {
+                    return;
+                }
+                throw error;
+            }
+            if (this.disposed || this.isIsolated) {
+                return;
+            }
+            this.editorContent = editorTarget;
+            if (this.canonicalContent !== editorTarget) {
+                this.projectionPending = true;
+                return;
+            }
         }
+        const diskTarget = this.canonicalContent;
         if (
-            this.diskContent !== this.canonicalContent
+            this.diskContent !== diskTarget
+            && !this.diskMutationInProgress
             && (!this.editorDirty || this.allowDirtyDiskProjection)
         ) {
             // A raw filesystem writer may have changed the file before the
@@ -223,14 +388,62 @@ export class TextReplicaStateMachine {
             }
             this.projections.record(diskProjectionPath(this.path), {
                 kind: this.diskContent === undefined ? 'create' : 'change',
-                hash: textHash(this.canonicalContent),
+                hash: textHash(diskTarget),
             });
             await this.persistProjectionReceipts();
-            await this.port.projectDisk(this.canonicalContent);
-            this.diskContent = this.canonicalContent;
+            if (this.disposed || this.isIsolated) {
+                return;
+            }
+            if (this.input.hasBufferedInput) {
+                await this.input.flush(true);
+                return;
+            }
+            await this.port.projectDisk(diskTarget);
+            if (this.disposed || this.isIsolated) {
+                return;
+            }
+            this.diskContent = diskTarget;
             this.allowDirtyDiskProjection = false;
+            if (this.canonicalContent !== diskTarget) {
+                this.projectionPending = true;
+                return;
+            }
         }
         await this.notifyConverged();
+    }
+
+    /** Journal a VS Code edit whose change event has not reached the queue. */
+    private async importUnobservedEditor(): Promise<boolean> {
+        if (!this.port.readEditor) {
+            return false;
+        }
+        if (this.port.hasPendingEditorObservations?.()) {
+            return true;
+        }
+        const observedEditor = await this.port.readEditor();
+        if (this.disposed || this.isIsolated) {
+            return true;
+        }
+        if (this.port.hasPendingEditorObservations?.()) {
+            return true;
+        }
+        if (observedEditor === undefined) {
+            this.editorContent = undefined;
+            return false;
+        }
+        if (observedEditor === this.editorContent) {
+            return false;
+        }
+        await this.onEditorChanged(observedEditor);
+        await this.input.flush(true);
+        return true;
+    }
+
+    private waitForProjectionRetirement(): Promise<void> {
+        if (!this.projectionInProgress) {
+            return Promise.resolve();
+        }
+        return new Promise<void>(resolve => this.projectionRetirementWaiters.push(resolve));
     }
 
     private async persistProjectionReceipts(): Promise<void> {
@@ -239,8 +452,10 @@ export class TextReplicaStateMachine {
 
     private async notifyConverged(): Promise<void> {
         if (
-            this.isIsolated
+            this.disposed
+            || this.isIsolated
             || this.input.hasBufferedInput
+            || this.diskMutationInProgress
             || this.diskContent !== this.canonicalContent
             || (
                 this.editorContent !== undefined
@@ -253,7 +468,7 @@ export class TextReplicaStateMachine {
     }
 
     private async isolate(reason: string): Promise<void> {
-        if (this.isolatedReason) {
+        if (this.disposed || this.isolatedReason) {
             return;
         }
         this.isolatedReason = reason;

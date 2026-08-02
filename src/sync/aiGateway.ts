@@ -156,7 +156,9 @@ export async function sendAiGatewayRequest<T>(
         let received = Buffer.alloc(0);
         const timer = setTimeout(() => {
             socket.destroy();
-            reject(new Error('AI gateway request timed out'));
+            reject(new Error(
+                `AI gateway ${request.method} request timed out for ${String(request.path ?? 'unknown path')}`,
+            ));
         }, timeoutMs);
         const finish = (error?: Error, value?: T) => {
             clearTimeout(timer);
@@ -167,7 +169,10 @@ export async function sendAiGatewayRequest<T>(
             }
         };
         socket.setEncoding('utf8');
-        socket.on('connect', () => socket.end(JSON.stringify(payload) + '\n'));
+        // Keep the writable side open until the server returns its response.
+        // Calling end() here makes Node's default allowHalfOpen=false server
+        // close its side while a queued handler is still running.
+        socket.on('connect', () => socket.write(JSON.stringify(payload) + '\n'));
         socket.on('data', chunk => {
             received = Buffer.concat([received, Buffer.from(chunk)]);
             const newline = received.indexOf(0x0a);

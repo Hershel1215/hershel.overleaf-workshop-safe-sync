@@ -63,6 +63,40 @@ describe('durable Overleaf document session', () => {
         await harness.session.close();
     });
 
+    it('drains an in-flight transition before closing its journal', async () => {
+        const harness = await createHarness();
+        let releaseCommit;
+        let announceCommit;
+        const commitStarted = new Promise(resolve => { announceCommit = resolve; });
+        const commitGate = new Promise(resolve => { releaseCommit = resolve; });
+        const commitRemote = harness.journal.commitRemoteOperation.bind(harness.journal);
+        harness.journal.commitRemoteOperation = async (...args) => {
+            announceCommit();
+            await commitGate;
+            return commitRemote(...args);
+        };
+        let journalClosed = false;
+        const closeJournal = harness.journal.close.bind(harness.journal);
+        harness.journal.close = async () => {
+            journalClosed = true;
+            await closeJournal();
+        };
+
+        const receive = harness.session.receiveUpdate({
+            doc: 'doc-1',
+            v: 0,
+            op: [{p: 1, i: 'R'}],
+            meta: {source: 'remote'},
+        });
+        await commitStarted;
+        const close = harness.session.close();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(journalClosed, false);
+        releaseCommit();
+        await Promise.all([receive, close]);
+        assert.strictEqual(journalClosed, true);
+    });
+
     it('transforms an outstanding operation against a remote edit', async () => {
         const harness = await createHarness();
         const write = harness.session.submitSnapshot('aLb');

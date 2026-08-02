@@ -12,11 +12,16 @@ export class FairTaskScheduler {
     private sourceCursor = 0;
     private pumping = false;
     private disposed = false;
+    private readonly retirementWaiters: Array<() => void> = [];
 
     constructor(private readonly maxPendingPerSource = 1024) {}
 
     get pendingCount(): number {
         return [...this.queues.values()].reduce((total, queue) => total + queue.length, 0);
+    }
+
+    pendingCountFor(source: string): number {
+        return this.queues.get(source)?.length ?? 0;
     }
 
     run<T>(source: string, task: () => Promise<T>): Promise<T> {
@@ -50,6 +55,18 @@ export class FairTaskScheduler {
             }
         }
         this.queues.clear();
+        if (!this.pumping) {
+            this.resolveRetirementWaiters();
+        }
+    }
+
+    /** Stop accepting work and wait for the one currently running task. */
+    async disposeAndWait(): Promise<void> {
+        this.dispose();
+        if (!this.pumping) {
+            return;
+        }
+        await new Promise<void>(resolve => this.retirementWaiters.push(resolve));
     }
 
     private async pump(): Promise<void> {
@@ -85,7 +102,15 @@ export class FairTaskScheduler {
             this.pumping = false;
             if (!this.disposed && this.pendingCount > 0) {
                 void this.pump();
+            } else {
+                this.resolveRetirementWaiters();
             }
+        }
+    }
+
+    private resolveRetirementWaiters(): void {
+        for (const resolve of this.retirementWaiters.splice(0)) {
+            resolve();
         }
     }
 }

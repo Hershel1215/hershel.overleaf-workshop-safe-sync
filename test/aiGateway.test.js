@@ -36,6 +36,22 @@ describe('AI gateway transport', () => {
         server = undefined;
     });
 
+    it('keeps the request socket open while a queued handler completes', async () => {
+        const metadataPath = path.join(directory, 'gateway.json');
+        server = new AiGatewayServer(metadataPath, {
+            handle: async () => {
+                await new Promise(resolve => setTimeout(resolve, 100));
+                return { delayed: true };
+            },
+        }, path.join(directory, 'gateway.sock'));
+        await server.start();
+        const response = await sendAiGatewayRequest(metadataPath, {
+            method: 'commit',
+            path: 'main.tex',
+        }, 500);
+        assert.deepStrictEqual(response, { delayed: true });
+    });
+
     it('rejects an unauthenticated socket request', async () => {
         const metadataPath = path.join(directory, 'gateway.json');
         server = new AiGatewayServer(metadataPath, { handle: async () => ({ ok: true }) }, path.join(directory, 'gateway.sock'));

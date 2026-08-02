@@ -3,13 +3,14 @@ import { createHash, randomUUID } from 'crypto';
 import { readFileSync } from 'fs';
 import { rm as removeDisk, writeFile as writeDiskFile } from 'fs/promises';
 import { BaseAPI, Identity, ProjectPersist } from '../api/base';
-import { SocketIOAPI, UpdateSchema } from '../api/socketio';
+import { isSocketIOTimeout, SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
 import { ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 import { DurableDocumentSession } from './durableDocumentSession';
 import { DocumentJournal } from './documentJournal';
+import { sendAiGatewayRequest } from './aiGateway';
 import { assertLocalReplicaBinding, LocalReplicaBinding } from './localBinding';
 import { ReplicaStateStore } from './replicaStateStore';
 import { TextOperation } from './textOperation';
@@ -21,9 +22,9 @@ const REQUEST_FILE = 'safe-sync-e2e.request.json';
 const RUNNING_FILE = 'safe-sync-e2e.running.json';
 const RESULT_FILE = 'safe-sync-e2e.result.json';
 const RELOAD_FILE = 'safe-sync-e2e.reload.json';
-const HANDOFF_TARGET_VERSION = '1.0.0-hershel.30';
-const HANDOFF_TARGET_BUILD_ID = '20260731T145150Z-safe-sync-v2-rc30';
-export const E2E_RESULT_SCHEMA_VERSION = 4;
+const HANDOFF_TARGET_VERSION = '1.0.0-hershel.60';
+const HANDOFF_TARGET_BUILD_ID = '20260802T045315Z-safe-sync-v2-rc60';
+export const E2E_RESULT_SCHEMA_VERSION = 5;
 const BINARY_FIXTURE = Uint8Array.from(Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
     'base64',
@@ -67,6 +68,7 @@ interface E2EEvidence {
         entityType: 'doc';
         createdSha256: string;
         remotelyEditedSha256: string;
+        lateAttachRebased: boolean;
         remoteDeleteVerified: boolean;
     };
     localResources?: Array<{name: string; entityType: 'file'; sha256: string}>;
@@ -76,7 +78,27 @@ interface E2EEvidence {
         archivesVerified: boolean;
         resolvedUsing: 'remote';
     };
+    textResourceConflictRecovery?: {
+        resolvedUsing: 'remote';
+        reattached: boolean;
+        sha256: string;
+    };
     localWriterOverlap?: {sha256: string; journalConverged: boolean};
+    streamingWriters?: {
+        path: string;
+        batchedLocalEditCount: number;
+        batchedLocalOperationCount: number;
+        localEditCount: number;
+        localSubmittedOperationCount: number;
+        editorChangeEventCount: number;
+        remoteSubmittedOperationCount: number;
+        aiCommittedOperationCount: number;
+        finalRevision: number;
+        expectedUtf16Length: number;
+        perWriterOrderPreserved: boolean;
+        sha256: string;
+        savedToDisk: boolean;
+    };
     conflictArtifactsRemoteAbsent?: boolean;
     otCatchUp?: {baseRevision: number; finalRevision: number; operationCount: number; sha256: string};
     cleanup?: {
@@ -295,6 +317,23 @@ async function freshDocument(
             }
             throw error;
         }
+    } catch (error) {
+        // Never report absence from a timed-out document read. A second fresh
+        // project snapshot must prove that the entity itself is gone.
+        if (isSocketIOTimeout(error)) {
+            const current = await freshProject(
+                serverUrl,
+                api,
+                identity,
+                projectId,
+                `confirm timed-out read of ${name}`,
+            );
+            const currentParent = findFolder(current.rootFolder[0], parentFolderId);
+            if (!currentParent?.docs.some(item => item.name === name)) {
+                return undefined;
+            }
+        }
+        throw error;
     } finally {
         socket.disconnect();
     }
@@ -764,6 +803,7 @@ async function runRemoteE2E(
 
         let runFolder!: FolderEntity;
         let documentId!: string;
+        let streamingDocumentId!: string;
         let binaryId!: string;
         let folderA!: FolderEntity;
         let folderB!: FolderEntity;
@@ -820,6 +860,15 @@ async function runRemoteE2E(
             assert(document.type === 'success' && document.entity, 'Could not create E2E document');
             documentId = document.entity._id;
 
+            const streaming = await api!.addDoc(
+                identity!, projectId!, runFolder._id, 'streaming.tex',
+            );
+            assert(
+                streaming.type === 'success' && streaming.entity,
+                'Could not create streaming editor document',
+            );
+            streamingDocumentId = streaming.entity._id;
+
             const uploaded = await api!.uploadFile(
                 identity!,
                 projectId!,
@@ -846,14 +895,20 @@ async function runRemoteE2E(
 
         await step('remote text and binary fixtures reach Local Replica', async () => {
             const localDocument = vscode.Uri.joinPath(localRoot!, isolatedRunName, 'concurrent.tex');
+            const localStreamingDocument = vscode.Uri.joinPath(
+                localRoot!, isolatedRunName, 'streaming.tex',
+            );
             const localBinary = vscode.Uri.joinPath(localRoot!, isolatedRunName, 'fixture.png');
             await waitForAsync(async () => {
-                const [text, binary] = await Promise.all([
+                const [text, streaming, binary] = await Promise.all([
                     readLocalBytes(localDocument),
+                    readLocalBytes(localStreamingDocument),
                     readLocalBytes(localBinary),
                 ]);
                 return text !== undefined
                     && Buffer.from(text).toString('utf8') === ''
+                    && streaming !== undefined
+                    && Buffer.from(streaming).toString('utf8') === ''
                     && binary !== undefined
                     && Buffer.from(binary).equals(Buffer.from(BINARY_FIXTURE));
             }, 30000, 'pull remote fixtures into Local Replica');
@@ -967,6 +1022,53 @@ async function runRemoteE2E(
             assert(sessionErrors.length === 0 && receiveErrors.length === 0,
                 'Remote round-trip editor entered fail-closed state');
 
+            await waitForAsync(async () => {
+                const state = await replicaStateStore!.reload();
+                return state.entries[relativePath]?.hash
+                    === createHash('sha256').update(convergedContent).digest('hex');
+            }, 30000, 'persist the round-trip common base before late attachment', 250);
+            await LocalReplicaSCMProvider.detachE2ETextReplica(
+                localRoot!.fsPath,
+                relativePath,
+            );
+            const lateBase = convergedContent;
+            const lateLocalToken = `LATE-LOCAL-${request.nonce}\n`;
+            const lateRemoteToken = `LATE-REMOTE-${request.nonce}\n`;
+            await Promise.all([
+                writeDiskFile(
+                    localUri.fsPath,
+                    Buffer.from(`${lateBase}${lateLocalToken}`, 'utf8'),
+                ),
+                remoteSession.submitSnapshotAgainstAncestor(
+                    lateBase,
+                    `${lateBase}${lateRemoteToken}`,
+                ),
+            ]);
+            await waitForAsync(async () => {
+                const [local, remote, state] = await Promise.all([
+                    readLocalBytes(localUri),
+                    freshDocument(
+                        server.server.url,
+                        api!,
+                        identity!,
+                        projectId!,
+                        runFolderId!,
+                        fileName,
+                    ),
+                    replicaStateStore!.reload(),
+                ]);
+                if (!local || !remote) {
+                    return false;
+                }
+                convergedContent = Buffer.from(local).toString('utf8');
+                return convergedContent === remote.content
+                    && convergedContent === remoteSession!.content
+                    && convergedContent.includes(lateLocalToken)
+                    && convergedContent.includes(lateRemoteToken)
+                    && !state.pendingAction
+                    && !state.conflicts[relativePath];
+            }, 45000, 'OT-rebase local and remote changes during late text attachment', 500);
+
             await vscode.workspace.fs.delete(localUri);
             await waitForAsync(async () => {
                 const current = await freshProject(
@@ -990,6 +1092,7 @@ async function runRemoteE2E(
                 entityType: 'doc',
                 createdSha256: localHash,
                 remotelyEditedSha256: createHash('sha256').update(convergedContent).digest('hex'),
+                lateAttachRebased: true,
                 remoteDeleteVerified: true,
             };
         });
@@ -1053,6 +1156,12 @@ async function runRemoteE2E(
                 journalConverged: true,
             };
 
+            // The overlap assertion above intentionally leaves the editor
+            // dirty. Cleanup must first make that verified snapshot durable;
+            // deleting the disk file while an unsaved buffer still exists is
+            // a new local-writer overlap, not an unambiguous fixture delete.
+            assert(await document.save(), 'Could not save the converged writer-overlap fixture');
+            assert(!document.isDirty, 'Writer-overlap fixture remained dirty before cleanup');
             await vscode.workspace.fs.delete(localUri);
             await waitForAsync(async () => {
                 const remote = await freshDocument(
@@ -1068,6 +1177,369 @@ async function runRemoteE2E(
                     && state.entries[relativePath] === undefined
                     && !state.pendingAction;
             }, 30000, 'delete writer-overlap fixture on both endpoints', 750);
+        });
+
+        await step('streaming VS Code, remote, and AI writers converge', async () => {
+            const fileName = 'streaming.tex';
+            const relativePath = `${isolatedRunName}/${fileName}`;
+            const localUri = vscode.Uri.joinPath(localRoot!, isolatedRunName, fileName);
+            const gatewayUri = vscode.Uri.joinPath(
+                localRoot!, '.overleaf', 'safe-sync-gateway.json',
+            );
+            const document = await vscode.workspace.openTextDocument(localUri);
+            assert(document.getText() === '', 'Streaming fixture did not start from an empty document');
+            let streamingEditor = await vscode.window.showTextDocument(document, {
+                preview: false,
+                preserveFocus: false,
+            });
+
+            const socket = new SocketIOAPI(server.server.url, api!, identity!, projectId!);
+            sockets.push(socket);
+            let remoteSession: DurableDocumentSession | undefined;
+            const receiveErrors: Error[] = [];
+            socket.updateEventHandlers({
+                onFileChanged: update => {
+                    remoteSession?.receiveUpdate(update).catch(error => receiveErrors.push(error));
+                },
+            });
+            await joinProjectWithProtocolFallback(socket, projectId!, 'join streaming remote writer');
+            await waitFor(
+                () => socket.sourceId !== undefined,
+                5000,
+                'receive streaming remote writer source id',
+            );
+            const joined = await withTimeout(
+                socket.joinDoc(streamingDocumentId),
+                10000,
+                'join streaming document',
+            );
+            const base = joined.docLines.join('\n');
+            assert(base === '', 'Streaming remote writer joined an unexpected baseline');
+            const sessionErrors: Error[] = [];
+            const journal = await DocumentJournal.open({
+                directory: e2eJournalDirectory,
+                documentId: `${streamingDocumentId}-streaming-remote`,
+                initialRevision: joined.version,
+                initialContent: base,
+                walOptions: {idleCommitMs: 1, maxCommitMs: 5},
+            });
+            remoteSession = await DurableDocumentSession.create({
+                documentId: streamingDocumentId,
+                authoritativeContent: base,
+                authoritativeRevision: joined.version,
+                journal,
+                sendUpdate: update => socket.applyOtUpdate(
+                    streamingDocumentId,
+                    update as UpdateSchema,
+                ),
+                getSourceId: () => socket.sourceId,
+                createOperationId: () => `e2e:${request.nonce}:stream:${randomUUID()}`,
+                onChange: () => {},
+                onError: error => sessionErrors.push(error),
+                retryDelayMs: 3000,
+                fatalDelayMs: 15000,
+            });
+            sessions.push(remoteSession);
+
+            await waitForAsync(
+                () => localPathExists(gatewayUri),
+                15000,
+                'wait for the active AI gateway metadata',
+                250,
+            );
+            const gatewayPath = gatewayUri.fsPath;
+            // Keep the batching probe inside the extension host so its edit
+            // spacing is controlled. `executeCommand('type')` crosses the
+            // remote workbench IPC boundary, where one requested burst can be
+            // delivered in arbitrarily delayed waves; the concurrent stream
+            // below still exercises that real workbench path.
+            const batchedLocalTokens = ['~', '!', '@', '#'];
+            // A workbench `type` payload is not an atomic OT operation: the
+            // client may emit one change event per character, and a valid
+            // remote insert may land between two such events. Use unique
+            // single-key tokens so the test proves exact-once retention and
+            // causal order without imposing false transaction semantics on a
+            // multi-character command.
+            const localTokens = Array.from(
+                {length: 48},
+                (_, index) => String.fromCharCode(0xe000 + index),
+            );
+            const remoteTokens = Array.from(
+                {length: 8},
+                (_, index) => `REMOTE-STREAM-${request.nonce}-${index}\n`,
+            );
+            const aiTokens = Array.from(
+                {length: 6},
+                (_, index) => `AI-STREAM-${request.nonce}-${index}\n`,
+            );
+            const expectedTokens = [
+                ...batchedLocalTokens,
+                ...localTokens,
+                ...remoteTokens,
+                ...aiTokens,
+            ];
+            const expectedUtf16Length = expectedTokens.reduce(
+                (total, token) => total + token.length,
+                0,
+            );
+            let localEditCount = 0;
+            let editorChangeEventCount = 0;
+            let remoteSubmittedOperationCount = 0;
+            let aiCommittedOperationCount = 0;
+            const editorEvents = vscode.workspace.onDidChangeTextDocument(event => {
+                if (event.document.uri.toString() === document.uri.toString()) {
+                    editorChangeEventCount += event.contentChanges.length;
+                }
+            });
+            const pause = (milliseconds: number): Promise<void> => new Promise(resolve => {
+                setTimeout(resolve, milliseconds);
+            });
+            const applyEditorToken = async (token: string): Promise<void> => {
+                if (vscode.window.activeTextEditor?.document.uri.toString()
+                    !== document.uri.toString()) {
+                    streamingEditor = await vscode.window.showTextDocument(document, {
+                        preview: false,
+                        preserveFocus: false,
+                    });
+                }
+                const end = document.positionAt(document.getText().length);
+                streamingEditor.selection = new vscode.Selection(end, end);
+                await vscode.commands.executeCommand('type', {text: token});
+                assert(document.getText().includes(token), 'VS Code type command lost a streaming edit');
+                localEditCount += 1;
+            };
+            const applyEditorBurst = async (tokens: string[]): Promise<void> => {
+                for (const token of tokens) {
+                    const end = document.positionAt(document.getText().length);
+                    const applied = await streamingEditor.edit(builder => {
+                        builder.insert(end, token);
+                    }, {
+                        undoStopBefore: false,
+                        undoStopAfter: false,
+                    });
+                    assert(applied, 'VS Code rejected a rapid editor edit');
+                }
+                assert(
+                    tokens.every(token => document.getText().includes(token)),
+                    'VS Code lost part of the rapid editor burst',
+                );
+                localEditCount += tokens.length;
+            };
+            const isRetryableAiError = (error: unknown): boolean => (
+                /lease is already held|recovery is still in progress|baseline is not initialized/i
+                    .test(safeMessage(error))
+            );
+
+            interface AiBeginResult {
+                leaseId: string;
+                fencingToken: number;
+                content: string;
+            }
+            interface AiCommitResult {
+                journaled: boolean;
+            }
+
+            const commitAiToken = async (token: string): Promise<void> => {
+                let lastError: unknown;
+                for (let attempt = 0; attempt < 80; attempt++) {
+                    let begin: AiBeginResult | undefined;
+                    try {
+                        begin = await sendAiGatewayRequest<AiBeginResult>(gatewayPath, {
+                            method: 'begin',
+                            path: relativePath,
+                            holder: `e2e-ai-${request.nonce}`,
+                        });
+                        const committed = await sendAiGatewayRequest<AiCommitResult>(gatewayPath, {
+                            method: 'commit',
+                            path: relativePath,
+                            leaseId: begin.leaseId,
+                            fencingToken: begin.fencingToken,
+                            content: `${begin.content}${token}`,
+                        });
+                        assert(committed.journaled, 'AI stream commit was not journaled');
+                        aiCommittedOperationCount += 1;
+                        return;
+                    } catch (error) {
+                        lastError = error;
+                        if (begin) {
+                            await sendAiGatewayRequest(gatewayPath, {
+                                method: 'abort',
+                                path: relativePath,
+                                leaseId: begin.leaseId,
+                                fencingToken: begin.fencingToken,
+                            }).catch(() => {});
+                        }
+                        if (!isRetryableAiError(error) || attempt === 79) {
+                            throw error;
+                        }
+                        await pause(50);
+                    }
+                }
+                throw lastError instanceof Error ? lastError : new Error('AI stream did not commit');
+            };
+
+            try {
+                await applyEditorBurst(batchedLocalTokens);
+                await waitForAsync(() => Promise.resolve(
+                    remoteSession!.revision >= joined.version + 1
+                    && batchedLocalTokens.every(token => remoteSession!.content.includes(token)),
+                ), 30000, 'journal one batched operation for rapid VS Code input', 100);
+                const batchedLocalOperationCount = remoteSession.revision - joined.version;
+                assert(
+                    batchedLocalOperationCount === 1,
+                    `${batchedLocalTokens.length} rapid edits created `
+                    + `${batchedLocalOperationCount} remote operations instead of one batch`,
+                );
+
+                const outcomes = await Promise.allSettled([
+                    (async () => {
+                        for (const token of localTokens) {
+                            await applyEditorToken(token);
+                            await pause(18);
+                        }
+                    })(),
+                    (async () => {
+                        for (const token of remoteTokens) {
+                            const ancestor = remoteSession!.content;
+                            await remoteSession!.submitSnapshotAgainstAncestor(
+                                ancestor,
+                                `${ancestor}${token}`,
+                            );
+                            remoteSubmittedOperationCount += 1;
+                            await pause(23);
+                        }
+                    })(),
+                    (async () => {
+                        for (const token of aiTokens) {
+                            await commitAiToken(token);
+                            await pause(31);
+                        }
+                    })(),
+                ]);
+                const failed = outcomes.find(
+                    (outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected',
+                );
+                if (failed) {
+                    throw failed.reason;
+                }
+            } finally {
+                editorEvents.dispose();
+            }
+            assert(
+                localEditCount === batchedLocalTokens.length + localTokens.length,
+                'Streaming editor did not issue every edit',
+            );
+            assert(
+                editorChangeEventCount >= localEditCount,
+                `Streaming editor emitted ${editorChangeEventCount} change events for ${localEditCount} edits`,
+            );
+            assert(
+                remoteSubmittedOperationCount === remoteTokens.length,
+                'Remote streaming writer did not acknowledge every operation',
+            );
+            assert(
+                aiCommittedOperationCount === aiTokens.length,
+                'AI streaming writer did not journal every operation',
+            );
+            const containsAllTokens = (content: string): boolean => (
+                expectedTokens.every(token => content.includes(token))
+            );
+            const containsInOrder = (content: string, tokens: string[]): boolean => {
+                let cursor = 0;
+                for (const token of tokens) {
+                    const index = content.indexOf(token, cursor);
+                    if (index < 0) {
+                        return false;
+                    }
+                    cursor = index + token.length;
+                }
+                return true;
+            };
+            const preservesWriterOrder = (content: string): boolean => (
+                containsInOrder(content, localTokens)
+                && containsInOrder(content, remoteTokens)
+                && containsInOrder(content, aiTokens)
+            );
+            let converged = '';
+            await waitForAsync(async () => {
+                const [remote, state] = await Promise.all([
+                    freshDocument(
+                        server.server.url,
+                        api!,
+                        identity!,
+                        projectId!,
+                        runFolderId!,
+                        fileName,
+                    ),
+                    replicaStateStore!.reload(),
+                ]);
+                if (!remote || !containsAllTokens(document.getText()) || !containsAllTokens(remote.content)) {
+                    return false;
+                }
+                converged = remote.content;
+                return document.getText() === converged
+                    && converged.length === expectedUtf16Length
+                    && preservesWriterOrder(converged)
+                    && !state.pendingAction
+                    && !Object.keys(state.conflicts)
+                        .some(filePath => isE2EConflictPath(filePath, isolatedRunName));
+            }, 60000, 'converge all streaming writer snapshots', 500);
+            assert(await document.save(), 'Could not save the converged streaming document');
+            await waitForAsync(async () => {
+                const [local, remote, state] = await Promise.all([
+                    readLocalBytes(localUri),
+                    freshDocument(
+                        server.server.url,
+                        api!,
+                        identity!,
+                        projectId!,
+                        runFolderId!,
+                        fileName,
+                    ),
+                    replicaStateStore!.reload(),
+                ]);
+                if (!local || !remote) {
+                    return false;
+                }
+                converged = remote.content;
+                const runtime = LocalReplicaSCMProvider.getRuntimeStatus(localRoot!.fsPath);
+                return Buffer.from(local).toString('utf8') === converged
+                    && document.getText() === converged
+                    && containsAllTokens(converged)
+                    && converged.length === expectedUtf16Length
+                    && preservesWriterOrder(converged)
+                    && !state.pendingAction
+                    && !Object.keys(state.conflicts)
+                        .some(filePath => isE2EConflictPath(filePath, isolatedRunName))
+                    && runtime?.settled === true;
+            }, 60000, 'persist the converged streaming document to disk', 500);
+            assert(sessionErrors.length === 0 && receiveErrors.length === 0,
+                'A streaming remote session entered fail-closed state');
+            const localSubmittedOperationCount = remoteSession.revision
+                - joined.version
+                - remoteSubmittedOperationCount
+                - aiCommittedOperationCount;
+            assert(
+                localSubmittedOperationCount > 0
+                && localSubmittedOperationCount < localEditCount,
+                `${localEditCount} streaming editor edits were not durably batched: `
+                + `${localSubmittedOperationCount} local operations`,
+            );
+            evidence.streamingWriters = {
+                path: relativePath,
+                batchedLocalEditCount: batchedLocalTokens.length,
+                batchedLocalOperationCount: 1,
+                localEditCount,
+                localSubmittedOperationCount,
+                editorChangeEventCount,
+                remoteSubmittedOperationCount,
+                aiCommittedOperationCount,
+                finalRevision: remoteSession.revision,
+                expectedUtf16Length,
+                perWriterOrderPreserved: true,
+                sha256: createHash('sha256').update(converged).digest('hex'),
+                savedToDisk: true,
+            };
         });
 
         await step('Local Replica watcher uploads SVG and stable binary resources', async () => {
@@ -1245,6 +1717,194 @@ async function runRemoteE2E(
             );
         });
 
+        await step('resource conflict resolution attaches bidirectional text sync', async () => {
+            const fileName = 'reattach.bin';
+            const relativePath = `${isolatedRunName}/${fileName}`;
+            const localUri = vscode.Uri.joinPath(localRoot!, isolatedRunName, fileName);
+            const fileBase = Buffer.from(`FILE-BASE-${request.nonce}\n`, 'utf8');
+            const uploaded = await api!.uploadFile(
+                identity!,
+                projectId!,
+                runFolderId!,
+                fileName,
+                fileBase,
+            );
+            assert(uploaded.type === 'success' && uploaded.entity,
+                'Could not create text conflict file baseline');
+            const fileEntityId = uploaded.entity._id;
+            const fileBaseHash = createHash('sha256').update(fileBase).digest('hex');
+            await waitForAsync(async () => {
+                const [local, state] = await Promise.all([
+                    readLocalBytes(localUri),
+                    replicaStateStore!.reload(),
+                ]);
+                return local !== undefined
+                    && Buffer.from(local).equals(fileBase)
+                    && state.entries[relativePath]?.fileType === 'file'
+                    && state.entries[relativePath]?.hash === fileBaseHash
+                    && !state.pendingAction;
+            }, 30000, 'establish text conflict file baseline', 750);
+
+            const localVariant = Buffer.from(`LOCAL-FILE-${request.nonce}\n`, 'utf8');
+            await vscode.workspace.fs.writeFile(localUri, localVariant);
+            const removed = await api!.deleteEntity(
+                identity!, projectId!, 'file', fileEntityId,
+            );
+            assert(removed.type === 'success', 'Could not remove text conflict file baseline');
+            const created = await api!.addDoc(
+                identity!, projectId!, runFolderId!, fileName,
+            );
+            assert(created.type === 'success' && created.entity,
+                'Could not replace text conflict baseline with a document');
+            const documentId = created.entity._id;
+
+            let artifactDirectory = '';
+            await waitForAsync(async () => {
+                const state = await replicaStateStore!.reload();
+                const record = state.conflicts[relativePath];
+                if (!record || state.pendingAction) {
+                    return false;
+                }
+                artifactDirectory = record.artifactDirectory;
+                return record.localFile !== undefined
+                    && record.remoteFile !== undefined
+                    && record.remoteEntityId === documentId;
+            }, 45000, 'isolate text resource replacement conflict', 750);
+
+            const resolvedArtifactDirectory = await LocalReplicaSCMProvider
+                .resolveE2EConflictUsingRemote(localRoot!.fsPath, relativePath);
+            assert(
+                resolvedArtifactDirectory === artifactDirectory.replace(
+                    '.overleaf/conflicts/unresolved/',
+                    '.overleaf/conflicts/resolved/',
+                ),
+                'Text conflict artifacts were not moved to the resolved archive',
+            );
+            await waitForAsync(async () => {
+                const [local, state] = await Promise.all([
+                    readLocalBytes(localUri),
+                    replicaStateStore!.reload(),
+                ]);
+                const runtime = LocalReplicaSCMProvider.getRuntimeStatus(localRoot!.fsPath);
+                return local !== undefined
+                    && local.byteLength === 0
+                    && state.entries[relativePath]?.fileType === 'doc'
+                    && state.entries[relativePath]?.entityId === documentId
+                    && !state.conflicts[relativePath]
+                    && !state.pendingAction
+                    && runtime?.settled === true;
+            }, 30000, 'finish remote text conflict resolution', 750);
+
+            const document = await vscode.workspace.openTextDocument(localUri);
+            const localToken = `LOCAL-AFTER-RESOLVE-${request.nonce}\n`;
+            const localEdit = new vscode.WorkspaceEdit();
+            localEdit.insert(localUri, new vscode.Position(0, 0), localToken);
+            assert(await vscode.workspace.applyEdit(localEdit),
+                'Could not edit the reattached local document');
+            await waitForAsync(async () => (
+                (await freshDocument(
+                    server.server.url,
+                    api!,
+                    identity!,
+                    projectId!,
+                    runFolderId!,
+                    fileName,
+                ))?.content === localToken
+            ), 30000, 'push local edit after text conflict resolution', 750);
+            assert(await document.save(), 'Could not save the reattached local document');
+
+            const remoteEditor = new SocketIOAPI(
+                server.server.url, api!, identity!, projectId!,
+            );
+            sockets.push(remoteEditor);
+            let remoteSession: DurableDocumentSession | undefined;
+            const receiveErrors: Error[] = [];
+            remoteEditor.updateEventHandlers({
+                onFileChanged: update => {
+                    remoteSession?.receiveUpdate(update).catch(error => receiveErrors.push(error));
+                },
+            });
+            await joinProjectWithProtocolFallback(
+                remoteEditor, projectId!, 'join post-resolution remote editor',
+            );
+            await waitFor(
+                () => remoteEditor.sourceId !== undefined,
+                5000,
+                'receive post-resolution remote editor source id',
+            );
+            const joined = await withTimeout(
+                remoteEditor.joinDoc(documentId),
+                10000,
+                'join post-resolution document',
+            );
+            const remoteBase = joined.docLines.join('\n');
+            assert(remoteBase === localToken,
+                'Post-resolution remote editor joined an unexpected snapshot');
+            const sessionErrors: Error[] = [];
+            const remoteJournal = await DocumentJournal.open({
+                directory: e2eJournalDirectory,
+                documentId: `${documentId}-reattach`,
+                initialRevision: joined.version,
+                initialContent: remoteBase,
+                walOptions: {idleCommitMs: 1, maxCommitMs: 5},
+            });
+            remoteSession = await DurableDocumentSession.create({
+                documentId,
+                authoritativeContent: remoteBase,
+                authoritativeRevision: joined.version,
+                journal: remoteJournal,
+                sendUpdate: update => remoteEditor.applyOtUpdate(documentId, update as UpdateSchema),
+                getSourceId: () => remoteEditor.sourceId,
+                createOperationId: () => `e2e:${request.nonce}:reattach:${randomUUID()}`,
+                onChange: () => {},
+                onError: error => sessionErrors.push(error),
+                retryDelayMs: 3000,
+                fatalDelayMs: 15000,
+            });
+            sessions.push(remoteSession);
+            const remoteToken = `REMOTE-AFTER-RESOLVE-${request.nonce}\n`;
+            await withTimeout(
+                remoteSession.submitSnapshot(`${remoteToken}${remoteBase}`),
+                20000,
+                'acknowledge remote edit after text conflict resolution',
+            );
+
+            let converged = '';
+            await waitForAsync(async () => {
+                const [local, remote, state] = await Promise.all([
+                    readLocalBytes(localUri),
+                    freshDocument(
+                        server.server.url,
+                        api!,
+                        identity!,
+                        projectId!,
+                        runFolderId!,
+                        fileName,
+                    ),
+                    replicaStateStore!.reload(),
+                ]);
+                if (!local || !remote) {
+                    return false;
+                }
+                converged = Buffer.from(local).toString('utf8');
+                const runtime = LocalReplicaSCMProvider.getRuntimeStatus(localRoot!.fsPath);
+                return document.getText() === converged
+                    && remote.content === converged
+                    && converged.includes(localToken)
+                    && converged.includes(remoteToken)
+                    && !state.conflicts[relativePath]
+                    && !state.pendingAction
+                    && runtime?.settled === true;
+            }, 45000, 'converge reattached editor, disk, and remote document', 750);
+            assert(sessionErrors.length === 0 && receiveErrors.length === 0,
+                'Post-resolution remote editor entered fail-closed state');
+            evidence.textResourceConflictRecovery = {
+                resolvedUsing: 'remote',
+                reattached: true,
+                sha256: createHash('sha256').update(converged).digest('hex'),
+            };
+        });
+
         await step('conflict artifact watcher events remain local-only', async () => {
             const artifactDirectory = vscode.Uri.joinPath(
                 localRoot!,
@@ -1330,20 +1990,29 @@ async function runRemoteE2E(
                 localRenamedUri,
                 {overwrite: false},
             );
-            await waitForAsync(async () => {
-                const refreshed = await freshProject(
-                    server.server.url,
-                    api!,
-                    identity!,
-                    projectId!,
-                    'verify Local Replica rename on remote',
-                );
-                const remoteEntity = findEntity(refreshed.rootFolder[0], movedDocumentId);
-                return remoteEntity?.parentId === folderB._id
-                    && remoteEntity.entity.name === 'local-renamed.tex';
-            }, 30000, 'apply the Local Replica rename to the remote entity', 750);
-            const state = await replicaStateStore!.reload();
             const finalPath = `${isolatedRunName}/move-b/local-renamed.tex`;
+            await waitForAsync(async () => {
+                const [refreshed, state] = await Promise.all([
+                    freshProject(
+                        server.server.url,
+                        api!,
+                        identity!,
+                        projectId!,
+                        'verify Local Replica rename on remote',
+                    ),
+                    replicaStateStore!.reload(),
+                ]);
+                const remoteEntity = findEntity(refreshed.rootFolder[0], movedDocumentId);
+                const runtime = LocalReplicaSCMProvider.getRuntimeStatus(localRoot!.fsPath);
+                return remoteEntity?.parentId === folderB._id
+                    && remoteEntity.entity.name === 'local-renamed.tex'
+                    && state.entries[finalPath]?.entityId === movedDocumentId
+                    && !state.pendingAction
+                    && !Object.keys(state.conflicts)
+                        .some(filePath => isE2EConflictPath(filePath, isolatedRunName))
+                    && runtime?.settled === true;
+            }, 45000, 'apply and settle the Local Replica rename on the remote entity', 750);
+            const state = await replicaStateStore!.reload();
             assert(!state.pendingAction && !Object.keys(state.conflicts)
                 .some(filePath => isE2EConflictPath(filePath, isolatedRunName)),
                 'Move/rename left a pending action or conflict');

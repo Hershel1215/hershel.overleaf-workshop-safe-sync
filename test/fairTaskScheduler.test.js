@@ -5,6 +5,19 @@ const {
 } = require('../out/sync/fairTaskScheduler');
 
 describe('fair document scheduler', () => {
+    it('reports queued observations for one causal source', async () => {
+        const scheduler = new FairTaskScheduler();
+        let release;
+        const gate = new Promise(resolve => { release = resolve; });
+        const running = scheduler.run('remote', async () => gate);
+        const editor = scheduler.run('editor', async () => {});
+        assert.strictEqual(scheduler.pendingCountFor('editor'), 1);
+        assert.strictEqual(scheduler.pendingCountFor('remote'), 0);
+        release();
+        await Promise.all([running, editor]);
+        assert.strictEqual(scheduler.pendingCountFor('editor'), 0);
+    });
+
     it('does not drain one continuous source before another source', async () => {
         const scheduler = new FairTaskScheduler();
         const order = [];
@@ -33,5 +46,26 @@ describe('fair document scheduler', () => {
         release();
         await Promise.all([first, second]);
         scheduler.dispose();
+    });
+
+    it('waits for the running task while rejecting queued work during retirement', async () => {
+        const scheduler = new FairTaskScheduler();
+        let release;
+        let runningFinished = false;
+        const gate = new Promise(resolve => { release = resolve; });
+        const running = scheduler.run('remote', async () => {
+            await gate;
+            runningFinished = true;
+        });
+        const queued = scheduler.run('editor', async () => {
+            throw new Error('queued task must not run');
+        });
+
+        const retirement = scheduler.disposeAndWait();
+        await assert.rejects(queued, /disposed/);
+        assert.strictEqual(runningFinished, false);
+        release();
+        await Promise.all([running, retirement]);
+        assert.strictEqual(runningFinished, true);
     });
 });

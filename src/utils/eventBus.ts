@@ -10,7 +10,6 @@ export type Events = {
     'compilerUpdateEvent': {compiler:string},
     'rootDocUpdateEvent': {rootDocId:string},
     'scmStatusChangeEvent': {status:StatusInfo},
-    'socketioConnectedEvent': {publicId:string},
 };
 
 export class EventBus {

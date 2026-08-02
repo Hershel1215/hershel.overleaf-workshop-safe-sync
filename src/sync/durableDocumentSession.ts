@@ -64,6 +64,7 @@ export class DurableDocumentSession {
     private fatalTimer?: NodeJS.Timeout;
     private lastHashTimestamp = 0;
     private failed?: Error;
+    private closed = false;
 
     private constructor(
         options: DurableDocumentSessionOptions,
@@ -151,7 +152,13 @@ export class DurableDocumentSession {
     }
 
     receiveUpdate(update: DurableLegacyDocumentUpdate): Promise<void> {
+        if (this.closed) {
+            return Promise.resolve();
+        }
         return this.enqueue(async () => {
+            if (this.closed) {
+                return;
+            }
             this.assertHealthy();
             if (update.doc !== this.documentId || update.v < this.revision) {
                 return;
@@ -174,6 +181,10 @@ export class DurableDocumentSession {
     }
 
     dispose(): void {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
         this.clearInflightTimers();
         const error = new Error('Document session disposed before acknowledgement');
         for (const completion of this.completions.values()) {
@@ -184,6 +195,7 @@ export class DurableDocumentSession {
 
     async close(): Promise<void> {
         this.dispose();
+        await this.transition;
         await this.journal.close();
     }
 
@@ -191,11 +203,14 @@ export class DurableDocumentSession {
         planner: (currentContent: string) => string,
         barrier: boolean,
     ): Promise<AcceptedDocumentOperation> {
-        if (this.failed) {
-            return Promise.reject(this.failed);
+        if (this.closed || this.failed) {
+            return Promise.reject(this.failed ?? new Error('Document session is closed'));
         }
         return new Promise<AcceptedDocumentOperation>((resolve, reject) => {
             this.enqueue(async () => {
+                if (this.closed) {
+                    throw new Error('Document session is closed');
+                }
                 this.assertHealthy();
                 const content = planner(this.journal.content);
                 const operation = TextOperation.fromDiff(this.journal.content, content);
@@ -206,6 +221,9 @@ export class DurableDocumentSession {
                 }
                 const opId = this.createOperationId();
                 const submission = await this.journal.commitLocalOperation(operation, opId, barrier);
+                if (this.closed) {
+                    throw new Error('Document session closed during journal commit');
+                }
                 let acknowledge: (content: string) => void;
                 let rejectAcknowledgement: (error: Error) => void;
                 const acknowledgement = new Promise<string>((resolveAcknowledgement, rejectPending) => {
@@ -276,6 +294,9 @@ export class DurableDocumentSession {
     }
 
     private async startOutgoing(outgoing: OutgoingOperation, recovering = false): Promise<void> {
+        if (this.closed) {
+            return;
+        }
         const sources = [...this.journal.transportSources];
         const sourceId = this.getSourceId();
         if (sourceId && !sources.includes(sourceId)) {
@@ -318,12 +339,15 @@ export class DurableDocumentSession {
     }
 
     private scheduleInflightTimers(): void {
+        if (this.closed) {
+            return;
+        }
         if (this.retryTimer) {
             clearTimeout(this.retryTimer);
         }
         this.retryTimer = setTimeout(() => {
             this.enqueue(async () => {
-                if (!this.inflightWire || this.failed) {
+                if (this.closed || !this.inflightWire || this.failed) {
                     return;
                 }
                 const sources = [...this.journal.transportSources];
@@ -375,7 +399,7 @@ export class DurableDocumentSession {
     }
 
     private fail(error: Error): void {
-        if (this.failed) {
+        if (this.closed || this.failed) {
             return;
         }
         this.failed = error;

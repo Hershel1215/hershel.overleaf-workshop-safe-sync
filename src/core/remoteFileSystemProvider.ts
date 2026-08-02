@@ -700,36 +700,41 @@ export class VirtualFileSystem extends vscode.Disposable {
                 throw new Error(`Unsupported Overleaf document OT type: ${joined.otType}`);
             }
             const serverContent = joined.docLines.join('\n');
-            return DurableDocumentSession.create({
-                documentId: doc._id,
-                authoritativeContent: serverContent,
-                authoritativeRevision: joined.version,
-                journal,
-                catchUpUpdates,
-                sendUpdate: update => this.socket.applyOtUpdate(doc._id, update as UpdateSchema),
-                getSourceId: () => this.publicId,
-                createOperationId: () => `${this.projectId}:${doc._id}:${randomUUID()}`,
-                onChange: (content, revision, acknowledgedContent) => {
-                    doc.version = revision;
-                    doc.localCache = content;
-                    doc.remoteCache = acknowledgedContent;
-                    this.isDirty = true;
-                    this.notify([
-                        {type: vscode.FileChangeType.Changed, uri: this.pathToUri(path)}
-                    ]);
-                },
-                onError: error => {
-                    doc.localCache = undefined;
-                    doc.remoteCache = undefined;
-                    console.error(`[hershel-safe-sync] document ${doc._id} isolated`, error);
-                    vscode.window.showWarningMessage(
-                        vscode.l10n.t('Safe synchronization isolated {path}: {message}', {
-                            path,
-                            message: error.message,
-                        })
-                    );
-                },
-            });
+            try {
+                return await DurableDocumentSession.create({
+                    documentId: doc._id,
+                    authoritativeContent: serverContent,
+                    authoritativeRevision: joined.version,
+                    journal,
+                    catchUpUpdates,
+                    sendUpdate: update => this.socket.applyOtUpdate(doc._id, update as UpdateSchema),
+                    getSourceId: () => this.publicId,
+                    createOperationId: () => `${this.projectId}:${doc._id}:${randomUUID()}`,
+                    onChange: (content, revision, acknowledgedContent) => {
+                        doc.version = revision;
+                        doc.localCache = content;
+                        doc.remoteCache = acknowledgedContent;
+                        this.isDirty = true;
+                        this.notify([
+                            {type: vscode.FileChangeType.Changed, uri: this.pathToUri(path)}
+                        ]);
+                    },
+                    onError: error => {
+                        doc.localCache = undefined;
+                        doc.remoteCache = undefined;
+                        console.error(`[hershel-safe-sync] document ${doc._id} isolated`, error);
+                        vscode.window.showWarningMessage(
+                            vscode.l10n.t('Safe synchronization isolated {path}: {message}', {
+                                path,
+                                message: error.message,
+                            })
+                        );
+                    },
+                });
+            } catch (error) {
+                await journal.close().catch(() => {});
+                throw error;
+            }
         })();
         this.documentSessions.set(doc._id, created);
         created.catch(() => {
@@ -770,6 +775,63 @@ export class VirtualFileSystem extends vscode.Disposable {
             entityId: fileEntity._id,
             fileType,
         };
+    }
+
+    /** Read a conflicted document without opening or replaying its local OT journal. */
+    async readAuthoritativeFileWithoutRecovery(
+        uri: vscode.Uri,
+    ): Promise<AuthoritativeFileSnapshot> {
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (!fileEntity || (fileType !== 'doc' && fileType !== 'file')) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        if (fileType === 'file') {
+            return {
+                content: await this.openFile(uri),
+                entityId: fileEntity._id,
+                fileType,
+            };
+        }
+        const joined = await this.socket.joinDoc(fileEntity._id);
+        if (joined.otType !== 'sharejs-text-ot') {
+            throw new Error(`Unsupported Overleaf document OT type: ${joined.otType}`);
+        }
+        return {
+            content: new TextEncoder().encode(joined.docLines.join('\n')),
+            entityId: fileEntity._id,
+            fileType,
+            revision: joined.version,
+        };
+    }
+
+    /** Retire failed local recovery state after its conflict artifact is durable. */
+    async discardDocumentRecovery(uri: vscode.Uri): Promise<void> {
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (fileType !== 'doc' || !fileEntity) {
+            return;
+        }
+        const pendingSession = this.documentSessions.get(fileEntity._id);
+        let session: DurableDocumentSession | undefined;
+        if (pendingSession) {
+            try {
+                session = await pendingSession;
+            } catch {
+                // Session creation closes its journal before rejecting.
+            }
+        }
+        // Never unlink a live WAL after a failed close. The conflict remains
+        // recoverable and a later resolution attempt can retry retirement.
+        await session?.close();
+        this.documentSessions.delete(fileEntity._id);
+        await Promise.all([
+            DocumentJournal.remove(this.documentJournalDirectory, fileEntity._id),
+            this.legacyDocumentStateStore.remove(fileEntity._id),
+        ]);
+        await this.socket.leaveDoc(fileEntity._id).catch(() => {});
+        const doc = fileEntity as DocumentEntity;
+        doc.version = undefined;
+        doc.localCache = undefined;
+        doc.remoteCache = undefined;
     }
 
     /** Apply a document change against a proven ancestor, preserving newer OT operations. */

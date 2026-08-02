@@ -44,9 +44,23 @@ The executable remote suite verifies the exact loaded extension build before
 any mutation. It then exercises the production Local Replica watcher for
 remote-to-local text and binary pulls, local-to-remote text and resource
 uploads, overlapping local/remote text edits, dirty-editor/external-writer OT
-convergence, SVG/PNG classification, concurrent binary conflict archival and
-explicit resolution, ignored conflict artifacts, bidirectional move/rename,
-two-client OT convergence, exact catch-up replay, and residue-free cleanup.
+convergence, late text attachment after both local and remote advance from a
+common base, sustained remote/VS Code/AI streams, SVG/PNG classification,
+concurrent binary conflict archival and explicit resolution, ignored conflict
+artifacts, bidirectional move/rename, two-client OT convergence, exact catch-up
+replay, and residue-free cleanup.
+
+The streaming step is not a final-snapshot smoke test. It sends unique
+single-key VS Code tokens, independent remote OT operations, and fenced AI
+read-edit-commit transactions while all writers overlap. It asserts every
+token exactly once by total UTF-16 length, preserves the causal order of each
+writer, proves four rapid editor callbacks become one remote operation, proves
+the full editor stream uses fewer journal operations than change events, saves
+the converged editor, and compares editor, disk, and authoritative remote
+bytes.
+An acknowledgement timeout from a fresh observer is never accepted as proof
+that a remote document is absent; a second project snapshot must confirm the
+entity deletion.
 ACK-loss recovery, reverse server ordering, conflicting tree operations,
 duplicate locks, and every journal action boundary are exercised by the
 deterministic integration suites.
@@ -64,6 +78,11 @@ Required scenarios:
 9. `.overleaf/conflicts/**` watcher events never create remote entities;
 10. final local bytes, remote bytes, entity types, and hashes converge with no
     unarchived losing variant.
+11. sustained remote writes without a local writer;
+12. sustained VS Code writes with bounded WAL batching;
+13. sustained single-AI gateway writes with lease fencing;
+14. concurrent remote, VS Code, and AI writes with exact retention and
+    per-writer order preservation.
 
 ## Acceptance gate for a real project
 

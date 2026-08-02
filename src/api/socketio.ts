@@ -1,7 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import { Identity, BaseAPI, ProjectMessageResponseSchema } from './base';
 import { FileEntity, DocumentEntity, FileRefEntity, FileType, FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
-import { EventBus } from '../utils/eventBus';
 import { SocketIOAlt } from './socketioAlt';
 
 function decodePackedUtf8(text: string): string {
@@ -77,12 +76,32 @@ export interface EventsHandler {
 
 type ConnectionScheme = 'Alt' | 'v1' | 'v2';
 
+/**
+ * An acknowledgement timeout is a transport observation failure, not an OT
+ * rejection.  Keeping it typed lets callers retry reads/reconnect without
+ * confusing it with an ancestry or content invariant failure.
+ */
+export class SocketIOTimeoutError extends Error {
+    readonly code = 'SOCKET_IO_TIMEOUT';
+
+    constructor(readonly event: string, readonly timeoutMs = 10000) {
+        super(`Socket.IO ${event} acknowledgement timed out after ${timeoutMs} ms`);
+        this.name = 'SocketIOTimeoutError';
+    }
+}
+
+export function isSocketIOTimeout(error: unknown): boolean {
+    return error instanceof SocketIOTimeoutError
+        || (typeof error === 'string' && error === 'timeout')
+        || (error instanceof Error && error.name === 'SocketIOTimeoutError');
+}
+
+const SOCKET_EVENT_TIMEOUT_MS = 10000;
+
 export class SocketIOAPI {
     private scheme: ConnectionScheme = 'v1';
     private record?: Promise<ProjectEntity>;
     private _handlers: Array<EventsHandler> = [];
-    /** Track EventBus listeners for cleanup to prevent MaxListenersExceededWarning */
-    private _eventBusCleanups: Array<()=>void> = [];
 
     private socket?: any;
     private emit: any;
@@ -99,8 +118,6 @@ export class SocketIOAPI {
     }
 
     init() {
-        // Clean up old EventBus listeners before creating new socket
-        this._cleanupEventBusListeners();
         this._publicId = undefined;
 
         // CRITICAL: Properly disconnect old socket before creating a new one.
@@ -140,21 +157,33 @@ export class SocketIOAPI {
         }
         // create emit
         (this.socket.emit)[require('util').promisify.custom] = (event:string, ...args:any[]) => {
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => {
-                    reject('timeout');
-                }, 5000);
-            });
-            const waitPromise = new Promise((resolve, reject) => {
-                this.socket.emit(event, ...args, (err:any, ...data:any[]) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(data);
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const timer = setTimeout(() => {
+                    settled = true;
+                    reject(new SocketIOTimeoutError(event, SOCKET_EVENT_TIMEOUT_MS));
+                }, SOCKET_EVENT_TIMEOUT_MS);
+                try {
+                    this.socket.emit(event, ...args, (err:any, ...data:any[]) => {
+                        if (settled) {
+                            return;
+                        }
+                        settled = true;
+                        clearTimeout(timer);
+                        if (err) {
+                            reject(err);
+                        } else {
+                            resolve(data);
+                        }
+                    });
+                } catch (error) {
+                    if (!settled) {
+                        settled = true;
+                        clearTimeout(timer);
+                        reject(error);
                     }
-                });
+                }
             });
-            return Promise.race([waitPromise, timeoutPromise]);
         };
         this.emit = require('util').promisify(this.socket.emit).bind(this.socket);
         // resume handlers
@@ -168,14 +197,6 @@ export class SocketIOAPI {
     /** Returns true if the socket needs re-initialization (scheme changed, or socket was never init'd) */
     get needsReinit(): boolean {
         return this._socketInitScheme !== this.scheme || !this.socket;
-    }
-
-    /** Clean up any accumulated EventBus listeners */
-    private _cleanupEventBusListeners() {
-        for (const cleanup of this._eventBusCleanups) {
-            try { cleanup(); } catch {}
-        }
-        this._eventBusCleanups = [];
     }
 
     private initInternalHandlers() {
@@ -216,7 +237,9 @@ export class SocketIOAPI {
                     const publicId = res.publicId as string;
                     this._publicId = publicId;
                     const project = res.project as ProjectEntity;
-                    EventBus.fire('socketioConnectedEvent', {publicId});
+                    for (const handlers of this._handlers) {
+                        handlers.onConnectionAccepted?.(publicId);
+                    }
                     resolve(project);
                 });
             });
@@ -299,11 +322,6 @@ export class SocketIOAPI {
                     this.socket.on('connectionAccepted', (_:any, publicId:any) => {
                         handler(publicId);
                     });
-                    // Track EventBus listener via Disposable for cleanup to prevent MaxListenersExceededWarning
-                    const eventBusDisposable = EventBus.on('socketioConnectedEvent', (arg:{publicId:string}) => {
-                        handler(arg.publicId);
-                    });
-                    this._eventBusCleanups.push(() => eventBusDisposable.dispose());
                     break;
                 case handlers.onClientUpdated:
                     this.socket.on('clientTracking.clientUpdated', (user:UpdateUserSchema) => {
@@ -362,8 +380,8 @@ export class SocketIOAPI {
     async joinProject(project_id:string): Promise<ProjectEntity> {
         const timeoutPromise: Promise<ProjectEntity> = new Promise((_, reject) => {
             setTimeout(() => {
-                reject('timeout');
-            }, 5000);
+                reject(new SocketIOTimeoutError('joinProject', SOCKET_EVENT_TIMEOUT_MS));
+            }, SOCKET_EVENT_TIMEOUT_MS);
         });
 
         switch(this.scheme) {
