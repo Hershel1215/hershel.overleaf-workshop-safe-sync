@@ -1,5 +1,9 @@
 # Safe-sync coverage audit
 
+> Archived rc60 evidence. Do not treat the versions or counts below as the
+> current release gate; current builds emit exact identity and E2E evidence in
+> the Safe Sync report.
+
 This file records release evidence, not implementation intent. A scenario is
 marked complete only when a deterministic integration test or the retained
 remote E2E project exercises its failure boundary.
@@ -85,6 +89,11 @@ the observation artifact remains preserved under `.overleaf/conflicts/resolved`.
 | 13 | Sustained AI writes | Deterministic lease suite plus live 6-transaction fenced AI stream | Pass |
 | 14 | Remote/VS Code/AI concurrent writes | Live exact-token, per-writer-order, editor/disk/remote convergence check | Pass |
 | 15 | Late text attachment after both endpoints advance | Forced machine detach plus live local-disk/remote OT rebase from one durable baseline | Pass |
+| 16 | Pending WAL loses the replica baseline path | Schema-3 journal path binding plus no-baseline recovery truth-table test | Pass |
+| 17 | Legacy pending WAL has no path anywhere | Detached base/local archive, durable retirement, and zero project-pause assertion across a real host reload | Required by result schema 11 |
+| 18 | Ignore rule hides a live pending document | Ignored-live-ID recovery test proves journal path isolation instead of skip/pause | Pass |
+| 19 | Recursive cleanup overlaps a pending descendant WAL | Cleanup rejection test plus per-entity recursive remote deletion fence | Pass |
+| 20 | Baseline GC runs while a document WAL is pending | Protected immutable-ID baseline refresh and moved-ID de-duplication tests | Pass |
 
 Scenario 2 uses deterministic connection-failure injection for the exact
 send-before-ACK boundary rather than terminating the production socket during

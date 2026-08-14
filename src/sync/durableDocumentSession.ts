@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import { createHash, randomUUID } from 'crypto';
-import { DocumentJournal } from './documentJournal';
+import { DocumentJournal, DocumentOperationDisposition } from './documentJournal';
 import { OutgoingOperation } from './otClientState';
 import { LegacyTextEdit, TextOperation } from './textOperation';
 
@@ -29,7 +29,13 @@ export interface DurableDocumentSessionOptions {
     sendUpdate: (update: DurableLegacyDocumentUpdate) => Promise<void>;
     getSourceId: () => string | undefined;
     createOperationId?: () => string;
-    onChange: (content: string, revision: number, acknowledgedContent: string) => void;
+    onChange: (
+        content: string,
+        revision: number,
+        acknowledgedContent: string,
+        hasPendingOperations: boolean,
+        sequence: number,
+    ) => void;
     onError: (error: Error) => void;
     retryDelayMs?: number;
     fatalDelayMs?: number;
@@ -44,7 +50,32 @@ export interface AcceptedDocumentOperation {
     opId?: string;
     content: string;
     acknowledgement: Promise<string>;
+    /** Ordinal of the session state `content` was read from. */
+    sequence: number;
 }
+
+export interface DocumentOperationInspection {
+    disposition: DocumentOperationDisposition;
+    content: string;
+    /** Ordinal of the session state `content` was read from. */
+    sequence: number;
+}
+
+/**
+ * Ordinals for published content states, counted across every session in this
+ * extension host rather than per session. A document's session is closed and
+ * re-opened by recovery and reconnect, and a consumer holding an ordinal from
+ * the previous session would otherwise read the new session's states — which
+ * restart from zero — as older than what it already has, and refuse every one
+ * of them for the life of the document.
+ */
+let nextPublishedContentSequence = 0;
+
+/** Expected acknowledgement cancellation while a recoverable WAL owner retires. */
+export class DocumentSessionRetiredError extends Error {}
+
+/** The WAL cannot prove that an operation id belongs to this document history. */
+export class DocumentOperationAncestryError extends Error {}
 
 /** Overleaf protocol binding whose state transitions are committed to a WAL. */
 export class DurableDocumentSession {
@@ -52,18 +83,30 @@ export class DurableDocumentSession {
     private readonly sendUpdate: (update: DurableLegacyDocumentUpdate) => Promise<void>;
     private readonly getSourceId: () => string | undefined;
     private readonly createOperationId: () => string;
-    private readonly onChange: (content: string, revision: number, acknowledgedContent: string) => void;
+    private readonly onChange: DurableDocumentSessionOptions['onChange'];
     private readonly onError: (error: Error) => void;
     private readonly retryDelayMs: number;
     private readonly fatalDelayMs: number;
-    private readonly completions = new Map<string, Completion>();
+    private readonly completions = new Map<string, Set<Completion>>();
     private readonly bufferedUpdates = new Map<number, DurableLegacyDocumentUpdate>();
+    private readonly transportSends = new Set<Promise<void>>();
     private transition: Promise<void> = Promise.resolve();
     private inflightWire?: DurableLegacyDocumentUpdate;
     private retryTimer?: NodeJS.Timeout;
     private fatalTimer?: NodeJS.Timeout;
+    private closePromise?: Promise<void>;
     private lastHashTimestamp = 0;
+    /**
+     * Ordinal of the current content state, advanced on every transition this
+     * session publishes. The revision cannot serve here: it only moves when
+     * the server acknowledges, so a burst of local operations produces many
+     * distinct contents under one revision and a consumer that reads them out
+     * of order has no way to tell which one is current.
+     */
+    private contentSequence = ++nextPublishedContentSequence;
     private failed?: Error;
+    private transportSuspended = false;
+    private closing = false;
     private closed = false;
 
     private constructor(
@@ -116,8 +159,92 @@ export class DurableDocumentSession {
         return this.journal.revision;
     }
 
+    /** Ordinal of the content state this session currently exposes. */
+    get sequence(): number {
+        return this.contentSequence;
+    }
+
     get isFailed(): boolean {
         return this.failed !== undefined;
+    }
+
+    get hasPendingOperations(): boolean {
+        return this.journal.hasPendingOperations;
+    }
+
+    get pendingOperationIds(): readonly string[] {
+        return this.journal.pendingOperationIds;
+    }
+
+    get lastKnownPath(): string | undefined {
+        return this.journal.lastKnownPath;
+    }
+
+    bindPath(path: string): Promise<void> {
+        return this.journal.bindPath(path, true);
+    }
+
+    get isTransportSuspended(): boolean {
+        return this.transportSuspended;
+    }
+
+    /** Keep the WAL owner writable while the project socket is unavailable. */
+    suspendTransport(): void {
+        if (this.closing || this.closed) {
+            return;
+        }
+        this.transportSuspended = true;
+        this.clearInflightTimers();
+    }
+
+    /**
+     * Rebase the live WAL owner on the authoritative reconnect snapshot before
+     * allowing its fixed outgoing operation back onto the wire.
+     */
+    resumeTransport(
+        authoritativeContent: string,
+        authoritativeRevision: number,
+        catchUpUpdates: DurableLegacyDocumentUpdate[],
+    ): Promise<void> {
+        return this.enqueue(async () => {
+            this.assertHealthy();
+            if (this.closing || this.closed) {
+                throw new DocumentSessionRetiredError('Document session is closed');
+            }
+            for (const update of catchUpUpdates) {
+                if (update.doc !== this.documentId || update.v !== this.revision) {
+                    throw new Error(
+                        `Catch-up update version ${update.v} does not match expected ${this.revision}`,
+                    );
+                }
+                this.bufferedUpdates.delete(update.v);
+                await this.processUpdate(update, false);
+            }
+            if (
+                this.revision !== authoritativeRevision
+                || this.acknowledgedContent !== authoritativeContent
+            ) {
+                throw new Error(
+                    'Operation history does not reproduce the authoritative reconnect snapshot',
+                );
+            }
+            while (this.bufferedUpdates.has(this.revision)) {
+                const next = this.bufferedUpdates.get(this.revision)!;
+                this.bufferedUpdates.delete(this.revision);
+                await this.processUpdate(next, false);
+            }
+            this.transportSuspended = false;
+            const outgoing = this.journal.currentOutgoingOperation;
+            if (outgoing) {
+                await this.startOutgoing(outgoing, true);
+            }
+        }).catch(error => {
+            const normalized = this.normalizeError(error);
+            if (!(normalized instanceof DocumentSessionRetiredError)) {
+                this.fail(normalized);
+            }
+            throw normalized;
+        });
     }
 
     submitSnapshot(content: string, barrier = false): Promise<void> {
@@ -139,6 +266,7 @@ export class DurableDocumentSession {
         ancestor: string,
         target: string,
         barrier = false,
+        operationId?: string,
     ): Promise<AcceptedDocumentOperation> {
         return this.acceptPlannedSnapshot(currentContent => {
             if (currentContent === ancestor) {
@@ -148,7 +276,35 @@ export class DurableDocumentSession {
             const requestedOperation = TextOperation.fromDiff(ancestor, target);
             const [, requestedPrime] = TextOperation.transform(currentOperation, requestedOperation);
             return requestedPrime.apply(currentContent);
-        }, barrier);
+        }, barrier, operationId);
+    }
+
+    inspectOperation(opId: string): DocumentOperationInspection {
+        return {
+            disposition: this.journal.operationDisposition(opId),
+            content: this.journal.content,
+            sequence: this.contentSequence,
+        };
+    }
+
+    /** Observe one already-journaled logical operation in this connection generation. */
+    observeOperation(opId: string): Promise<string> {
+        if (this.closed) {
+            return Promise.reject(new DocumentSessionRetiredError('Document session is closed'));
+        }
+        if (this.failed) {
+            return Promise.reject(this.failed);
+        }
+        switch (this.journal.operationDisposition(opId)) {
+            case 'settled':
+                return Promise.resolve(this.journal.content);
+            case 'pending':
+                return this.createCompletion(opId);
+            case 'unknown':
+                return Promise.reject(new DocumentOperationAncestryError(
+                    `Cannot prove disposition of document operation ${opId}`,
+                ));
+        }
     }
 
     receiveUpdate(update: DurableLegacyDocumentUpdate): Promise<void> {
@@ -161,6 +317,14 @@ export class DurableDocumentSession {
             }
             this.assertHealthy();
             if (update.doc !== this.documentId || update.v < this.revision) {
+                return;
+            }
+            if (this.transportSuspended) {
+                const existing = this.bufferedUpdates.get(update.v);
+                if (existing && JSON.stringify(existing) !== JSON.stringify(update)) {
+                    throw new Error(`Conflicting buffered updates at revision ${update.v}`);
+                }
+                this.bufferedUpdates.set(update.v, update);
                 return;
             }
             if (update.v > this.revision) {
@@ -180,69 +344,133 @@ export class DurableDocumentSession {
         }).catch(error => this.fail(this.normalizeError(error)));
     }
 
+    /** Wait until every wire send started by this generation has settled. */
+    async waitForTransportIdle(): Promise<void> {
+        for (;;) {
+            await this.transition;
+            const sends = [...this.transportSends];
+            if (sends.length === 0) {
+                return;
+            }
+            await Promise.allSettled(sends);
+            // An acknowledgement can be queued by the same server turn that
+            // settles applyOtUpdate. Process it before exposing disposition.
+            await this.transition;
+            if (this.transportSends.size === 0) {
+                return;
+            }
+        }
+    }
+
     dispose(): void {
         if (this.closed) {
             return;
         }
         this.closed = true;
         this.clearInflightTimers();
-        const error = new Error('Document session disposed before acknowledgement');
-        for (const completion of this.completions.values()) {
-            completion.reject(error);
+        const error = new DocumentSessionRetiredError(
+            'Document session disposed before acknowledgement',
+        );
+        for (const completions of this.completions.values()) {
+            for (const completion of completions) {
+                completion.reject(error);
+            }
         }
         this.completions.clear();
     }
 
-    async close(): Promise<void> {
-        this.dispose();
-        await this.transition;
-        await this.journal.close();
+    close(): Promise<void> {
+        if (!this.closePromise) {
+            this.closing = true;
+            this.clearInflightTimers();
+            this.closePromise = (async () => {
+                await this.transition;
+                await this.waitForTransportIdle();
+                await this.transition;
+                this.dispose();
+                await this.transition;
+                await this.journal.close();
+            })();
+        }
+        return this.closePromise;
     }
 
     private acceptPlannedSnapshot(
         planner: (currentContent: string) => string,
         barrier: boolean,
+        operationId?: string,
     ): Promise<AcceptedDocumentOperation> {
-        if (this.closed || this.failed) {
-            return Promise.reject(this.failed ?? new Error('Document session is closed'));
+        if (this.closing || this.closed || this.failed) {
+            return Promise.reject(
+                this.failed ?? new DocumentSessionRetiredError('Document session is closed'),
+            );
         }
         return new Promise<AcceptedDocumentOperation>((resolve, reject) => {
             this.enqueue(async () => {
-                if (this.closed) {
-                    throw new Error('Document session is closed');
-                }
                 this.assertHealthy();
+                if (operationId !== undefined) {
+                    const disposition = this.journal.operationDisposition(operationId);
+                    if (disposition !== 'unknown') {
+                        resolve({
+                            opId: operationId,
+                            content: this.journal.content,
+                            acknowledgement: this.observeOperation(operationId),
+                            sequence: this.contentSequence,
+                        });
+                        return;
+                    }
+                }
                 const content = planner(this.journal.content);
                 const operation = TextOperation.fromDiff(this.journal.content, content);
                 if (operation.isNoop) {
                     const current = this.journal.content;
-                    resolve({ content: current, acknowledgement: Promise.resolve(current) });
+                    resolve({
+                        content: current,
+                        acknowledgement: Promise.resolve(current),
+                        sequence: this.contentSequence,
+                    });
                     return;
                 }
-                const opId = this.createOperationId();
+                const opId = operationId ?? this.createOperationId();
                 const submission = await this.journal.commitLocalOperation(operation, opId, barrier);
-                if (this.closed) {
-                    throw new Error('Document session closed during journal commit');
+                if (this.closing || this.closed) {
+                    const retired = Promise.reject<string>(new DocumentSessionRetiredError(
+                        'Document session closed after journal commit',
+                    ));
+                    void retired.catch(() => {});
+                    // The journal already moved; nothing will publish this
+                    // state, so claim its ordinal here rather than hand back a
+                    // content newer than the sequence that labels it.
+                    this.contentSequence = ++nextPublishedContentSequence;
+                    resolve({
+                        opId,
+                        content: this.journal.content,
+                        acknowledgement: retired,
+                        sequence: this.contentSequence,
+                    });
+                    return;
                 }
-                let acknowledge: (content: string) => void;
-                let rejectAcknowledgement: (error: Error) => void;
-                const acknowledgement = new Promise<string>((resolveAcknowledgement, rejectPending) => {
-                    acknowledge = resolveAcknowledgement;
-                    rejectAcknowledgement = rejectPending;
-                });
-                this.completions.set(opId, {
-                    resolve: content => acknowledge(content),
-                    reject: error => rejectAcknowledgement(error),
-                });
+                const acknowledgement = this.createCompletion(opId);
                 this.notifyChange();
+                // The local-operation WAL append above is the durability
+                // boundary. Return its fixed opId before transport metadata or
+                // socket work can fail, so callers never mistake a journaled
+                // operation for one that is safe to derive and submit again.
+                resolve({
+                    opId,
+                    content: this.journal.content,
+                    acknowledgement,
+                    sequence: this.contentSequence,
+                });
                 if (submission.send) {
                     await this.startOutgoing(submission.send);
                 }
-                resolve({ opId, content: this.journal.content, acknowledgement });
             }).catch(error => {
                 const normalized = this.normalizeError(error);
                 reject(normalized);
-                this.fail(normalized);
+                if (!(normalized instanceof DocumentSessionRetiredError)) {
+                    this.fail(normalized);
+                }
             });
         });
     }
@@ -283,7 +511,9 @@ export class DurableDocumentSession {
 
         if (ownOperation) {
             for (const id of result.acknowledgedIds) {
-                this.completions.get(id)?.resolve(this.journal.content);
+                for (const completion of this.completions.get(id) ?? []) {
+                    completion.resolve(this.journal.content);
+                }
                 this.completions.delete(id);
             }
             if (result.send && sendNext) {
@@ -294,7 +524,7 @@ export class DurableDocumentSession {
     }
 
     private async startOutgoing(outgoing: OutgoingOperation, recovering = false): Promise<void> {
-        if (this.closed) {
+        if (this.closing || this.closed) {
             return;
         }
         const sources = [...this.journal.transportSources];
@@ -304,6 +534,9 @@ export class DurableDocumentSession {
         }
         const previousSubmittedRevision = this.journal.previousSubmittedRevision;
         await this.journal.commitTransportState(sources, outgoing.revision);
+        if (this.closing || this.closed) {
+            return;
+        }
 
         const targetContent = outgoing.operation.apply(this.journal.acknowledgedContent);
         const now = Date.now();
@@ -321,11 +554,22 @@ export class DurableDocumentSession {
             this.lastHashTimestamp = now;
         }
         this.inflightWire = update;
+        if (this.transportSuspended) {
+            return;
+        }
         this.scheduleInflightTimers();
         // Journal durability is the caller-visible boundary. A transient
         // transport rejection must leave the same source-tagged wire in
         // flight so the retry path can resend it idempotently.
-        void this.sendWire(update);
+        void this.trackTransportSend(update);
+    }
+
+    private trackTransportSend(update: DurableLegacyDocumentUpdate): Promise<void> {
+        let tracked: Promise<void>;
+        tracked = this.sendWire(update)
+            .finally(() => this.transportSends.delete(tracked));
+        this.transportSends.add(tracked);
+        return tracked;
     }
 
     private async sendWire(update: DurableLegacyDocumentUpdate): Promise<void> {
@@ -339,7 +583,7 @@ export class DurableDocumentSession {
     }
 
     private scheduleInflightTimers(): void {
-        if (this.closed) {
+        if (this.closing || this.closed || this.transportSuspended) {
             return;
         }
         if (this.retryTimer) {
@@ -347,7 +591,13 @@ export class DurableDocumentSession {
         }
         this.retryTimer = setTimeout(() => {
             this.enqueue(async () => {
-                if (this.closed || !this.inflightWire || this.failed) {
+                if (
+                    this.closing
+                    || this.closed
+                    || this.transportSuspended
+                    || !this.inflightWire
+                    || this.failed
+                ) {
                     return;
                 }
                 const sources = [...this.journal.transportSources];
@@ -359,7 +609,12 @@ export class DurableDocumentSession {
                     sources,
                     this.journal.previousSubmittedRevision,
                 );
-                await this.sendWire({ ...this.inflightWire, dupIfSource: sources });
+                // ACK processing shares this transition queue. Never hold it
+                // behind a socket Promise: the server may have accepted the
+                // retry even when the transport callback never settles.
+                if (this.transportSends.size === 0) {
+                    void this.trackTransportSend({ ...this.inflightWire, dupIfSource: sources });
+                }
                 this.scheduleInflightTimers();
             }).catch(error => this.fail(this.normalizeError(error)));
         }, this.retryDelayMs);
@@ -383,7 +638,23 @@ export class DurableDocumentSession {
     }
 
     private notifyChange(): void {
-        this.onChange(this.content, this.revision, this.acknowledgedContent);
+        this.contentSequence = ++nextPublishedContentSequence;
+        this.onChange(
+            this.content,
+            this.revision,
+            this.acknowledgedContent,
+            this.hasPendingOperations,
+            this.contentSequence,
+        );
+    }
+
+    private createCompletion(opId: string): Promise<string> {
+        return new Promise<string>((resolve, reject) => {
+            const completion = {resolve, reject};
+            const current = this.completions.get(opId) ?? new Set<Completion>();
+            current.add(completion);
+            this.completions.set(opId, current);
+        });
     }
 
     private enqueue(task: () => Promise<void>): Promise<void> {
@@ -404,8 +675,10 @@ export class DurableDocumentSession {
         }
         this.failed = error;
         this.clearInflightTimers();
-        for (const completion of this.completions.values()) {
-            completion.reject(error);
+        for (const completions of this.completions.values()) {
+            for (const completion of completions) {
+                completion.reject(error);
+            }
         }
         this.completions.clear();
         this.onError(error);

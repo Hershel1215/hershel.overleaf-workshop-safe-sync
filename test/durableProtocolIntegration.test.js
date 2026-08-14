@@ -16,6 +16,7 @@ describe('durable OT protocol integration', () => {
             documentId: 'doc-1',
             initialRevision: 0,
             initialContent: 'base',
+            initialPath: 'main.tex',
             walOptions: { idleCommitMs: 1, maxCommitMs: 5 },
         })));
         const sessions = [];

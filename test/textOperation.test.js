@@ -143,6 +143,38 @@ describe('TextOperation', () => {
         }
     });
 
+    it('anchors a snapshot diff of repeated lines on its line boundary', () => {
+        const line = index => `REMOTE-STREAM-abc123-${index}\n`;
+        const before = `KEEP\n${line(1)}`;
+        const after = `KEEP\n${line(0)}${line(1)}`;
+        const operation = TextOperation.fromDiff(before, after);
+
+        assert.strictEqual(operation.apply(before), after);
+        assert.deepStrictEqual(
+            operation.components.filter(part => part.kind === 'insert'),
+            [{kind: 'insert', text: line(0)}],
+        );
+        assert.strictEqual(operation.components[0].count, 'KEEP\n'.length);
+    });
+
+    it('keeps concurrent writers from splitting a shared line', () => {
+        const line = (name, index) => `${name}-STREAM-abc123-${index}\n`;
+        const base = `KEEP\n${line('REMOTE', 1)}`;
+        // Both writers describe their edit as a whole-document snapshot.
+        const left = TextOperation.fromDiff(base, `KEEP\n${line('REMOTE', 0)}${line('REMOTE', 1)}`);
+        const right = TextOperation.fromDiff(base, `KEEP\n${line('REMOTE', 2)}${line('REMOTE', 1)}`);
+        const [leftPrime, rightPrime] = TextOperation.transform(left, right);
+        const merged = rightPrime.apply(left.apply(base));
+
+        assert.strictEqual(merged, leftPrime.apply(right.apply(base)));
+        for (const index of [0, 1, 2]) {
+            assert(
+                merged.includes(line('REMOTE', index)),
+                `merge split line ${index}: ${JSON.stringify(merged)}`,
+            );
+        }
+    });
+
     it('satisfies composition for randomized sequential operations', () => {
         for (let iteration = 0; iteration < 500; iteration++) {
             const base = randomText(18);

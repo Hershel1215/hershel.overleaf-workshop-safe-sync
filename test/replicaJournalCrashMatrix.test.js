@@ -252,8 +252,16 @@ describe('replica journal crash recovery matrix', () => {
 
         assertAllowed(action, local, entries(snapshot('source.tex', 'remote-source')));
         assertAllowed(action, local, entries(snapshot('target.tex', 'remote-source')));
-        assertRejected(action, local, entries(snapshot('source.tex', 'unrelated')));
-        assertRejected(action, local, entries(snapshot('target.tex', 'unrelated')));
+        // The immutable remote entity proves move ownership even when its
+        // content changes concurrently. A lookalike replacement id does not.
+        assertAllowed(action, local, entries(snapshot('source.tex', 'concurrent-edit')));
+        assertAllowed(action, local, entries(snapshot('target.tex', 'concurrent-edit')));
+        assertRejected(action, local, entries(snapshot(
+            'source.tex', 'unrelated', 'replacement-entity',
+        )));
+        assertRejected(action, local, entries(snapshot(
+            'target.tex', 'unrelated', 'replacement-entity',
+        )));
     });
 
     it('accepts converge-local before and after local writeback only', () => {

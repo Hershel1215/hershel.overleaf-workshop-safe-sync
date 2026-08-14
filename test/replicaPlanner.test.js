@@ -63,6 +63,80 @@ describe('replica planning', () => {
         });
     });
 
+    it('accepts a completed move with changed content when both target identities match', () => {
+        const pending = {
+            id: 'move-after-crash',
+            kind: 'move-remote',
+            path: 'old.tex',
+            targetPath: 'new.tex',
+            startedAt: new Date(0).toISOString(),
+            expectedLocalHash: 'common-base',
+            expectedLocalIdentity: '1:2',
+            expectedRemoteHash: 'common-base',
+            targetHash: 'common-base',
+            entityId: 'doc-1',
+        };
+        const local = new Map([[
+            'new.tex',
+            snap('new.tex', 'concurrent-local-edit', 'doc', undefined, '1:2'),
+        ]]);
+        const remote = new Map([[
+            'new.tex',
+            snap('new.tex', 'concurrent-remote-edit', 'doc', 'doc-1'),
+        ]]);
+
+        assert.deepStrictEqual(
+            validatePendingRecovery(pending, local, remote),
+            {kind: 'strict'},
+        );
+    });
+
+    it('rejects a move target whose local inode or remote entity was replaced', () => {
+        const pending = {
+            id: 'move-after-crash',
+            kind: 'move-remote',
+            path: 'old.tex',
+            targetPath: 'new.tex',
+            startedAt: new Date(0).toISOString(),
+            expectedLocalHash: 'common-base',
+            expectedLocalIdentity: '1:2',
+            expectedRemoteHash: 'common-base',
+            targetHash: 'common-base',
+            entityId: 'doc-1',
+        };
+        const ownedLocal = new Map([[
+            'new.tex',
+            snap('new.tex', 'common-base', 'doc', undefined, '1:2'),
+        ]]);
+        const ownedRemote = new Map([[
+            'new.tex',
+            snap('new.tex', 'common-base', 'doc', 'doc-1'),
+        ]]);
+
+        assert.throws(
+            () => validatePendingRecovery(
+                pending,
+                new Map([[
+                    'new.tex',
+                    snap('new.tex', 'common-base', 'doc', undefined, '9:9'),
+                ]]),
+                ownedRemote,
+            ),
+            /Cannot prove recovery ancestry for pending move/,
+        );
+        assert.throws(
+            () => validatePendingRecovery(
+                pending,
+                ownedLocal,
+                new Map([[
+                    'new.tex',
+                    snap('new.tex', 'common-base', 'doc', 'replacement-doc'),
+                ]]),
+            ),
+            /Cannot prove recovery ancestry for pending move/,
+        );
+    });
+
     it('only refreshes baselines for converged, unconflicted paths', () => {
         const current = state();
         current.entries['blocked.tex'] = { entityId: 'blocked', fileType: 'doc', hash: 'old', text: 'old' };
@@ -81,6 +155,42 @@ describe('replica planning', () => {
         assert.strictEqual(current.entries['main.tex'].entityId, 'doc-1');
         assert.strictEqual(current.entries['main.tex'].localIdentity, '1:3');
         assert.strictEqual(current.entries['blocked.tex'].hash, 'old');
+    });
+
+    it('keeps the last path mapping while its immutable document WAL is pending', () => {
+        const current = state();
+        current.entries['sections/main.tex'] = {
+            entityId: 'pending-doc', fileType: 'doc', hash: 'base', text: 'BASE',
+        };
+
+        refreshConvergedBaseline(
+            current,
+            new Map(),
+            new Map(),
+            new Set(['pending-doc']),
+        );
+
+        assert.strictEqual(current.entries['sections/main.tex'].entityId, 'pending-doc');
+    });
+
+    it('does not duplicate a protected document mapping after an immutable-id move', () => {
+        const current = state();
+        current.entries['old/main.tex'] = {
+            entityId: 'pending-doc', fileType: 'doc', hash: 'base', text: 'BASE',
+        };
+        const local = new Map([[
+            'new/main.tex',
+            snap('new/main.tex', 'moved', 'doc', undefined, '1:5'),
+        ]]);
+        const remote = new Map([[
+            'new/main.tex',
+            snap('new/main.tex', 'moved', 'doc', 'pending-doc'),
+        ]]);
+
+        refreshConvergedBaseline(current, local, remote, new Set(['pending-doc']));
+
+        assert.strictEqual(current.entries['old/main.tex'], undefined);
+        assert.strictEqual(current.entries['new/main.tex'].entityId, 'pending-doc');
     });
 
     it('fails closed when a pending action has an unrelated endpoint state', () => {

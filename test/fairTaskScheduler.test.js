@@ -11,11 +11,17 @@ describe('fair document scheduler', () => {
         const gate = new Promise(resolve => { release = resolve; });
         const running = scheduler.run('remote', async () => gate);
         const editor = scheduler.run('editor', async () => {});
+        assert.strictEqual(scheduler.isIdle, false);
+        assert.strictEqual(scheduler.activeTask.source, 'remote');
+        assert(scheduler.activeTask.durationMs >= 0);
         assert.strictEqual(scheduler.pendingCountFor('editor'), 1);
         assert.strictEqual(scheduler.pendingCountFor('remote'), 0);
         release();
         await Promise.all([running, editor]);
         assert.strictEqual(scheduler.pendingCountFor('editor'), 0);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.strictEqual(scheduler.isIdle, true);
+        assert.strictEqual(scheduler.activeTask, undefined);
     });
 
     it('does not drain one continuous source before another source', async () => {

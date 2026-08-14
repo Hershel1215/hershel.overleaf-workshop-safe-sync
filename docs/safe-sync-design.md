@@ -1,5 +1,8 @@
 # Safe-sync design
 
+> Historical v1 design note. It is not the current implementation contract.
+> See [Hershel Safe Sync v2](./safe-sync-v2-design.md).
+
 ## Safety invariants
 
 1. Timestamps never select a content winner.

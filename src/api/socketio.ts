@@ -90,6 +90,23 @@ export class SocketIOTimeoutError extends Error {
     }
 }
 
+/**
+ * A membership RPC refused because the socket it would travel on is known to
+ * be unusable. It is a timeout in the sense callers care about — the server
+ * epoch is unknowable and the transport must be rebuilt — but no time was
+ * spent waiting, and reporting it as an acknowledgement that "timed out after
+ * 0 ms" hides the one fact that matters, which is that retrying this socket
+ * can never succeed.
+ */
+export class TransportInvalidatedError extends SocketIOTimeoutError {
+    constructor(event: string) {
+        super(event, 0);
+        this.name = 'TransportInvalidatedError';
+        this.message = `Socket.IO ${event} refused: `
+            + 'the socket transport was invalidated and must be rebuilt';
+    }
+}
+
 export function isSocketIOTimeout(error: unknown): boolean {
     return error instanceof SocketIOTimeoutError
         || (typeof error === 'string' && error === 'timeout')
@@ -102,12 +119,21 @@ export class SocketIOAPI {
     private scheme: ConnectionScheme = 'v1';
     private record?: Promise<ProjectEntity>;
     private _handlers: Array<EventsHandler> = [];
+    /**
+     * Overleaf guards joinDoc/leaveDoc with one joinLeaveEpoch per socket.
+     * Serialize only those membership RPCs; document updates remain concurrent.
+     */
+    private membershipChain: Promise<void> = Promise.resolve();
 
     private socket?: any;
     private emit: any;
     private _publicId?: string;
     /** Track the scheme used when the socket was last initialized */
     private _socketInitScheme?: ConnectionScheme;
+    /** A timed-out membership RPC leaves the server-side epoch unknowable. */
+    private transportInvalidated = false;
+    /** Whether the current socket generation already told handlers it went away. */
+    private disconnectAnnounced = false;
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -155,6 +181,8 @@ export class SocketIOAPI {
                 this.socket = this.api._initSocketV0(this.identity, query);
                 break;
         }
+        this.transportInvalidated = false;
+        this.disconnectAnnounced = false;
         // create emit
         (this.socket.emit)[require('util').promisify.custom] = (event:string, ...args:any[]) => {
             return new Promise((resolve, reject) => {
@@ -196,7 +224,9 @@ export class SocketIOAPI {
 
     /** Returns true if the socket needs re-initialization (scheme changed, or socket was never init'd) */
     get needsReinit(): boolean {
-        return this._socketInitScheme !== this.scheme || !this.socket;
+        return this._socketInitScheme !== this.scheme
+            || !this.socket
+            || this.transportInvalidated;
     }
 
     private initInternalHandlers() {
@@ -205,6 +235,11 @@ export class SocketIOAPI {
         });
         this.socket.on('connect', () => {
             console.log('SocketIOAPI: connected');
+        });
+        this.socket.on('disconnect', () => {
+            // Registered before any caller handler, so a real transport
+            // disconnect is always recorded before the fallback below can run.
+            this.disconnectAnnounced = true;
         });
         this.socket.on('connect_failed', () => {
             console.log('SocketIOAPI: connect_failed');
@@ -247,6 +282,13 @@ export class SocketIOAPI {
     }
 
     disconnect() {
+        this.socket.disconnect();
+    }
+
+    /** Permanently retire this client without allowing late handlers to run. */
+    retire() {
+        this._handlers = [];
+        this.socket.removeAllListeners?.();
         this.socket.disconnect();
     }
 
@@ -384,6 +426,7 @@ export class SocketIOAPI {
             }, SOCKET_EVENT_TIMEOUT_MS);
         });
 
+        let result: Promise<ProjectEntity>;
         switch(this.scheme) {
             case 'Alt':
             case 'v1':
@@ -401,10 +444,22 @@ export class SocketIOAPI {
                         reject(err.message);
                     });
                 });
-                return Promise.race([joinPromise, rejectPromise, timeoutPromise]);
+                result = Promise.race([joinPromise, rejectPromise, timeoutPromise]);
+                break;
             case 'v2':
-                return Promise.race([this.record!, timeoutPromise]);
+                result = Promise.race([this.record!, timeoutPromise]);
+                break;
         }
+        return result.catch(error => {
+            if (isSocketIOTimeout(error)) {
+                // A late join acknowledgement can belong to a server-side
+                // project membership generation we no longer understand.
+                // Reusing this socket makes the retry observationally
+                // ambiguous, so the next attempt must start a fresh transport.
+                this.invalidateTransport();
+            }
+            throw error;
+        });
     }
 
     /**
@@ -412,16 +467,24 @@ export class SocketIOAPI {
      * @param {string} docId - The document id.
      * @returns {Promise}
      */
-    async joinDoc(docId:string, fromVersion?:number) {
-        const args = fromVersion === undefined
-            ? [docId, { encodeRanges: true }]
-            : [docId, fromVersion, { encodeRanges: true, age: 0 }];
-        return this.emit('joinDoc', ...args)
-            .then((returns: [Array<string>, number, Array<UpdateSchema>, any, string?]) => {
-                const [docLinesAscii, version, updates, ranges, otType = 'sharejs-text-ot'] = returns;
-                const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
-                return {docLines, version, updates, ranges, otType};
-            });
+    async joinDoc(docId:string, fromVersion?:number): Promise<{
+        docLines: string[],
+        version: number,
+        updates: UpdateSchema[],
+        ranges: any,
+        otType: string,
+    }> {
+        return this.runMembershipRpc(`joinDoc(${docId})`, async () => {
+            const args = fromVersion === undefined
+                ? [docId, { encodeRanges: true, supportsHistoryOT: true }]
+                : [docId, fromVersion, { encodeRanges: true, age: 0, supportsHistoryOT: true }];
+            const returns = await this.emit('joinDoc', ...args) as [
+                Array<string>, number, Array<UpdateSchema>, any, string?,
+            ];
+            const [docLinesAscii, version, updates, ranges, otType = 'sharejs-text-ot'] = returns;
+            const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
+            return {docLines, version, updates, ranges, otType};
+        });
     }
 
     /**
@@ -429,11 +492,64 @@ export class SocketIOAPI {
      * @param {string} docId - The document id.
      * @returns {Promise}
      */
-    async leaveDoc(docId:string) {
-        return this.emit('leaveDoc', docId)
-            .then(() => {
+    async leaveDoc(docId:string): Promise<void> {
+        return this.runMembershipRpc(`leaveDoc(${docId})`, async () => {
+            await this.emit('leaveDoc', docId);
+        });
+    }
+
+    private runMembershipRpc<T>(
+        event: string,
+        task: () => Promise<T>,
+    ): Promise<T> {
+        const execute = () => this.transportInvalidated
+            ? Promise.reject<T>(new TransportInvalidatedError(event))
+            : task();
+        const raw = this.membershipChain.then(execute, execute);
+        const result = raw.catch(error => {
+            if (!isSocketIOTimeout(error)) {
+                throw error;
+            }
+            const timeoutMs = error instanceof SocketIOTimeoutError
+                ? error.timeoutMs
+                : SOCKET_EVENT_TIMEOUT_MS;
+            const contextual = error instanceof SocketIOTimeoutError
+                && error.event === event
+                ? error
+                : new SocketIOTimeoutError(event, timeoutMs);
+            this.invalidateTransport();
+            throw contextual;
+        });
+        this.membershipChain = result.then(() => undefined, () => undefined);
+        return result;
+    }
+
+    private invalidateTransport(): void {
+        if (this.transportInvalidated) {
+            return;
+        }
+        this.transportInvalidated = true;
+        const invalidated = this.socket;
+        try {
+            this.socket?.disconnect();
+        } catch {
+            // The next VFS initialization still sees needsReinit=true.
+        }
+        // disconnect() emits 'disconnect' only on a socket that still believes
+        // it is connected, and an acknowledgement that timed out usually means
+        // it does not. Nothing else rebuilds the transport: the reconnect is
+        // driven by that event alone, so a silent disconnect leaves this flag
+        // set forever and every later membership RPC is refused against it.
+        // Announce the loss ourselves when the socket did not.
+        setTimeout(() => {
+            if (this.socket !== invalidated || this.disconnectAnnounced) {
                 return;
-            });
+            }
+            this.disconnectAnnounced = true;
+            for (const handlers of this._handlers) {
+                handlers.onDisconnected?.();
+            }
+        }, 0);
     }
 
     /**

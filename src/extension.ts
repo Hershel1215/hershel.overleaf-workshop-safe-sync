@@ -13,7 +13,6 @@ import { createLocalReplicaBinding, ensureLocalReplicaBinding } from './sync/loc
 
 export async function activate(context: vscode.ExtensionContext) {
     await GlobalStateManager.initialize(context);
-    context.subscriptions.push(...registerSafeSyncE2E(context));
     context.subscriptions.push(
         vscode.commands.registerCommand(
             `${ROOT_NAME}.safeSync.showReport`,
@@ -44,9 +43,10 @@ export async function activate(context: vscode.ExtensionContext) {
     const langIntellisenseProvider = new LangIntellisenseProvider(context, remoteFileSystemProvider);
     context.subscriptions.push( ...langIntellisenseProvider.triggers );
 
-    // activate vfs for local replica
-    LocalReplicaSCMProvider.readSettings()
-    .then(async setting => {
+    // Recover the bound server and start its replica owner before the E2E
+    // startup hook can observe configuration or filesystem semantics.
+    try {
+        let setting = await LocalReplicaSCMProvider.readSettings();
         const workspaceRoot = vscode.workspace.workspaceFolders?.length === 1
             ? vscode.workspace.workspaceFolders[0].uri
             : undefined;
@@ -71,6 +71,7 @@ export async function activate(context: vscode.ExtensionContext) {
                         remoteUri.toString(),
                         match.serverName,
                         match.project.name,
+                        match.serverUrl,
                     ),
                     match.project.id,
                 );
@@ -80,6 +81,10 @@ export async function activate(context: vscode.ExtensionContext) {
         if (setting?.uri) {
             const uri = vscode.Uri.parse(setting.uri);
             if (uri.scheme===URI_SCHEME) {
+                // A new VS Code extension host can see the workspace binding
+                // before its non-secret globalState snapshot. Rehydrate that
+                // public record from the binding plus shared SecretStorage.
+                await GlobalStateManager.restoreBoundServer(context, setting);
                 // activate vfs
                 const vfs = (await (await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.prefetch`, uri))) as VirtualFileSystem;
                 await vfs.init();
@@ -90,13 +95,15 @@ export async function activate(context: vscode.ExtensionContext) {
                 }
             }
         }
-    })
-    .catch(error => {
-        // A local binding may activate before its server credentials have been
-        // added to this independent extension. Keep the workspace untouched;
-        // login followed by a window reload will retry the prefetch.
+    } catch (error) {
         console.warn('Safe-sync local binding activation failed', error);
-    });
+        const reason = error instanceof Error ? error.message : String(error);
+        vscode.window.showErrorMessage(
+            `Hershel safe sync did not start for this workspace: ${reason}. `
+            + 'Edits are not managed until this error is resolved.',
+        );
+    }
+    context.subscriptions.push(...registerSafeSyncE2E(context));
 }
 
 export function deactivate() {

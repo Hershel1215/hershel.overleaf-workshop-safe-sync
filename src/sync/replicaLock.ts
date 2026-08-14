@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import { readFileSync, rmSync } from 'fs';
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'fs/promises';
 import * as path from 'path';
 
 interface LockOwner {
@@ -23,6 +23,8 @@ export class ReplicaLock {
     private readonly lockDirectory: string;
     private readonly ownerPath: string;
     private heartbeatTimer?: NodeJS.Timeout;
+    private heartbeatInFlight?: Promise<void>;
+    private releasePromise?: Promise<void>;
     private released = false;
 
     private constructor(
@@ -52,42 +54,33 @@ export class ReplicaLock {
 
         for (let attempt = 0; attempt < 5; attempt++) {
             try {
-                await mkdir(lock.lockDirectory, { mode: 0o700 });
-                await lock.writeOwner();
+                await lock.publishOwner();
                 lock.startHeartbeat();
                 return lock;
             } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+                const code = (error as NodeJS.ErrnoException).code;
+                if (code !== 'EEXIST' && code !== 'ENOTEMPTY') {
                     throw error;
                 }
                 const recoveryDirectory = `${lock.lockDirectory}.recovery`;
-                try {
-                    await mkdir(recoveryDirectory, { mode: 0o700 });
-                } catch (recoveryError) {
-                    if ((recoveryError as NodeJS.ErrnoException).code !== 'EEXIST') {
-                        throw recoveryError;
-                    }
-                    try {
-                        const recoveryStat = await stat(recoveryDirectory);
-                        if (Date.now() - recoveryStat.mtimeMs > ttlMs) {
-                            await rm(recoveryDirectory, { recursive: true, force: true });
-                        }
-                    } catch (statError) {
-                        if ((statError as NodeJS.ErrnoException).code !== 'ENOENT') {
-                            throw statError;
-                        }
-                    }
+                if (!await lock.acquireRecoveryGuard(recoveryDirectory)) {
                     await new Promise(resolve => setTimeout(resolve, 25));
                     continue;
                 }
                 try {
                     const owner = await lock.readOwner();
-                    if (owner && Date.now() - owner.heartbeat <= ttlMs) {
+                    if (
+                        owner
+                        && (
+                            Date.now() - owner.heartbeat <= ttlMs
+                            || ReplicaLock.isProcessAlive(owner.pid)
+                        )
+                    ) {
                         throw new ReplicaLockedError(owner);
                     }
                     await rm(lock.lockDirectory, { recursive: true, force: true });
                 } finally {
-                    await rm(recoveryDirectory, { recursive: true, force: true });
+                    await lock.releaseRecoveryGuard(recoveryDirectory);
                 }
             }
         }
@@ -95,28 +88,39 @@ export class ReplicaLock {
     }
 
     async release(): Promise<void> {
+        if (this.releasePromise) {
+            return this.releasePromise;
+        }
         if (this.released) {
             return;
         }
-        this.released = true;
-        if (this.heartbeatTimer) {
-            clearInterval(this.heartbeatTimer);
-            this.heartbeatTimer = undefined;
-        }
-        const owner = await this.readOwner();
-        if (owner?.instanceId === this.instanceId) {
-            await rm(this.lockDirectory, { recursive: true, force: true });
-        }
+        this.stopRenewing();
+        const heartbeat = this.heartbeatInFlight;
+        this.releasePromise = (async () => {
+            if (heartbeat) {
+                try {
+                    await heartbeat;
+                } catch {
+                    // Ownership is checked again below after the renewal settles.
+                }
+            }
+            const owner = await this.readOwner();
+            if (owner?.instanceId === this.instanceId) {
+                await rm(this.lockDirectory, { recursive: true, force: true });
+            }
+        })();
+        return this.releasePromise;
     }
 
     releaseSync(): void {
         if (this.released) {
             return;
         }
-        this.released = true;
-        if (this.heartbeatTimer) {
-            clearInterval(this.heartbeatTimer);
-            this.heartbeatTimer = undefined;
+        this.stopRenewing();
+        if (this.heartbeatInFlight) {
+            // A synchronous caller cannot safely delete a lease while an older
+            // renewal may still write. Leave it for TTL recovery instead.
+            return;
         }
         try {
             const owner = JSON.parse(readFileSync(this.ownerPath, 'utf8')) as LockOwner;
@@ -130,8 +134,19 @@ export class ReplicaLock {
         }
     }
 
+    /** Stop renewing without deleting the lease; a successor waits for TTL. */
+    abandon(): void {
+        if (this.released) {
+            return;
+        }
+        this.stopRenewing();
+    }
+
     private startHeartbeat(): void {
         this.heartbeatTimer = setInterval(() => {
+            if (this.released || this.heartbeatInFlight) {
+                return;
+            }
             this.heartbeat().catch(error => {
                 if (!this.released) {
                     this.onLost(error instanceof Error ? error : new Error(String(error)));
@@ -141,7 +156,32 @@ export class ReplicaLock {
         this.heartbeatTimer.unref();
     }
 
-    private async heartbeat(): Promise<void> {
+    private heartbeat(): Promise<void> {
+        if (this.released) {
+            return Promise.resolve();
+        }
+        if (this.heartbeatInFlight) {
+            return this.heartbeatInFlight;
+        }
+        let tracked: Promise<void>;
+        tracked = this.renewHeartbeat().then(
+            () => {
+                if (this.heartbeatInFlight === tracked) {
+                    this.heartbeatInFlight = undefined;
+                }
+            },
+            error => {
+                if (this.heartbeatInFlight === tracked) {
+                    this.heartbeatInFlight = undefined;
+                }
+                throw error;
+            },
+        );
+        this.heartbeatInFlight = tracked;
+        return tracked;
+    }
+
+    private async renewHeartbeat(): Promise<void> {
         const owner = await this.readOwner();
         if (owner?.instanceId !== this.instanceId) {
             throw new Error('Local replica lock ownership was lost');
@@ -149,14 +189,17 @@ export class ReplicaLock {
         await this.writeOwner();
     }
 
+    private stopRenewing(): void {
+        this.released = true;
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = undefined;
+        }
+    }
+
     private async writeOwner(): Promise<void> {
         const temporary = path.join(this.lockDirectory, `${this.instanceId}.tmp`);
-        const owner: LockOwner = {
-            instanceId: this.instanceId,
-            pid: process.pid,
-            heartbeat: Date.now(),
-        };
-        await writeFile(temporary, JSON.stringify(owner), { mode: 0o600 });
+        await writeFile(temporary, JSON.stringify(this.currentOwner()), { mode: 0o600 });
         try {
             await rename(temporary, this.ownerPath);
         } catch (error) {
@@ -169,6 +212,32 @@ export class ReplicaLock {
         }
     }
 
+    /** Publish the lock directory and owner identity in one atomic rename. */
+    private async publishOwner(): Promise<void> {
+        const temporary = `${this.lockDirectory}.${this.instanceId}.acquire`;
+        await rm(temporary, {recursive: true, force: true});
+        await mkdir(temporary, {mode: 0o700});
+        await writeFile(
+            path.join(temporary, 'owner.json'),
+            JSON.stringify(this.currentOwner()),
+            {mode: 0o600},
+        );
+        try {
+            await rename(temporary, this.lockDirectory);
+        } catch (error) {
+            await rm(temporary, {recursive: true, force: true});
+            throw error;
+        }
+    }
+
+    private currentOwner(): LockOwner {
+        return {
+            instanceId: this.instanceId,
+            pid: process.pid,
+            heartbeat: Date.now(),
+        };
+    }
+
     private async readOwner(): Promise<LockOwner | undefined> {
         try {
             return JSON.parse(await readFile(this.ownerPath, 'utf8')) as LockOwner;
@@ -177,6 +246,89 @@ export class ReplicaLock {
                 return undefined;
             }
             throw error;
+        }
+    }
+
+    /**
+     * Publish a complete recovery identity atomically. A live recovery owner
+     * can never be evicted merely because its filesystem operation is slow.
+     */
+    private async acquireRecoveryGuard(recoveryDirectory: string): Promise<boolean> {
+        const temporary = `${recoveryDirectory}.${this.instanceId}.tmp`;
+        await rm(temporary, { recursive: true, force: true });
+        await mkdir(temporary, { mode: 0o700 });
+        await writeFile(
+            path.join(temporary, 'owner.json'),
+            JSON.stringify({
+                instanceId: this.instanceId,
+                pid: process.pid,
+                heartbeat: Date.now(),
+            } satisfies LockOwner),
+            { mode: 0o600 },
+        );
+        try {
+            await rename(temporary, recoveryDirectory);
+            return true;
+        } catch (error) {
+            await rm(temporary, { recursive: true, force: true });
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== 'EEXIST' && code !== 'ENOTEMPTY') {
+                throw error;
+            }
+        }
+
+        let owner: LockOwner;
+        try {
+            owner = JSON.parse(
+                await readFile(path.join(recoveryDirectory, 'owner.json'), 'utf8'),
+            ) as LockOwner;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+                return false;
+            }
+            throw error;
+        }
+        if (ReplicaLock.isProcessAlive(owner.pid)) {
+            return false;
+        }
+        const quarantine = `${recoveryDirectory}.${randomUUID()}.stale`;
+        try {
+            await rename(recoveryDirectory, quarantine);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+                return false;
+            }
+            throw error;
+        }
+        await rm(quarantine, { recursive: true, force: true });
+        return false;
+    }
+
+    private async releaseRecoveryGuard(recoveryDirectory: string): Promise<void> {
+        try {
+            const owner = JSON.parse(
+                await readFile(path.join(recoveryDirectory, 'owner.json'), 'utf8'),
+            ) as LockOwner;
+            if (owner.instanceId === this.instanceId) {
+                await rm(recoveryDirectory, { recursive: true, force: true });
+            }
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw error;
+            }
+        }
+    }
+
+    /** A delayed heartbeat is not proof that a live local writer is dead. */
+    private static isProcessAlive(pid: number): boolean {
+        if (!Number.isSafeInteger(pid) || pid <= 0) {
+            return false;
+        }
+        try {
+            process.kill(pid, 0);
+            return true;
+        } catch (error) {
+            return (error as NodeJS.ErrnoException).code !== 'ESRCH';
         }
     }
 }

@@ -71,6 +71,17 @@ export class OtClientState {
         return this.outstanding !== undefined;
     }
 
+    get hasPendingOperations(): boolean {
+        return this.outstanding !== undefined || this.pending !== undefined;
+    }
+
+    get activeOperationIds(): readonly string[] {
+        return [
+            ...(this.outstanding?.ids ?? []),
+            ...(this.pending?.ids ?? []),
+        ];
+    }
+
     get outstandingOperation(): TextOperation | undefined {
         return this.outstanding?.operation;
     }
@@ -154,6 +165,11 @@ export class OtClientState {
                 this.pending = undefined;
                 send = this.outgoing(this.outstanding);
             } else {
+                // A composed pending operation can cancel itself before it is
+                // ever sent. Its source operations are nevertheless settled:
+                // their visible effect is already represented by the now
+                // acknowledged server state.
+                acknowledgedIds.push(...(this.pending?.ids ?? []));
                 this.pending = undefined;
             }
             if (!this.outstanding && this.localContent !== this.serverContent) {

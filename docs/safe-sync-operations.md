@@ -25,6 +25,11 @@ installed upstream extension.
 
 Until step 6, the replica is read-only and no source endpoint is modified.
 
+`.hershel-safe-sync` and `.hershel-safe-sync.staging-<uuid>` are reserved remote
+transaction namespaces. They are never projected locally or uploaded as user
+content. If either name already exists at the local replica root, startup stops
+before watchers observe it; rename that local item rather than deleting it.
+
 ## Normal status
 
 - Cloud: converged.
@@ -32,8 +37,26 @@ Until step 6, the replica is read-only and no source endpoint is modified.
 - Shield/attention message: baseline selection, read-only capability, path
   conflicts, or a project-wide pause needs review.
 
-Text edits are normally batched for 350 ms. A binary must remain unchanged for
+Text edits are normally batched for 150 ms with a 300 ms hard cut. A binary must remain unchanged for
 at least 500 ms before upload or conflict capture.
+
+## Codex and Claude writes
+
+For a write that may overlap VS Code or Overleaf editing, run **Copy AI Gateway
+Command** from the Command Palette and give that command to the AI agent. The
+`begin` response supplies the lease ID, fencing token, and exact base content;
+the agent returns its candidate with the same CLI using:
+
+```text
+... commit <relative-path> <lease-id> <fencing-token> <candidate-file>
+```
+
+Only one gateway AI lease may own a document, while human and Overleaf edits
+continue through OT. Direct Codex/Claude filesystem writes are still imported
+as ordinary on-disk snapshots, but the filesystem does not identify which
+process wrote them; therefore the extension cannot reject a second raw AI
+writer or preserve an intermediate snapshot overwritten before its watcher
+event is observed.
 
 ## Resolve a conflict
 
@@ -47,15 +70,24 @@ choose:
 Artifacts are moved from `unresolved` to `resolved`. Use **Clean up resolved
 conflict artifacts** only when they are no longer needed.
 
+For folders, **latest archived local version** replaces the whole subtree one
+durable resource at a time. **Keep Overleaf version and restore local copy**
+publishes the complete archived subtree under a sibling name. For an old
+document ID with pending WAL, inspect the manifest's base, acknowledged,
+visible local, replacement remote, revisions, and pending operation IDs before
+cleaning the archive.
+
 Never move conflict artifacts into the normal source tree unless intentionally
 restoring them. `.overleaf/**` is hard ignored by synchronization.
 
 ## Project pause and recovery
 
-A corrupt state file, lock loss, missing catch-up ancestry, malformed OT update,
-or unverified pending action pauses the project. Read the **Hershel Overleaf Safe
-Sync** output channel first. Preserve global storage and `.overleaf/conflicts/`.
-After correcting the underlying condition, choose **Retry paused safe sync**.
+A corrupt project state file, lock loss, or unverified project action pauses the
+project. Missing catch-up ancestry, a malformed OT update, or an invalid OT
+invariant isolates only that document with full recovery evidence while other
+paths continue. Read the **Hershel Overleaf Safe Sync** output channel first.
+Preserve global storage and `.overleaf/conflicts/`. After correcting a
+project-wide condition, choose **Retry paused safe sync**.
 
 Do not delete durable state merely to make the warning disappear. If state must
 be abandoned, export all local/remote content, retain conflict artifacts, and

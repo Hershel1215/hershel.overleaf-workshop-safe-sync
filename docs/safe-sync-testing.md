@@ -18,6 +18,11 @@ The unit suite covers:
 - two-client protocol ordering and composed pending edits;
 - authoritative ACK completion, out-of-order delivery, catch-up replay,
   ACK-loss duplicate prevention, timeout/failure paths, and strict recovery;
+- bounded document/project WAL compaction at both record and 4 MiB limits,
+  including crashes before and after generation-selector publication and
+  tombstoned deletion of every selected/historical WAL generation;
+- migration of a complete legacy checkpoint with an empty/absent WAL, while a
+  checkpoint ahead of a shorter non-empty WAL remains a hard recovery error;
 - one-sided changes, causal deletes, delete/edit conflicts, remote-first text
   overlap, binary conflict classification, and local edit during ACK;
 - stable entity/local identity move planning and folder tree hashes;
@@ -28,6 +33,12 @@ The unit suite covers:
   apply `patch-package` explicitly, including after `npm ci --ignore-scripts`.
 - byte-exact multipart upload framing, including the required filename field
   and `qqfile` binary part when requests are sent through `undici`.
+- disk projection races before installation, same-inode writes after
+  installation, and pathname replacement after installation; only the
+  same-inode case may use the installed target as the raw writer's ancestor.
+- project/document membership acknowledgement timeouts invalidate their socket
+  generation before retry, while an explicit non-timeout rejection leaves the
+  serialized membership queue usable.
 
 ## Remote E2E project
 
@@ -45,22 +56,75 @@ any mutation. It then exercises the production Local Replica watcher for
 remote-to-local text and binary pulls, local-to-remote text and resource
 uploads, overlapping local/remote text edits, dirty-editor/external-writer OT
 convergence, late text attachment after both local and remote advance from a
-common base, sustained remote/VS Code/AI streams, SVG/PNG classification,
+common base, a real extension-host reload of one fixed pending operation,
+synchronous verification that the pending operation retained its durable path,
+pathless legacy-WAL archival without a project pause,
+sustained remote/VS Code/raw-filesystem/AI streams, SVG/PNG classification,
 concurrent binary conflict archival and explicit resolution, ignored conflict
-artifacts, bidirectional move/rename, two-client OT convergence, exact catch-up
-replay, and residue-free cleanup.
+artifacts, byte-exact local binary moves, bidirectional document move/rename
+with a barriered concurrent remote text edit,
+two-client OT convergence, exact catch-up
+replay, old-document-ID pending-WAL recovery after same-path replacement, and
+residue-free cleanup.
 
-The streaming step is not a final-snapshot smoke test. It sends unique
-single-key VS Code tokens, independent remote OT operations, and fenced AI
-read-edit-commit transactions while all writers overlap. It asserts every
-token exactly once by total UTF-16 length, preserves the causal order of each
-writer, proves four rapid editor callbacks become one remote operation, proves
-the full editor stream uses fewer journal operations than change events, saves
-the converged editor, and compares editor, disk, and authoritative remote
-bytes.
+The streaming suite first runs remote-only, VS Code-only, and fenced AI-only
+continuous writers as separate live E2E steps. Each step must expose its first
+edit to another endpoint before the writer stops, then converge the open
+editor, disk, joined OT session, and a fresh authoritative Overleaf observer
+without conflict or project pause; post-writer convergence is bounded to five
+seconds. It then sends unique single-key VS Code tokens, a range replacement, a
+range deletion, sustained whole-file raw snapshots, independent remote OT
+operations, and fenced AI read-edit-commit transactions while all writers
+overlap. It asserts every
+retained token occurs exactly once by total UTF-16 length, rejects either old
+range, preserves the causal order of each writer, proves four rapid editor
+callbacks become fewer remote operations than callbacks, compares editor, disk, and authoritative
+remote bytes before the explicit save, and requires exact convergence within
+five seconds after all writers stop. The reload step persists the pre-reload
+PID, namespace, entity, base/target hashes, revision, and pending operation ID;
+the new extension-host PID must prove that same operation settled exactly once
+at the next revision before the suite can continue. VS Code Auto Save may clean
+the buffer before reload; recovery therefore binds the durable WAL candidate,
+path, revision, and operation ID instead of treating the transient UI dirty bit
+as ancestry evidence.
+The streaming convergence loop reads its already-joined durable OT session;
+it does not create a new project socket on every polling interval and thereby
+turn the test harness itself into a connection storm.
+Fixture creation is also idempotent across ambiguous HTTP failures: before a
+failed create is retried, a fresh project snapshot checks whether Overleaf
+already committed the named entity. Retries remain bounded and retain the last
+server refusal in the failed result; this hardens test provisioning without
+relaxing any subsequent convergence assertion.
+The stream also runs with the workspace's real Auto Save policy. A save that
+overtakes its editor-change callback must journal the current editor exactly
+once, while a stale queued save must not delete newer input; reverting to the
+preceding canonical snapshot is an immediate failure, not an acceptable
+clean-editor reload.
+Watcher invalidations emitted by that save must remain behind its causal fence,
+coalesce to one current disk read, and must not build a filesystem queue that
+delays acknowledged remote tokens.
+The same reload injects a legacy pending WAL whose document ID and path do not
+exist in the current replica. The new host must preserve byte-exact base/local
+artifacts, retire that WAL only after the archive is durable, report zero
+project-pause events, and then remove only the test-owned detached record.
+Focused recovery tests also hold exactly one path proof at a time: live-tree
+identity (including hard-ignored paths), baseline, active/retained conflict,
+pending document action, pending AI intent, completed AI receipt, or schema-3 WAL binding. None may
+enter detached recovery; only the pending legacy WAL with every proof absent may
+do so. Two race tests make the same immutable ID reappear immediately before and
+immediately after WAL preparation; both must leave the WAL attached and publish
+no detached artifact.
+One deterministic race test captures an empty converged scan, advances the
+same document baseline, and then commits the older scan. The newer per-path
+baseline must survive while unrelated paths remain refreshable.
 An acknowledgement timeout from a fresh observer is never accepted as proof
 that a remote document is absent; a second project snapshot must confirm the
 entity deletion.
+The remote-pull bound starts at the server acknowledgement, because the stress
+case deliberately holds the synthetic remote client's incoming ACKs while it
+builds a pending-operation backlog. Admission-to-observation time is retained
+separately in the evidence, so queue pressure remains visible without calling
+time spent before server acceptance a client pull delay.
 ACK-loss recovery, reverse server ordering, conflicting tree operations,
 duplicate locks, and every journal action boundary are exercised by the
 deterministic integration suites.
@@ -81,8 +145,17 @@ Required scenarios:
 11. sustained remote writes without a local writer;
 12. sustained VS Code writes with bounded WAL batching;
 13. sustained single-AI gateway writes with lease fencing;
-14. concurrent remote, VS Code, and AI writes with exact retention and
-    per-writer order preservation.
+14. concurrent remote, VS Code, raw-filesystem, and AI writes with exact
+    retention and per-writer order preservation, including range replacement
+    and deletion;
+15. unsaved old-ID local WAL, remote delete/recreate at the same path, complete
+    recovery manifest, remote resolution, then exact bidirectional sync on the
+    replacement ID;
+16. a real extension-host reload preserves the same namespace, immutable
+    document ID, fixed pending operation ID, exact target, and one-revision ACK.
+17. after an explicit user save, two consecutive remote revisions reach disk
+    and the open editor within five seconds while the editor remains clean and
+    the plugin emits no synthetic save.
 
 ## Acceptance gate for a real project
 

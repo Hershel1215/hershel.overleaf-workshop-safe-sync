@@ -291,6 +291,14 @@ export class TextOperation {
         }
         const dmp = new DiffMatchPatch();
         const diffs = dmp.diff_main(before, after);
+        // A snapshot diff of repetitive text anchors its edit wherever the
+        // common prefix and suffix happen to meet, which for a document of
+        // similar lines lands in the middle of one. That offset is a real OT
+        // position: a concurrent insertion transformed against it is placed
+        // inside the line, splitting text neither writer ever split. Sliding
+        // the edit onto the surrounding line boundary changes no byte this
+        // operation produces and gives every writer the same anchor.
+        dmp.diff_cleanupSemanticLossless(diffs);
         const operation = new TextOperation();
         for (const [kind, text] of diffs) {
             if (kind === 0) {

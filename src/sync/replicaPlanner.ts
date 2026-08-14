@@ -10,6 +10,7 @@ export interface ReplicaSnapshot extends SyncSnapshot {
     content?: Uint8Array;
     localIdentity?: string;
     readonly?: boolean;
+    remoteStructureHash?: string;
     localVariants?: {
         diskContent: Uint8Array;
         editorContent: Uint8Array;
@@ -117,6 +118,7 @@ export function refreshConvergedBaseline(
     state: ReplicaState,
     local: Map<string, ReplicaSnapshot>,
     remote: Map<string, ReplicaSnapshot>,
+    protectedDocumentEntityIds: ReadonlySet<string> = new Set(),
 ): void {
     const nextEntries: Record<string, BaselineEntry> = {};
     for (const [path, remoteEntry] of remote) {
@@ -147,7 +149,15 @@ export function refreshConvergedBaseline(
         };
     }
     for (const [path, previous] of Object.entries(state.entries)) {
-        if (isPathConflicted(path, state) && nextEntries[path] === undefined) {
+        const protectedUnmappedDocument = previous.fileType === 'doc'
+            && protectedDocumentEntityIds.has(previous.entityId)
+            && !Object.values(nextEntries).some(entry => (
+                entry.fileType === 'doc' && entry.entityId === previous.entityId
+            ));
+        if (
+            nextEntries[path] === undefined
+            && (isPathConflicted(path, state) || protectedUnmappedDocument)
+        ) {
             nextEntries[path] = previous;
         }
     }
@@ -241,20 +251,88 @@ export function validatePendingRecovery(
         case 'delete-local':
         case 'delete-remote':
             if (!allowed(localHash, true, pending.expectedLocalHash)
-                || !allowed(remoteHash, true, pending.expectedRemoteHash)) {
+                || !allowed(remoteHash, true, pending.expectedRemoteHash)
+                || (
+                    remoteEntry?.fileType === 'folder'
+                    && pending.expectedRemoteTreeHash !== undefined
+                    && remoteEntry.treeHash !== pending.expectedRemoteTreeHash
+                )
+                || (
+                    remoteEntry?.fileType === 'folder'
+                    && pending.expectedRemoteStructureHash !== undefined
+                    && remoteEntry.remoteStructureHash !== pending.expectedRemoteStructureHash
+                )) {
                 throw new Error(`Cannot prove recovery ancestry for pending deletion of ${pending.path}`);
             }
             break;
         case 'move-local':
-        case 'move-remote':
+        case 'move-remote': {
+            const targetLocalEntry = (
+                pending.targetPath ? local.get(pending.targetPath) : undefined
+            );
+            const targetRemoteEntry = (
+                pending.targetPath ? remote.get(pending.targetPath) : undefined
+            );
+            const localMoveEndpoint = (
+                pending.expectedLocalIdentity !== undefined
+                && targetLocalEntry?.localIdentity === pending.expectedLocalIdentity
+            ) ? targetLocalEntry : localEntry ?? targetLocalEntry;
+            const remoteMoveEndpoint = (
+                pending.entityId !== undefined
+                && targetRemoteEntry?.entityId === pending.entityId
+            ) ? targetRemoteEntry : remoteEntry ?? targetRemoteEntry;
+            const localIdentityProvesOwnership = pending.expectedLocalIdentity !== undefined
+                && localMoveEndpoint?.localIdentity === pending.expectedLocalIdentity;
+            const remoteIdentityProvesOwnership = pending.entityId !== undefined
+                && remoteMoveEndpoint?.entityId === pending.entityId;
             if (!pending.targetPath
-                || !allowed(localHash, true, pending.expectedLocalHash)
-                || !allowed(remoteHash, true, pending.expectedRemoteHash)
-                || !allowed(targetLocalHash, true, pending.targetHash, pending.expectedLocalHash)
-                || !allowed(targetRemoteHash, true, pending.targetHash, pending.expectedRemoteHash)) {
+                || (
+                    !localIdentityProvesOwnership
+                    && (
+                        !allowed(localHash, true, pending.expectedLocalHash)
+                        || !allowed(
+                            targetLocalHash,
+                            true,
+                            pending.targetHash,
+                            pending.expectedLocalHash,
+                        )
+                    )
+                )
+                || (
+                    !remoteIdentityProvesOwnership
+                    && (
+                        !allowed(remoteHash, true, pending.expectedRemoteHash)
+                        || !allowed(
+                            targetRemoteHash,
+                            true,
+                            pending.targetHash,
+                            pending.expectedRemoteHash,
+                        )
+                    )
+                )
+                || (
+                    !localIdentityProvesOwnership
+                    && pending.expectedLocalTreeHash !== undefined
+                    && localMoveEndpoint?.treeHash !== pending.expectedLocalTreeHash
+                )
+                || (
+                    pending.expectedLocalIdentity !== undefined
+                    && localMoveEndpoint?.localIdentity !== pending.expectedLocalIdentity
+                )
+                || (
+                    !remoteIdentityProvesOwnership
+                    && pending.expectedRemoteStructureHash !== undefined
+                    && remoteMoveEndpoint?.remoteStructureHash
+                        !== pending.expectedRemoteStructureHash
+                )
+                || (
+                    pending.entityId !== undefined
+                    && remoteMoveEndpoint?.entityId !== pending.entityId
+                )) {
                 throw new Error(`Cannot prove recovery ancestry for pending move of ${pending.path}`);
             }
             break;
+        }
         case 'converge-local':
             if (!allowed(localHash, false, pending.expectedLocalHash, pending.targetHash)
                 || !allowed(remoteHash, true, pending.expectedRemoteHash)) {

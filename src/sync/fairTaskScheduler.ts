@@ -1,4 +1,5 @@
 export class SchedulerBackpressureError extends Error {}
+export class DocumentSchedulerRetiredError extends Error {}
 
 interface ScheduledTask<T> {
     run: () => Promise<T>;
@@ -12,12 +13,27 @@ export class FairTaskScheduler {
     private sourceCursor = 0;
     private pumping = false;
     private disposed = false;
+    private activeSource?: string;
+    private activeStartedAt?: number;
     private readonly retirementWaiters: Array<() => void> = [];
 
     constructor(private readonly maxPendingPerSource = 1024) {}
 
     get pendingCount(): number {
         return [...this.queues.values()].reduce((total, queue) => total + queue.length, 0);
+    }
+
+    get isIdle(): boolean {
+        return !this.pumping && this.pendingCount === 0;
+    }
+
+    get activeTask(): {source: string; durationMs: number} | undefined {
+        return this.activeSource === undefined || this.activeStartedAt === undefined
+            ? undefined
+            : {
+                source: this.activeSource,
+                durationMs: Date.now() - this.activeStartedAt,
+            };
     }
 
     pendingCountFor(source: string): number {
@@ -48,7 +64,9 @@ export class FairTaskScheduler {
 
     dispose(): void {
         this.disposed = true;
-        const error = new Error('Document scheduler disposed with pending work');
+        const error = new DocumentSchedulerRetiredError(
+            'Document scheduler disposed with pending work',
+        );
         for (const queue of this.queues.values()) {
             for (const task of queue) {
                 task.reject(error);
@@ -92,9 +110,14 @@ export class FairTaskScheduler {
                     continue;
                 }
                 try {
+                    this.activeSource = source;
+                    this.activeStartedAt = Date.now();
                     task.resolve(await task.run());
                 } catch (error) {
                     task.reject(error instanceof Error ? error : new Error(String(error)));
+                } finally {
+                    this.activeSource = undefined;
+                    this.activeStartedAt = undefined;
                 }
                 await new Promise<void>(resolve => setImmediate(resolve));
             }

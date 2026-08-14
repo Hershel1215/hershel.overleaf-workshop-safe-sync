@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { mkdtemp, readFile, rm } = require('fs/promises');
+const { mkdtemp, readFile, rm, writeFile } = require('fs/promises');
 const os = require('os');
 const path = require('path');
 const {
@@ -50,6 +50,47 @@ describe('AI gateway transport', () => {
             path: 'main.tex',
         }, 500);
         assert.deepStrictEqual(response, { delayed: true });
+    });
+
+    it('preserves successor metadata and lets a handoff handler stop without deadlocking', async () => {
+        const metadataPath = path.join(directory, 'gateway.json');
+        server = new AiGatewayServer(metadataPath, {
+            handle: async () => ({ ok: true }),
+        }, path.join(directory, 'old.sock'));
+        await server.start();
+        const successor = {
+            schemaVersion: 1,
+            socketPath: path.join(directory, 'successor.sock'),
+            token: 'successor-token',
+        };
+        await writeFile(metadataPath, JSON.stringify(successor));
+        await server.stop();
+        assert.deepStrictEqual(JSON.parse(await readFile(metadataPath, 'utf8')), successor);
+
+        let handoffServer;
+        const handoffSuccessor = {
+            schemaVersion: 1,
+            socketPath: path.join(directory, 'handoff-successor.sock'),
+            token: 'handoff-successor-token',
+        };
+        handoffServer = new AiGatewayServer(metadataPath, {
+            handle: async () => {
+                await writeFile(metadataPath, JSON.stringify(handoffSuccessor));
+                await handoffServer.stopForHandoff();
+                return { released: true };
+            },
+        }, path.join(directory, 'handoff.sock'));
+        server = handoffServer;
+        await server.start();
+        const response = await sendAiGatewayRequest(metadataPath, {
+            method: 'handoff',
+        }, 500);
+
+        assert.deepStrictEqual(response, { released: true });
+        assert.deepStrictEqual(
+            JSON.parse(await readFile(metadataPath, 'utf8')),
+            handoffSuccessor,
+        );
     });
 
     it('rejects an unauthenticated socket request', async () => {

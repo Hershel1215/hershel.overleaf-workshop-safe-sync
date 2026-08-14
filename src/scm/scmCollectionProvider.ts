@@ -179,7 +179,13 @@ export class SCMCollectionProvider extends vscode.Disposable {
         } catch (error) {
             // permanently remove failed scm
             // this.vfs.setProjectSCMPersist(scm.scmKey, undefined);
-            vscode.window.showErrorMessage( vscode.l10n.t('"{scm}" creation failed.', {scm:scmProto.label}) );
+            if (scm instanceof LocalReplicaSCMProvider) {
+                scm.dispose();
+            }
+            const reason = error instanceof Error ? error.message : String(error);
+            vscode.window.showErrorMessage(
+                `${vscode.l10n.t('"{scm}" creation failed.', {scm:scmProto.label})} ${reason}`,
+            );
             return undefined;
         }
     }

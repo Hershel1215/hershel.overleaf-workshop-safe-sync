@@ -30,6 +30,7 @@ describe('durable safe-sync WAL', () => {
         assert.strictEqual(firstRecord.sequence, 1);
         assert.strictEqual(secondRecord.sequence, 2);
         assert.strictEqual(secondRecord.previousHash, firstRecord.hash);
+        assert.strictEqual(wal.byteLength, (await readFile(walPath)).length);
         await wal.close();
 
         const recovered = await DurableWal.open(walPath);
@@ -46,6 +47,19 @@ describe('durable safe-sync WAL', () => {
         assert.strictEqual(record.sequence, 1);
         assert.match(await readFile(walPath, 'utf8'), /barrier/);
         await wal.close();
+    });
+
+    it('atomically replaces a closed WAL instead of truncating it in place', async () => {
+        const wal = await DurableWal.open(walPath);
+        await wal.append({kind: 'old-generation'}, true);
+        await wal.close();
+
+        await DurableWal.replaceWithEmpty(walPath);
+
+        assert.strictEqual((await readFile(walPath)).length, 0);
+        const recovered = await DurableWal.open(walPath);
+        assert.deepStrictEqual(recovered.records, []);
+        await recovered.close();
     });
 
     it('discards only a torn final record', async () => {

@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'crypto';
-import { FileHandle, mkdir, open, readFile, rename, truncate } from 'fs/promises';
+import { constants as fsConstants } from 'fs';
+import { FileHandle, open, readFile, rename, rm, truncate } from 'fs/promises';
 import * as path from 'path';
+import { createDirectoryDurably, syncDirectoryDurably } from './durableFile';
 
 const WAL_SCHEMA_VERSION = 1;
 const CHECKPOINT_SCHEMA_VERSION = 1;
@@ -46,6 +48,7 @@ export class DurableWal<T> {
     private closed = false;
     private nextSequence: number;
     private previousHash: string;
+    private durableBytes: number;
 
     private constructor(
         readonly filePath: string,
@@ -62,20 +65,100 @@ export class DurableWal<T> {
         const last = recoveredRecords.at(-1);
         this.nextSequence = (last?.sequence ?? 0) + 1;
         this.previousHash = last?.hash ?? ZERO_HASH;
+        this.durableBytes = recoveredRecords.reduce(
+            (total, record) => total + Buffer.byteLength(`${JSON.stringify(record)}\n`),
+            0,
+        );
     }
 
     static async open<T>(
         filePath: string,
         options: DurableWalOptions = {},
     ): Promise<DurableWal<T>> {
-        await mkdir(path.dirname(filePath), { recursive: true });
-        const recovered = await recoverWal<T>(filePath);
-        const handle = await open(filePath, 'a+');
-        return new DurableWal(filePath, handle, recovered, options);
+        const directory = path.dirname(filePath);
+        await createDirectoryDurably(directory, 0o700);
+        let recovered: WalRecord<T>[];
+        let handle: FileHandle | undefined;
+        try {
+            handle = await open(filePath, 'ax+');
+            recovered = [];
+            // fdatasync alone does not durably publish a newly created name.
+            // The journaled contract starts only after both the empty inode
+            // and its parent-directory entry survive a crash.
+            await handle.datasync();
+            await syncDirectoryDurably(directory);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+                await handle?.close().catch(() => {});
+                throw error;
+            }
+            recovered = await recoverWal<T>(filePath);
+            // Do not recreate a file that disappeared between recovery and
+            // ownership. That race means another actor changed the WAL path.
+            handle = await open(filePath, fsConstants.O_RDWR | fsConstants.O_APPEND);
+        }
+        if (!handle) {
+            throw new Error(`WAL handle was not opened: ${filePath}`);
+        }
+        try {
+            return new DurableWal(filePath, handle, recovered, options);
+        } catch (error) {
+            await handle.close().catch(() => {});
+            throw error;
+        }
+    }
+
+    /**
+     * Durably create a new, empty WAL generation.
+     *
+     * Generation paths are unique, so publishing the file itself does not
+     * select it. The caller must durably publish its generation selector only
+     * after this promise resolves.
+     */
+    static async createEmpty(filePath: string): Promise<void> {
+        const directory = path.dirname(filePath);
+        await createDirectoryDurably(directory, 0o700);
+        const handle = await open(filePath, 'wx');
+        try {
+            await handle.datasync();
+        } finally {
+            await handle.close();
+        }
+        await syncDirectoryDurably(directory);
+    }
+
+    /**
+     * Atomically replace a closed WAL with an empty file.
+     *
+     * This deliberately never truncates the selected WAL in place: before the
+     * rename recovery sees the old complete WAL, and afterwards it sees the
+     * new empty WAL.
+     */
+    static async replaceWithEmpty(filePath: string): Promise<void> {
+        const directory = path.dirname(filePath);
+        await createDirectoryDurably(directory, 0o700);
+        const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.empty`;
+        const temporary = await open(temporaryPath, 'wx');
+        try {
+            await temporary.datasync();
+        } finally {
+            await temporary.close();
+        }
+        try {
+            await rename(temporaryPath, filePath);
+            await syncDirectoryDurably(directory);
+        } catch (error) {
+            await rm(temporaryPath, { force: true }).catch(() => {});
+            throw error;
+        }
     }
 
     get records(): readonly WalRecord<T>[] {
         return this.recoveredRecords;
+    }
+
+    get byteLength(): number {
+        return this.durableBytes;
     }
 
     append(payload: T, barrier = false): Promise<WalRecord<T>> {
@@ -166,6 +249,7 @@ export class DurableWal<T> {
 
             this.nextSequence = nextSequence;
             this.previousHash = previousHash;
+            this.durableBytes += Buffer.byteLength(encoded);
             this.recoveredRecords.push(...records);
             for (let index = 0; index < batch.length; index++) {
                 batch[index].resolve(records[index]);
@@ -241,7 +325,7 @@ export class AtomicCheckpointStore<T> {
         if (!Number.isInteger(checkpoint.walSequence) || checkpoint.walSequence < 0) {
             throw new Error('Invalid checkpoint WAL sequence');
         }
-        await mkdir(path.dirname(this.filePath), { recursive: true });
+        await createDirectoryDurably(path.dirname(this.filePath), 0o700);
         const body = {
             schemaVersion: CHECKPOINT_SCHEMA_VERSION as 1,
             walSequence: checkpoint.walSequence,
@@ -257,7 +341,7 @@ export class AtomicCheckpointStore<T> {
             await temporary.close();
         }
         await rename(temporaryPath, this.filePath);
-        await syncDirectory(path.dirname(this.filePath));
+        await syncDirectoryDurably(path.dirname(this.filePath));
     }
 }
 
@@ -313,15 +397,6 @@ async function recoverWal<T>(filePath: string): Promise<WalRecord<T>[]> {
 
 function hashJson(value: unknown): string {
     return createHash('sha256').update(JSON.stringify(value)).digest('hex');
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-    const handle = await open(directory, 'r');
-    try {
-        await handle.sync();
-    } finally {
-        await handle.close();
-    }
 }
 
 function isMissingFile(error: unknown): boolean {

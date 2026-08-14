@@ -14,18 +14,28 @@ local synchronization fail closed.
 
 ## Safe-sync guarantees
 
-- Text edits from VS Code, external scripts, formatters, Codex, and Claude are
-  converted from snapshots to UTF-16 OT operations and resolve only after an
-  authoritative `otUpdateApplied` acknowledgement.
+- VS Code edits and stable on-disk snapshots from scripts or formatters are
+  converted to UTF-16 OT operations and resolve only after an authoritative
+  `otUpdateApplied` acknowledgement.
 - A durable operation queue and server `joinDoc(fromVersion)` catch-up prevent
-  ACK-loss duplication. If ancestry cannot be proved, the project pauses.
-- Binary conflicts never use timestamps. The remote file remains canonical;
-  every stable local variant is archived under `.overleaf/conflicts/`.
-- File-tree moves use remote entity IDs and local filesystem identity. Ambiguous
-  move/delete/edit cases pause the affected path or subtree.
+  ACK-loss duplication. Unprovable document ancestry is isolated with complete
+  recovery evidence; corrupt project state is the narrower project-wide stop.
+- Binary and folder conflicts never use timestamps. Base, current Overleaf,
+  current local, and version/reason evidence are archived under
+  `.overleaf/conflicts/` before an explicit choice changes either endpoint.
+- File-tree moves bind remote immutable IDs and authoritative hashes plus local
+  filesystem identity. A delete/recreate race cannot move the replacement.
 - One extension host owns a local replica directory at a time through a lease.
+- Codex/Claude exact-once commits use the generated AI gateway command. One
+  gateway commit is durable and idempotent across a lost response or extension
+  restart, and a second gateway AI writer for the same document is rejected.
+  Direct raw filesystem writes remain compatible latest-snapshot input, but
+  cannot expose writer identity or preserve an intermediate snapshot that a
+  second process overwrites before the filesystem watcher observes it.
 - A new replica is preview-only until the user explicitly selects its trusted
   first baseline. `.overleaf/**` is permanently excluded from upload.
+- Remote recovery transactions live only in an ownership-marked
+  `.hershel-safe-sync`; that name and valid staging names are reserved locally.
 - Credentials are stored in VS Code SecretStorage, not ordinary global state.
 
 The writable capability is currently validated for `10.10.5.4:8888`. Other
@@ -33,7 +43,8 @@ servers remain read-only unless they advertise `hershelSafeSyncProtocol` as
 `legacy-ot-v1`.
 
 See [safe-sync operations](./docs/safe-sync-operations.md),
-[design](./docs/safe-sync-design.md), and [test matrix](./docs/safe-sync-testing.md).
+[v2 design](./docs/safe-sync-v2-design.md), and
+[test matrix](./docs/safe-sync-testing.md).
 
 ## Upstream features and attribution
 

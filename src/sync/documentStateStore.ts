@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'crypto';
 import { open } from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { SerializedOtClientState } from './otClientState';
+import { OtClientState, SerializedOtClientState } from './otClientState';
 
 export interface StoredDocumentState {
     schemaVersion: 1;
@@ -35,6 +35,7 @@ export class DocumentStateStore {
             if (parsed.schemaVersion !== 1 || parsed.documentId !== documentId) {
                 throw new Error(`Invalid durable document state for ${documentId}`);
             }
+            OtClientState.restore(parsed.state);
             return parsed;
         } catch (error) {
             if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') {
@@ -42,6 +43,58 @@ export class DocumentStateStore {
             }
             throw error;
         }
+    }
+
+    /** Enumerate legacy durable OT states so pending writes cannot become unreachable. */
+    async listExisting(): Promise<StoredDocumentState[]> {
+        let entries: [string, vscode.FileType][];
+        try {
+            entries = await vscode.workspace.fs.readDirectory(this.directory);
+        } catch (error) {
+            if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') {
+                return [];
+            }
+            throw error;
+        }
+        const states: StoredDocumentState[] = [];
+        const documentIds = new Set<string>();
+        for (const [name, type] of entries) {
+            if (type !== vscode.FileType.File || !name.endsWith('.json')) {
+                continue;
+            }
+            const uri = vscode.Uri.joinPath(this.directory, name);
+            let parsed: StoredDocumentState;
+            try {
+                parsed = JSON.parse(
+                    new TextDecoder().decode(await vscode.workspace.fs.readFile(uri)),
+                ) as StoredDocumentState;
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new Error(`Invalid legacy durable document state ${name}: ${message}`);
+            }
+            if (
+                parsed.schemaVersion !== 1
+                || typeof parsed.documentId !== 'string'
+                || parsed.documentId.length === 0
+                || !parsed.state
+                || parsed.state.schemaVersion !== 1
+                || name !== this.fileName(parsed.documentId)
+            ) {
+                throw new Error(`Invalid legacy durable document state ${name}`);
+            }
+            try {
+                OtClientState.restore(parsed.state);
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new Error(`Invalid legacy durable document state ${name}: ${message}`);
+            }
+            if (documentIds.has(parsed.documentId)) {
+                throw new Error(`Duplicate legacy durable document state for ${parsed.documentId}`);
+            }
+            documentIds.add(parsed.documentId);
+            states.push(parsed);
+        }
+        return states.sort((left, right) => left.documentId.localeCompare(right.documentId));
     }
 
     async save(documentId: string, state: SerializedOtClientState): Promise<void> {
@@ -67,13 +120,17 @@ export class DocumentStateStore {
     }
 
     async remove(documentId: string): Promise<void> {
+        const target = this.stateUri(documentId);
         try {
-            await vscode.workspace.fs.delete(this.stateUri(documentId));
+            await vscode.workspace.fs.delete(target);
         } catch (error) {
-            if (!(error instanceof vscode.FileSystemError) || error.code !== 'FileNotFound') {
+            if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') {
+                return;
+            } else {
                 throw error;
             }
         }
+        await this.syncDirectory(target);
     }
 
     private stateUri(documentId: string): vscode.Uri {

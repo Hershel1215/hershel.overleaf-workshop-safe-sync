@@ -14,6 +14,18 @@ function getSetCookie(res: any): string[] {
     return [];
 }
 
+/**
+ * Per-attempt ceiling for every HTTP call to Overleaf.
+ *
+ * fetch has no default timeout. A server that accepts the connection and then
+ * stops reading leaves the promise pending for the life of the process, which
+ * wedges whatever resource action issued it and every reconciliation queued
+ * behind that action. Generous enough for a large upload on a slow link, and
+ * an expiry is reported as a network error, so the existing retry and backoff
+ * treat it like any other transient failure.
+ */
+const HTTP_REQUEST_TIMEOUT_MS = 60_000;
+
 export interface Identity {
     csrfToken: string;
     cookies: string;
@@ -209,6 +221,7 @@ export class BaseAPI {
     private async getCsrfToken(): Promise<Identity> {
         const res = await fetch(this.url+'login', {
             method: 'GET', redirect: 'manual',
+            signal: AbortSignal.timeout(HTTP_REQUEST_TIMEOUT_MS),
         });
         const body = await res.text();
         const match = body.match(/<input.*name="_csrf".*value="([^"]*)">/);
@@ -224,6 +237,7 @@ export class BaseAPI {
     private async getUserId(cookies:string) {
         const res = await fetch(this.url+'project', {
             method: 'GET', redirect:'manual',
+            signal: AbortSignal.timeout(HTTP_REQUEST_TIMEOUT_MS),
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': cookies,
@@ -378,15 +392,22 @@ export class BaseAPI {
         if (this.identity===undefined) { return Promise.reject(); }
 
         const MAX_HTTP_RETRIES = 2;
+        // fetch has no default timeout. A server that accepts the connection
+        // and then never answers leaves this promise pending forever, and the
+        // retry below never runs because nothing ever settles. Sync stops for
+        // good: the pending resource action that issued the call stays pending,
+        // and every later reconciliation waits behind it. Bound the wait so a
+        // stalled connection becomes an ordinary transient error instead.
         let lastError: {statusCode?: number, message?: string} = {};
 
         for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
+            const signal = AbortSignal.timeout(HTTP_REQUEST_TIMEOUT_MS);
             try {
                 let res = undefined;
                 switch(type) {
                     case 'GET':
                         res = await fetch(this.url+route, {
-                            method: 'GET', redirect: 'manual',
+                            method: 'GET', redirect: 'manual', signal,
                             headers: {
                                 'Connection': 'keep-alive',
                                 'Cookie': this.identity!.cookies,
@@ -401,7 +422,7 @@ export class BaseAPI {
                             ...body
                         });
                         res = await fetch(this.url+route, {
-                            method: 'POST', redirect: 'manual',
+                            method: 'POST', redirect: 'manual', signal,
                             headers: {
                                 'Connection': 'keep-alive',
                                 'Cookie': this.identity!.cookies,
@@ -415,7 +436,7 @@ export class BaseAPI {
                         break;
                     case 'DELETE':
                         res = await fetch(this.url+route, {
-                            method: 'DELETE', redirect: 'manual',
+                            method: 'DELETE', redirect: 'manual', signal,
                             headers: {
                                 'Connection': 'keep-alive',
                                 'Cookie': this.identity!.cookies,
@@ -478,6 +499,7 @@ export class BaseAPI {
         while(true) {
             const res = await fetch(this.url+route, {
                 method: 'GET', redirect: 'manual',
+                signal: AbortSignal.timeout(HTTP_REQUEST_TIMEOUT_MS),
                 headers: {
                     'Connection': 'keep-alive',
                     'Cookie': this.identity.cookies,
@@ -596,13 +618,21 @@ export class BaseAPI {
         }, {'X-Csrf-Token': identity.csrfToken});
     }
 
-    async uploadFile(identity:Identity, projectId:string, parentFolderId:string, filename:string, fileContent:Uint8Array) {
+    async uploadFile(
+        identity:Identity,
+        projectId:string,
+        parentFolderId:string,
+        filename:string,
+        fileContent:Uint8Array,
+        explicitMimeType?:string,
+    ) {
         const formData = new FormData();
-        const mimeType = require('mime-types').lookup(filename);
+        const inferredMimeType = require('mime-types').lookup(filename);
+        const mimeType = explicitMimeType || (inferredMimeType ? inferredMimeType : 'text/plain');
         formData.append('targetFolderId', parentFolderId);
         formData.append('name', filename);
-        formData.append('type', mimeType? mimeType : 'text/plain');
-        formData.append('qqfile', Buffer.from(fileContent), {filename});
+        formData.append('type', mimeType);
+        formData.append('qqfile', Buffer.from(fileContent), {filename, contentType: mimeType});
 
         this.setIdentity(identity);
         return this.request('POST', `project/${projectId}/upload?folder_id=${parentFolderId}`, formData, (res) => {

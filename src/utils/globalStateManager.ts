@@ -30,6 +30,7 @@ type ProjectSCMPersistMap = {[name: string]: ProjectSCMPersist};
 
 export interface ProjectSCMPersistMatch {
     serverName: string;
+    serverUrl: string;
     project: ProjectPersist;
     scm: ProjectSCMPersist;
 }
@@ -90,6 +91,57 @@ export class GlobalStateManager {
         } else {
             return servers;
         }
+    }
+
+    /**
+     * Rehydrate the non-secret server record for a bound local replica.
+     * VS Code can start a second remote extension host with an empty/stale
+     * globalState snapshot even though SecretStorage is shared. The binding
+     * contains enough public identity to restore that record without copying
+     * credentials into the workspace.
+     */
+    static async restoreBoundServer(
+        context: vscode.ExtensionContext,
+        binding: {uri: string; serverName: string; serverUrl?: string},
+    ): Promise<void> {
+        const parsed = new URL(binding.uri);
+        const query = new URLSearchParams(decodeURIComponent(parsed.search.slice(1)));
+        const userId = query.get('user');
+        if (parsed.host !== binding.serverName || !userId) {
+            throw new Error('Local replica binding lacks a valid server user');
+        }
+        const boundServerUrl = binding.serverUrl ?? this.inferBoundServerUrl(binding.serverName);
+        const parsedServerUrl = new URL(boundServerUrl);
+        if (
+            parsedServerUrl.host !== binding.serverName
+            || !['http:', 'https:'].includes(parsedServerUrl.protocol)
+        ) {
+            throw new Error('Local replica binding server URL does not match its server name');
+        }
+        const identity = await this.loadIdentity(context, binding.serverName);
+        const persists = context.globalState.get<ServerPersistMap>(keyServerPersists, {});
+        const existing = persists[binding.serverName];
+        if (existing && binding.serverUrl && existing.url !== binding.serverUrl) {
+            throw new Error('Local replica binding server URL does not match the stored server');
+        }
+        if (existing?.login && existing.login.userId !== userId) {
+            throw new Error('Local replica binding user does not match the stored server login');
+        }
+        const server = existing ?? {
+            name: binding.serverName,
+            url: boundServerUrl,
+        };
+        server.login ??= {
+            userId,
+            username: 'local-replica',
+        };
+        persists[binding.serverName] = server;
+        this.identityCache.set(this.cacheKey(context, binding.serverName), identity);
+        await context.globalState.update(keyServerPersists, persists);
+    }
+
+    static getServerUrl(context: vscode.ExtensionContext, name: string): string | undefined {
+        return context.globalState.get<ServerPersistMap>(keyServerPersists, {})[name]?.url;
     }
 
     static addServer(context:vscode.ExtensionContext, name:string, url:string): boolean {
@@ -217,7 +269,7 @@ export class GlobalStateManager {
         const server   = persists[name];
         const identity = this.identityCache.get(this.cacheKey(context, name));
 
-        if (server.login!==undefined && identity) {
+        if (server?.login!==undefined && identity) {
             const api = new ExtendedBaseAPI(server.url);
             const socket = new SocketIOAPI(server.url, api, identity, projectId);
             return {api, socket};
@@ -252,7 +304,12 @@ export class GlobalStateManager {
                         && configured.scheme === 'file'
                         && configured.fsPath === baseUri.fsPath
                     ) {
-                        matches.push({ serverName: server.name, project, scm });
+                        matches.push({
+                            serverName: server.name,
+                            serverUrl: server.url,
+                            project,
+                            scm,
+                        });
                     }
                 }
             }
@@ -349,6 +406,15 @@ export class GlobalStateManager {
 
     private static cacheKey(context: vscode.ExtensionContext, name: string): string {
         return `${context.extension.id}\0${name}`;
+    }
+
+    private static inferBoundServerUrl(name: string): string {
+        const local = /^localhost(?::\d+)?$/i.test(name)
+            || /^127(?:\.\d{1,3}){3}(?::\d+)?$/.test(name)
+            || /^10(?:\.\d{1,3}){3}(?::\d+)?$/.test(name)
+            || /^192\.168(?:\.\d{1,3}){2}(?::\d+)?$/.test(name)
+            || /^172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}(?::\d+)?$/.test(name);
+        return `${local ? 'http' : 'https'}://${name}/`;
     }
 
 }

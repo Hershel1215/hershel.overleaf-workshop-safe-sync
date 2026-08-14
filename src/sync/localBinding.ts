@@ -5,6 +5,7 @@ import * as path from 'path';
 export interface LocalReplicaBinding {
     uri: string;
     serverName: string;
+    serverUrl?: string;
     enableCompileNPreview: boolean;
     projectName: string;
 }
@@ -13,10 +14,12 @@ export function createLocalReplicaBinding(
     uri: string,
     serverName: string,
     projectName: string,
+    serverUrl?: string,
 ): LocalReplicaBinding {
     return {
         uri,
         serverName,
+        ...(serverUrl === undefined ? {} : {serverUrl}),
         enableCompileNPreview: false,
         projectName,
     };

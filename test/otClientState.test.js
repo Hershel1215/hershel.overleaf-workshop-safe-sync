@@ -36,6 +36,21 @@ describe('OtClientState', () => {
         assert.strictEqual(state.visibleContent, 'aLXb');
     });
 
+    it('settles source ids whose composed pending operation cancels to a noop', () => {
+        const state = new OtClientState(0, 'ab', 'ab', ids());
+        const first = state.submitOperation(makeEdit('ab', 1, 0, 'L'));
+        state.submitOperation(makeEdit('aLb', 2, 0, 'X'));
+        state.submitOperation(makeEdit('aLXb', 2, 1, ''));
+
+        const result = state.receive(first.send.operation, 0, true);
+
+        assert.deepStrictEqual(result.acknowledgedIds, ['op-1', 'op-2', 'op-3']);
+        assert.strictEqual(result.send, undefined);
+        assert.strictEqual(state.hasPendingOperations, false);
+        assert.strictEqual(state.visibleContent, 'aLb');
+        assert.strictEqual(state.acknowledgedContent, 'aLb');
+    });
+
     it('rebases outstanding and pending edits behind an authoritative remote edit', () => {
         const state = new OtClientState(0, 'ab', 'ab', ids());
         const first = state.submitOperation(makeEdit('ab', 1, 0, 'L'));

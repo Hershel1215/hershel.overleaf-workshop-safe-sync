@@ -42,6 +42,107 @@ describe('buffered editor input', () => {
         input.dispose();
     });
 
+    it('serializes a timer boundary through the document scheduler', async () => {
+        const events = [];
+        let releaseBoundary;
+        const boundaryGate = new Promise(resolve => { releaseBoundary = resolve; });
+        const input = new BufferedDocumentInput({
+            idleCommitMs: 5,
+            maxCommitMs: 10,
+            onError: error => { throw error; },
+            scheduleBoundary: async task => {
+                events.push('scheduled');
+                await boundaryGate;
+                events.push('released');
+                await task();
+            },
+            commit: async (_ancestor, target, barrier) => {
+                events.push(`commit:${String(barrier)}`);
+                return {content: target, acknowledgement: Promise.resolve(target)};
+            },
+        });
+        input.update('base', 'local');
+        await new Promise(resolve => setTimeout(resolve, 15));
+        assert.deepStrictEqual(events, ['scheduled']);
+        releaseBoundary();
+        for (let attempt = 0; attempt < 10 && events.length < 3; attempt++) {
+            await new Promise(resolve => setImmediate(resolve));
+        }
+        assert.deepStrictEqual(events, ['scheduled', 'released', 'commit:true']);
+        input.dispose();
+    });
+
+    it('finishes a hard boundary while input continues into the next batch', async () => {
+        const commits = [];
+        let releaseFirst;
+        let announceFirst;
+        const firstStarted = new Promise(resolve => { announceFirst = resolve; });
+        const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+        let idleCount = 0;
+        let boundaryCount = 0;
+        const input = new BufferedDocumentInput({
+            idleCommitMs: 25,
+            maxCommitMs: 30,
+            onError: error => { throw error; },
+            commit: async (ancestor, target, barrier) => {
+                commits.push({ancestor, target, barrier});
+                if (commits.length === 1) {
+                    announceFirst();
+                    await firstGate;
+                }
+                return {content: target, acknowledgement: Promise.resolve(target)};
+            },
+            onIdle: async () => { idleCount++; },
+            onBoundary: async () => { boundaryCount++; },
+        });
+
+        input.update('base', 'local-1');
+        await new Promise(resolve => setTimeout(resolve, 10));
+        input.update('base', 'local-1');
+        await firstStarted;
+        input.update('local-1', 'local-2');
+        releaseFirst();
+        for (let attempt = 0; attempt < 10 && boundaryCount === 0; attempt++) {
+            await new Promise(resolve => setImmediate(resolve));
+        }
+
+        assert.deepStrictEqual(commits, [
+            {ancestor: 'base', target: 'local-1', barrier: true},
+        ]);
+        assert.strictEqual(boundaryCount, 1);
+        assert.strictEqual(idleCount, 0);
+        assert.strictEqual(input.hasBufferedInput, true);
+        await input.flush(true);
+        assert.deepStrictEqual(commits, [
+            {ancestor: 'base', target: 'local-1', barrier: true},
+            {ancestor: 'local-1', target: 'local-2', barrier: true},
+        ]);
+        assert.strictEqual(input.hasBufferedInput, false);
+        input.dispose();
+    });
+
+    it('does not let a continuous producer keep one barrier alive forever', async () => {
+        const commits = [];
+        let input;
+        input = new BufferedDocumentInput({
+            idleCommitMs: 1000,
+            maxCommitMs: 2000,
+            onError: error => { throw error; },
+            commit: async (ancestor, target, barrier) => {
+                commits.push({ancestor, target, barrier});
+                input.update(target, `${target}!`);
+                return {content: target, acknowledgement: Promise.resolve(target)};
+            },
+        });
+        input.update('', 'a');
+
+        await input.flush(true);
+
+        assert.deepStrictEqual(commits, [{ancestor: '', target: 'a', barrier: true}]);
+        assert.strictEqual(input.hasBufferedInput, true);
+        input.dispose();
+    });
+
     it('flushes buffered input at an explicit durable consistency barrier', async () => {
         const commits = [];
         const input = new BufferedDocumentInput({
@@ -135,7 +236,8 @@ describe('buffered editor input', () => {
                 return {content: target, acknowledgement: Promise.resolve(target)};
             },
         });
-        await input.updateTransition('base-a', 'target-a');
+        assert.strictEqual(input.tryUpdateTransition('base-a', 'target-a'), true);
+        assert.strictEqual(input.tryUpdateTransition('base-b', 'target-b'), false);
         await input.updateTransition('base-b', 'target-b');
         await input.flush(true);
 
@@ -143,6 +245,53 @@ describe('buffered editor input', () => {
             {ancestor: 'base-a', target: 'target-a', barrier: true},
             {ancestor: 'base-b', target: 'target-b', barrier: true},
         ]);
+        input.dispose();
+    });
+
+    it('prepends an earlier queued transition to a later synchronous batch', async () => {
+        const commits = [];
+        const input = new BufferedDocumentInput({
+            idleCommitMs: 1000,
+            maxCommitMs: 2000,
+            onError: error => { throw error; },
+            commit: async (ancestor, target, barrier) => {
+                commits.push({ancestor, target, barrier});
+                return {content: target, acknowledgement: Promise.resolve(target)};
+            },
+        });
+
+        assert.strictEqual(input.tryUpdateTransition('middle', 'latest'), true);
+        assert.strictEqual(input.tryUpdateTransition('base', 'middle'), true);
+        await input.flush(true);
+
+        assert.deepStrictEqual(commits, [{ancestor: 'base', target: 'latest', barrier: true}]);
+        input.dispose();
+    });
+
+    it('re-anchors a buffered suffix at its installed transformed preview', async () => {
+        const commits = [];
+        const input = new BufferedDocumentInput({
+            idleCommitMs: 1000,
+            maxCommitMs: 2000,
+            onError: error => { throw error; },
+            commit: async (ancestor, target, barrier) => {
+                commits.push({ancestor, target, barrier});
+                return {content: target, acknowledgement: Promise.resolve(target)};
+            },
+        });
+        assert.strictEqual(input.tryUpdateTransition('ab', 'aLb'), true);
+        const preview = input.previewAgainst('aRb');
+        assert.strictEqual(preview, 'aRLb');
+
+        assert.strictEqual(input.adoptProjectedPreview('aRb', preview), true);
+        assert.strictEqual(input.tryUpdateTransition(preview, `${preview}X`), true);
+        await input.flush(true);
+
+        assert.deepStrictEqual(commits, [{
+            ancestor: 'aRb',
+            target: 'aRLbX',
+            barrier: true,
+        }]);
         input.dispose();
     });
 });

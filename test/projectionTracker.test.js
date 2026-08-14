@@ -22,13 +22,15 @@ describe('projection provenance', () => {
 
     it('handles coalesced watcher events by matching the newest receipt', () => {
         const tracker = new ProjectionTracker(ids());
-        tracker.record('main.tex', { kind: 'change', hash: 'one' });
+        const skipped = tracker.record('main.tex', { kind: 'change', hash: 'one' });
         const newest = tracker.record('main.tex', { kind: 'change', hash: 'two' });
         assert.deepStrictEqual(
             tracker.observe('main.tex', { kind: 'change', hash: 'two' }),
             { kind: 'projection', projectionId: newest.id },
         );
         assert.deepStrictEqual(tracker.serialize(), []);
+        assert.strictEqual(tracker.hasReceipt(skipped.id), false);
+        assert.strictEqual(tracker.hasReceipt(newest.id), true);
     });
 
     it('classifies content that differs from all receipts as a mutation', () => {
@@ -58,5 +60,33 @@ describe('projection provenance', () => {
             }),
             { kind: 'projection', projectionId: receipt.id },
         );
+    });
+
+    it('matches a persisted OT projection rebased over later editor input', () => {
+        const tracker = new ProjectionTracker(() => 'merge-receipt');
+        tracker.recordTextMerge('editor:main.tex', 'ab', 'aRb');
+
+        const classification = tracker.observe('editor:main.tex', {
+            kind: 'change',
+            hash: 'ignored-for-operation-receipt',
+            ancestor: 'aLb',
+            content: 'aRLb',
+        });
+
+        assert.deepStrictEqual(classification, {
+            kind: 'projection',
+            projectionId: 'merge-receipt',
+        });
+    });
+
+    it('does not match an unrelated editor edit to an OT projection receipt', () => {
+        const tracker = new ProjectionTracker(() => 'merge-receipt');
+        tracker.recordTextMerge('editor:main.tex', 'ab', 'aRb');
+
+        assert.deepStrictEqual(tracker.observe('editor:main.tex', {
+            kind: 'change',
+            ancestor: 'aLb',
+            content: 'aXLb',
+        }), {kind: 'mutation'});
     });
 });

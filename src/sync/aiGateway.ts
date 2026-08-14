@@ -6,7 +6,7 @@ import * as path from 'path';
 const GATEWAY_SCHEMA_VERSION = 1;
 const MAX_MESSAGE_BYTES = 20 * 1024 * 1024;
 
-export type AiGatewayMethod = 'begin' | 'heartbeat' | 'commit' | 'abort';
+export type AiGatewayMethod = 'begin' | 'heartbeat' | 'commit' | 'abort' | 'handoff';
 
 export interface AiGatewayRequest {
     token: string;
@@ -78,14 +78,33 @@ export class AiGatewayServer {
     async stop(): Promise<void> {
         const server = this.server;
         this.server = undefined;
+        const metadata = this.metadata;
+        this.metadata = undefined;
         if (server) {
             await new Promise<void>(resolve => server.close(() => resolve()));
         }
-        await rm(this.metadataPath, { force: true });
+        await this.removeOwnedMetadata(metadata);
         if (process.platform !== 'win32') {
             await rm(this.socketPath, { force: true });
         }
+    }
+
+    /**
+     * Remove the discovery record before replying to a handoff request while
+     * allowing the request socket itself to finish. The old server never
+     * awaits `close`, so a new owner can safely create a fresh gateway after
+     * acquiring the replica lock.
+     */
+    async stopForHandoff(): Promise<void> {
+        const server = this.server;
+        this.server = undefined;
+        const metadata = this.metadata;
         this.metadata = undefined;
+        await this.removeOwnedMetadata(metadata);
+        if (process.platform !== 'win32') {
+            await rm(this.socketPath, { force: true });
+        }
+        server?.close();
     }
 
     private handleConnection(socket: net.Socket, metadata: AiGatewayMetadata): void {
@@ -111,6 +130,24 @@ export class AiGatewayServer {
             void this.dispatch(encoded, metadata, socket);
         });
         socket.on('error', () => {});
+    }
+
+    private async removeOwnedMetadata(metadata?: AiGatewayMetadata): Promise<void> {
+        if (!metadata) {
+            return;
+        }
+        try {
+            const current = JSON.parse(await readFile(this.metadataPath, 'utf8')) as Partial<AiGatewayMetadata>;
+            if (current.token !== metadata.token) {
+                return;
+            }
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw error;
+            }
+            return;
+        }
+        await rm(this.metadataPath, { force: true });
     }
 
     private async dispatch(
