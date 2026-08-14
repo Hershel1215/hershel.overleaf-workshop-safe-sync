@@ -95,6 +95,10 @@ failed create is retried, a fresh project snapshot checks whether Overleaf
 already committed the named entity. Retries remain bounded and retain the last
 server refusal in the failed result; this hardens test provisioning without
 relaxing any subsequent convergence assertion.
+Before provisioning, the dedicated E2E project also invokes the production
+pressure-safe retention policy. It may reclaim only recognized safe-sync
+transaction folders outside the protected in-flight window; it cannot delete
+an arbitrary project folder or run against a non-E2E project.
 The stream also runs with the workspace's real Auto Save policy. A save that
 overtakes its editor-change callback must journal the current editor exactly
 once, while a stale queued save must not delete newer input; reverting to the
@@ -103,6 +107,13 @@ clean-editor reload.
 Watcher invalidations emitted by that save must remain behind its causal fence,
 coalesce to one current disk read, and must not build a filesystem queue that
 delays acknowledged remote tokens.
+After the stress stream, a dedicated same-document scenario establishes two
+existing paragraphs from one durable common baseline. The AI gateway begins
+from that baseline, VS Code replaces paragraph A, and the stale AI candidate
+replaces only paragraph B. The step passes only when both replacements occur
+exactly once and the open editor, local disk, fresh authoritative Overleaf
+observer, and persisted common baseline all equal the exact composed text
+before any explicit save.
 The same reload injects a legacy pending WAL whose document ID and path do not
 exist in the current replica. The new host must preserve byte-exact base/local
 artifacts, retire that WAL only after the archive is durable, report zero
@@ -156,6 +167,10 @@ Required scenarios:
 17. after an explicit user save, two consecutive remote revisions reach disk
     and the open editor within five seconds while the editor remains clean and
     the plugin emits no synthetic save.
+18. from one common baseline, a user replaces paragraph A while an AI
+    transaction based on that same baseline replaces paragraph B; both edits
+    persist exactly once in VS Code, on local disk, and in Overleaf without a
+    conflict, text isolation, or project pause.
 
 ## Acceptance gate for a real project
 

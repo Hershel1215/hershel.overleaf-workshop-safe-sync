@@ -27,9 +27,9 @@ const RUNNING_FILE = 'safe-sync-e2e.running.json';
 const RESULT_FILE = 'safe-sync-e2e.result.json';
 const RELOAD_FILE = 'safe-sync-e2e.reload.json';
 const RESTART_RECOVERY_FILE = 'safe-sync-e2e.restart-recovery.json';
-export const HANDOFF_TARGET_VERSION = '1.0.0-hershel.189';
-export const HANDOFF_TARGET_BUILD_ID = '20260814T091358Z-safe-sync-v2-rc189';
-export const E2E_RESULT_SCHEMA_VERSION = 12;
+export const HANDOFF_TARGET_VERSION = '1.0.0-hershel.191';
+export const HANDOFF_TARGET_BUILD_ID = '20260814T102744Z-safe-sync-v2-rc191';
+export const E2E_RESULT_SCHEMA_VERSION = 13;
 const BINARY_FIXTURE = Uint8Array.from(Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
     'base64',
@@ -198,6 +198,22 @@ interface E2EEvidence {
         rangeReplaceVerified: boolean;
         rangeDeleteVerified: boolean;
         convergenceAfterWritersMs: number;
+    };
+    disjointParagraphEdits?: {
+        path: string;
+        commonBaseSha256: string;
+        expectedSha256: string;
+        finalRevision: number;
+        aiBeganBeforeUserEdit: boolean;
+        candidatesSharedBase: boolean;
+        aiCommitJournaled: boolean;
+        convergedBeforeExplicitSave: boolean;
+        editorEqualsDisk: boolean;
+        diskEqualsRemote: boolean;
+        userParagraphOccurrences: number;
+        aiParagraphOccurrences: number;
+        textIsolationEvents: number;
+        projectPauseEvents: number;
     };
     conflictArtifactsRemoteAbsent?: boolean;
     otCatchUp?: {baseRevision: number; finalRevision: number; operationCount: number; sha256: string};
@@ -1522,6 +1538,13 @@ async function runRemoteE2E(
                         localRoot!, restartRecoveryMarker.namespace,
                     )).length === 0,
                     'Restart-recovery fixture entered conflict isolation before resume proof',
+                );
+            }
+            const reclaimed = await LocalReplicaSCMProvider
+                .reclaimE2ERetainedRemoteTransactions(localRoot!.fsPath, projectId!);
+            if (reclaimed) {
+                output.appendLine(
+                    '[maintenance] reclaimed old safe-sync retention transactions for E2E capacity',
                 );
             }
         });
@@ -3854,6 +3877,200 @@ async function runRemoteE2E(
                 maxRemotePullLatencyMs <= 5000,
                 `Remote pull latency exceeded the realtime bound: ${maxRemotePullLatencyMs} ms`,
             );
+        });
+
+        await step('disjoint VS Code and AI paragraph edits converge and persist', async () => {
+            const fileName = 'streaming.tex';
+            const relativePath = `${isolatedRunName}/${fileName}`;
+            const localUri = vscode.Uri.joinPath(localRoot!, isolatedRunName, fileName);
+            const gatewayUri = vscode.Uri.joinPath(
+                localRoot!, '.overleaf', 'safe-sync-gateway.json',
+            );
+            const document = await vscode.workspace.openTextDocument(localUri);
+            const editor = await vscode.window.showTextDocument(document, {
+                preview: false,
+                preserveFocus: false,
+            });
+            const oldParagraphA = `PARAGRAPH-A-OLD-${request.nonce}\n`;
+            const userParagraphA = `PARAGRAPH-A-USER-${request.nonce}\n`;
+            const oldParagraphB = `PARAGRAPH-B-OLD-${request.nonce}\n`;
+            const aiParagraphB = `PARAGRAPH-B-AI-${request.nonce}\n`;
+            const seed = [
+                `INTRO-${request.nonce}\n`,
+                oldParagraphA,
+                `MIDDLE-${request.nonce}\n`,
+                oldParagraphB,
+                `OUTRO-${request.nonce}\n`,
+            ].join('');
+            const userCandidate = seed.replace(oldParagraphA, userParagraphA);
+            const aiCandidate = seed.replace(oldParagraphB, aiParagraphB);
+            const expected = userCandidate.replace(oldParagraphB, aiParagraphB);
+            const seedHash = createHash('sha256').update(seed).digest('hex');
+            const expectedHash = createHash('sha256').update(expected).digest('hex');
+
+            const baselineEdit = new vscode.WorkspaceEdit();
+            baselineEdit.replace(
+                localUri,
+                new vscode.Range(
+                    new vscode.Position(0, 0),
+                    document.positionAt(document.getText().length),
+                ),
+                seed,
+            );
+            assert(await vscode.workspace.applyEdit(baselineEdit),
+                'Could not establish the disjoint-paragraph common base');
+            await saveDocument(document, 'Could not save the disjoint-paragraph common base');
+            await waitForAsync(async () => {
+                const [local, state] = await Promise.all([
+                    readLocalBytes(localUri),
+                    replicaStateStore!.reload(),
+                ]);
+                const runtime = LocalReplicaSCMProvider.getRuntimeStatus(localRoot!.fsPath);
+                return local !== undefined
+                    && Buffer.from(local).toString('utf8') === seed
+                    && document.getText() === seed
+                    && state.entries[relativePath]?.text === seed
+                    && state.entries[relativePath]?.hash === seedHash
+                    && !state.pendingAction
+                    && !state.conflicts[relativePath]
+                    && runtime?.settled === true;
+            }, 60000, 'establish the disjoint-paragraph common baseline', 250);
+            const runtimeAtParagraphStart = LocalReplicaSCMProvider.getRuntimeStatus(
+                localRoot!.fsPath,
+            );
+            assert(runtimeAtParagraphStart,
+                'Disjoint-paragraph test has no Local Replica runtime');
+            const isolationEvents = runtimeAtParagraphStart.textIsolationEvents;
+            const pauseEvents = runtimeAtParagraphStart.projectPauseEvents;
+
+            interface ParagraphAiBegin {
+                leaseId: string;
+                fencingToken: number;
+                content: string;
+            }
+            interface ParagraphAiCommit {
+                journaled: boolean;
+            }
+            const begin = await sendAiGatewayRequest<ParagraphAiBegin>(gatewayUri.fsPath, {
+                method: 'begin',
+                path: relativePath,
+                holder: `e2e-paragraph-ai-${request.nonce}`,
+            });
+            assert(begin.content === seed,
+                'AI paragraph transaction did not begin from the shared common base');
+            assert(aiCandidate.includes(oldParagraphA) && !aiCandidate.includes(userParagraphA),
+                'AI paragraph candidate unexpectedly observed the later user edit');
+            assert(userCandidate.includes(oldParagraphB) && !userCandidate.includes(aiParagraphB),
+                'User paragraph candidate unexpectedly contains the later AI edit');
+
+            const paragraphAOffset = document.getText().indexOf(oldParagraphA);
+            assert(paragraphAOffset >= 0, 'User paragraph A is absent from the common base');
+            const userApplied = await editor.edit(builder => {
+                builder.replace(
+                    new vscode.Range(
+                        document.positionAt(paragraphAOffset),
+                        document.positionAt(paragraphAOffset + oldParagraphA.length),
+                    ),
+                    userParagraphA,
+                );
+            }, {
+                undoStopBefore: true,
+                undoStopAfter: true,
+            });
+            assert(userApplied && document.getText() === userCandidate,
+                'VS Code did not create the independent paragraph A candidate');
+
+            let aiCommitJournaled = false;
+            try {
+                const committed = await sendAiGatewayRequest<ParagraphAiCommit>(gatewayUri.fsPath, {
+                    method: 'commit',
+                    path: relativePath,
+                    leaseId: begin.leaseId,
+                    fencingToken: begin.fencingToken,
+                    content: aiCandidate,
+                });
+                assert(committed.journaled, 'AI paragraph B commit was not journaled');
+                aiCommitJournaled = true;
+            } finally {
+                if (!aiCommitJournaled) {
+                    await sendAiGatewayRequest(gatewayUri.fsPath, {
+                        method: 'abort',
+                        path: relativePath,
+                        leaseId: begin.leaseId,
+                        fencingToken: begin.fencingToken,
+                    }).catch(() => {});
+                }
+            }
+
+            await waitForAsync(async () => {
+                const [local, state] = await Promise.all([
+                    readLocalBytes(localUri),
+                    replicaStateStore!.reload(),
+                ]);
+                const runtime = LocalReplicaSCMProvider.getRuntimeStatus(localRoot!.fsPath);
+                return local !== undefined
+                    && document.getText() === expected
+                    && Buffer.from(local).toString('utf8') === expected
+                    && state.entries[relativePath]?.text === expected
+                    && state.entries[relativePath]?.hash === expectedHash
+                    && !state.pendingAction
+                    && !state.conflicts[relativePath]
+                    && runtime?.settled === true
+                    && runtime.textIsolationEvents === isolationEvents
+                    && runtime.projectPauseEvents === pauseEvents;
+            }, 60000, 'converge and persist disjoint user and AI paragraphs', 250);
+
+            const remote = await freshDocument(
+                server.server.url,
+                api!,
+                identity!,
+                projectId!,
+                runFolderId!,
+                fileName,
+            );
+            assert(remote?.entityId === streamingDocumentId,
+                'Disjoint-paragraph verification observed a replacement document');
+            assert(remote.content === expected,
+                'Overleaf did not retain both disjoint paragraph edits');
+            const local = await readLocalBytes(localUri);
+            const disk = local === undefined ? undefined : Buffer.from(local).toString('utf8');
+            assert(document.getText() === expected && disk === expected,
+                'Editor and disk did not retain both disjoint paragraph edits');
+            const runtimeAfterParagraphs = LocalReplicaSCMProvider.getRuntimeStatus(
+                localRoot!.fsPath,
+            );
+            assert(runtimeAfterParagraphs,
+                'Disjoint-paragraph test lost the Local Replica runtime after convergence');
+            assert(
+                runtimeAfterParagraphs.textIsolationEvents === isolationEvents
+                && runtimeAfterParagraphs.projectPauseEvents === pauseEvents,
+                'Disjoint paragraph edits caused text isolation or a project pause',
+            );
+            assert(
+                countExactOccurrences(expected, userParagraphA) === 1
+                && countExactOccurrences(expected, aiParagraphB) === 1
+                && !expected.includes(oldParagraphA)
+                && !expected.includes(oldParagraphB),
+                'Expected disjoint paragraph composition is malformed',
+            );
+            evidence.disjointParagraphEdits = {
+                path: relativePath,
+                commonBaseSha256: seedHash,
+                expectedSha256: expectedHash,
+                finalRevision: remote.revision,
+                aiBeganBeforeUserEdit: true,
+                candidatesSharedBase: true,
+                aiCommitJournaled,
+                convergedBeforeExplicitSave: true,
+                editorEqualsDisk: document.getText() === disk,
+                diskEqualsRemote: disk === remote.content,
+                userParagraphOccurrences: countExactOccurrences(remote.content, userParagraphA),
+                aiParagraphOccurrences: countExactOccurrences(remote.content, aiParagraphB),
+                textIsolationEvents: runtimeAfterParagraphs.textIsolationEvents - isolationEvents,
+                projectPauseEvents: runtimeAfterParagraphs.projectPauseEvents - pauseEvents,
+            };
+            await saveDocument(document,
+                'Could not clean the converged disjoint-paragraph editor');
         });
 
         await step('Local Replica watcher uploads SVG and stable binary resources', async () => {

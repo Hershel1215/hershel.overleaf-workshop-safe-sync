@@ -130,7 +130,7 @@ describe('safe-sync E2E runner lifecycle', () => {
     });
 
     it('records an explicit result schema and extension build identity', () => {
-        assert.strictEqual(runner.E2E_RESULT_SCHEMA_VERSION, 12);
+        assert.strictEqual(runner.E2E_RESULT_SCHEMA_VERSION, 13);
         assert.strictEqual(identity.extensionId, 'hershel.overleaf-workshop-safe-sync');
         assert.strictEqual(identity.extensionVersion, manifest.version);
         assert.strictEqual(identity.buildId, manifest.hershelBuildId);

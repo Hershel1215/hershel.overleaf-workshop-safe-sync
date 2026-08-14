@@ -3337,6 +3337,12 @@ export class VirtualFileSystem extends vscode.Disposable {
         return reclaimed;
     }
 
+    /** Run the normal pressure-safe retention policy from a serialized maintenance caller. */
+    async reclaimRetainedRemoteTransactionsUnderPressure(): Promise<boolean> {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        return this.reclaimRetainedRemoteTransactions(identity);
+    }
+
     private async openRetainedRemoteTransaction(
         identity: Identity,
         kindFolder: FolderEntity,

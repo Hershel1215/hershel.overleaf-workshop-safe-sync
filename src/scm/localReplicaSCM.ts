@@ -453,6 +453,34 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         });
     }
 
+    public static reclaimE2ERetainedRemoteTransactions(
+        basePath: string,
+        expectedProjectId: string,
+    ): Promise<boolean> {
+        const instance = LocalReplicaSCMProvider.activeInstances.get(path.resolve(basePath));
+        if (!instance) {
+            return Promise.reject(
+                new Error(`No active Local Replica runtime for ${path.resolve(basePath)}`),
+            );
+        }
+        if (
+            instance.vfs.projectId !== expectedProjectId
+            || instance.vfs.projectName !== 'hershel-safe-sync-e2e'
+        ) {
+            return Promise.reject(
+                new Error('Refusing retained-transaction reclamation outside the approved E2E project'),
+            );
+        }
+        return instance.reconcileQueue.run(async () => {
+            instance.activeReconcileCount++;
+            try {
+                return await instance.vfs.reclaimRetainedRemoteTransactionsUnderPressure();
+            } finally {
+                instance.activeReconcileCount--;
+            }
+        });
+    }
+
     public static resolveE2EConflictUsingRemote(
         basePath: string,
         filePath: string,
