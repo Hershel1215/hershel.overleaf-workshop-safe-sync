@@ -33,6 +33,45 @@ class FakeSocket extends EventEmitter {
     disconnect() {}
 }
 
+class ReconnectingManager extends EventEmitter {
+    constructor() {
+        super();
+        this.options = {reconnect: true};
+        this.connected = false;
+        this.connecting = false;
+        this.reconnecting = true;
+        this.disconnectCalls = 0;
+        this.transportCloseCalls = 0;
+        this.transportClearCalls = 0;
+        this.reconnectionTimer = setTimeout(() => {}, 60000);
+        this.connectTimeoutTimer = setTimeout(() => {}, 60000);
+        this.heartbeatTimeoutTimer = setTimeout(() => {}, 60000);
+        this.transport = {
+            close: () => { this.transportCloseCalls++; },
+            clearTimeouts: () => { this.transportClearCalls++; },
+        };
+        this.namespaces = {};
+    }
+
+    disconnect() {
+        // socket.io-client 0.9 disconnect() is a no-op in this state even
+        // though its reconnection timer remains live.
+        this.disconnectCalls++;
+    }
+}
+
+class ReconnectingNamespace extends EventEmitter {
+    constructor(manager) {
+        super();
+        this.socket = manager;
+        manager.namespaces[''] = this;
+    }
+
+    disconnect() {
+        this.socket.disconnect();
+    }
+}
+
 class ControlledMembershipSocket extends EventEmitter {
     constructor() {
         super();
@@ -245,6 +284,27 @@ describe('SocketIOAPI instance identity isolation', () => {
         assert.deepStrictEqual(updates, []);
         assert.deepStrictEqual(sources, []);
         assert.strictEqual(client.sourceId, undefined);
+    });
+
+    it('permanently cancels a reconnecting socket.io 0.9 manager', () => {
+        const SocketIOAPI = loadSocketApi();
+        const manager = new ReconnectingManager();
+        const namespace = new ReconnectingNamespace(manager);
+        const api = {_initSocketV0: () => namespace};
+        const client = new SocketIOAPI('http://example.test', api, {}, 'project');
+
+        client.retire();
+
+        assert.strictEqual(manager.options.reconnect, false);
+        assert.strictEqual(manager.reconnecting, false);
+        assert.strictEqual(manager.reconnectionTimer, undefined);
+        assert.strictEqual(manager.connectTimeoutTimer, undefined);
+        assert.strictEqual(manager.heartbeatTimeoutTimer, undefined);
+        assert.strictEqual(manager.transportCloseCalls, 1);
+        assert.strictEqual(manager.transportClearCalls, 1);
+        assert.deepStrictEqual(manager.eventNames(), []);
+        assert.deepStrictEqual(namespace.eventNames(), []);
+        assert.deepStrictEqual(manager.namespaces, {});
     });
 
     it('names a rebuild rather than reporting a membership refusal as a 0 ms timeout', async () => {

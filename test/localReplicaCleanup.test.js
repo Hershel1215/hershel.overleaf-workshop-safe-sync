@@ -28,7 +28,7 @@ class MockDocumentRecoveryIsolationError extends Error {
     }
 }
 
-function loadProvider(vscodeOverride) {
+function loadProvider(vscodeOverride, moduleOverrides = {}) {
     const originalLoad = Module._load;
     Module._load = function(request) {
         if (request === 'vscode') {
@@ -43,6 +43,9 @@ function loadProvider(vscodeOverride) {
                     }),
                 },
             };
+        }
+        if (Object.prototype.hasOwnProperty.call(moduleOverrides, request)) {
+            return moduleOverrides[request];
         }
         if (request === '../core/remoteFileSystemProvider') {
             return {
@@ -1409,6 +1412,39 @@ describe('Local Replica AI scheduling', () => {
 });
 
 describe('Local Replica extension-host ownership handoff', () => {
+    it('gives one live owner the full handoff drain window', async () => {
+        class MockReplicaLockedError extends Error {}
+        let lockAttempts = 0;
+        let requestTimeout;
+        const acquired = {release: async () => {}};
+        const LocalReplicaSCMProvider = loadProvider(undefined, {
+            '../sync/replicaLock': {
+                ReplicaLockedError: MockReplicaLockedError,
+                ReplicaLock: {
+                    acquire: async () => {
+                        if (lockAttempts++ === 0) {
+                            throw new MockReplicaLockedError('owned');
+                        }
+                        return acquired;
+                    },
+                },
+            },
+            '../sync/aiGateway': {
+                AiGatewayServer: class AiGatewayServer {},
+                sendAiGatewayRequest: async (_path, _request, timeout) => {
+                    requestTimeout = timeout;
+                    return {closing: true};
+                },
+            },
+        });
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        provider.context = {globalStorageUri: {fsPath: '/tmp/hershel-handoff-state'}};
+        provider.baseUri = {fsPath: '/tmp/hershel-handoff-fixture'};
+
+        assert.strictEqual(await provider.acquireReplicaLock(), acquired);
+        assert(requestTimeout > 29000, `handoff timeout was only ${requestTimeout} ms`);
+    });
+
     it('durably flushes but retains ownership until the old window really closes', async () => {
         const commands = [];
         let saveCount = 0;

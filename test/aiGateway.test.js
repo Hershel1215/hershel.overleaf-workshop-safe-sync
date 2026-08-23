@@ -52,6 +52,26 @@ describe('AI gateway transport', () => {
         assert.deepStrictEqual(response, { delayed: true });
     });
 
+    it('identifies a timed-out handoff by its replica path', async () => {
+        const metadataPath = path.join(directory, 'gateway.json');
+        server = new AiGatewayServer(metadataPath, {
+            handle: async () => {
+                await new Promise(resolve => setTimeout(resolve, 50));
+                return { delayed: true };
+            },
+        }, path.join(directory, 'gateway.sock'));
+        await server.start();
+
+        await assert.rejects(
+            () => sendAiGatewayRequest(metadataPath, {
+                method: 'handoff',
+                replicaPath: '/tmp/hershel-replica',
+            }, 5),
+            /handoff request timed out for \/tmp\/hershel-replica/,
+        );
+        await new Promise(resolve => setTimeout(resolve, 60));
+    });
+
     it('preserves successor metadata and lets a handoff handler stop without deadlocking', async () => {
         const metadataPath = path.join(directory, 'gateway.json');
         server = new AiGatewayServer(metadataPath, {

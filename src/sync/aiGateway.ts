@@ -194,7 +194,8 @@ export async function sendAiGatewayRequest<T>(
         const timer = setTimeout(() => {
             socket.destroy();
             reject(new Error(
-                `AI gateway ${request.method} request timed out for ${String(request.path ?? 'unknown path')}`,
+                `AI gateway ${request.method} request timed out for `
+                + `${String(request.path ?? request.replicaPath ?? 'unknown path')}`,
             ));
         }, timeoutMs);
         const finish = (error?: Error, value?: T) => {

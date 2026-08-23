@@ -2889,7 +2889,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             method: 'handoff',
                             replicaPath: path.resolve(this.baseUri.fsPath),
                             requesterPid: process.pid,
-                        }, 2000);
+                        }, Math.max(1, handoffDeadline - Date.now()));
                     } catch (handoffError) {
                         latestError = handoffError;
                         const message = handoffError instanceof Error

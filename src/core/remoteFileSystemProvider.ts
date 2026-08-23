@@ -382,8 +382,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             // dispose all triggers of scmCollection
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
-            // disconnect socketio
-            // this.socket.disconnect();
+            this.socket.retire();
             this.resetDocumentSessions();
             this.documentProjectionListeners.clear();
         });
@@ -3847,7 +3846,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 return await observer.joinProject(this.projectId);
             }
         } finally {
-            observer.disconnect();
+            observer.retire();
         }
     }
 

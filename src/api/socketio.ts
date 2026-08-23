@@ -146,24 +146,8 @@ export class SocketIOAPI {
     init() {
         this._publicId = undefined;
 
-        // CRITICAL: Properly disconnect old socket before creating a new one.
-        // Without this, the old TCP connection is abandoned but still alive. When the
-        // server later sends data on it (out-of-order/late packets), the OS TCP stack
-        // responds with RST, which can cause the server to drop ALL connections from
-        // this client — explaining the "connection lost" loop reported in issue #309.
         if (this.socket) {
-            try {
-                // Remove all listeners to prevent stale event handlers from firing
-                if (typeof this.socket.removeAllListeners === 'function') {
-                    this.socket.removeAllListeners();
-                }
-                // Gracefully close the connection (sends FIN, not RST)
-                if (typeof this.socket.disconnect === 'function') {
-                    this.socket.disconnect();
-                }
-            } catch {
-                // Best-effort cleanup; socket may already be in a bad state
-            }
+            this.permanentlyRetireSocket(this.socket);
         }
 
         // connect
@@ -257,9 +241,7 @@ export class SocketIOAPI {
             // Disable auto-reconnect on this socket: the server explicitly rejected
             // our connection parameters. Reconnecting would just get rejected again,
             // creating unnecessary TCP connection churn (and RST packets).
-            if (this.socket.io && typeof this.socket.io.reconnect === 'function') {
-                this.socket.io.reconnect(false);
-            }
+            this.disableAutomaticReconnect(this.socket);
         });
         this.socket.on('error', (err:any) => {
             // Log error instead of throwing to avoid crashing the extension
@@ -282,14 +264,76 @@ export class SocketIOAPI {
     }
 
     disconnect() {
-        this.socket.disconnect();
+        this.socket?.disconnect();
     }
 
     /** Permanently retire this client without allowing late handlers to run. */
     retire() {
         this._handlers = [];
-        this.socket.removeAllListeners?.();
-        this.socket.disconnect();
+        if (this.socket) {
+            this.permanentlyRetireSocket(this.socket);
+            this.socket = undefined;
+        }
+    }
+
+    /**
+     * socket.io-client 0.9 returns a namespace whose transport manager lives
+     * at `.socket`. Namespace.disconnect() is a no-op while the manager is
+     * between reconnect attempts, so permanent retirement must cancel the
+     * manager timers and close its transport explicitly.
+     */
+    private permanentlyRetireSocket(socket: any): void {
+        const manager = this.socketManager(socket);
+        this.disableAutomaticReconnect(socket);
+        const wasActive = manager?.connected || manager?.connecting || manager?.open;
+        socket.removeAllListeners?.();
+        try {
+            socket.disconnect?.();
+        } catch {
+            // Continue with direct manager cleanup below.
+        }
+        if (manager) {
+            this.clearManagerTimer(manager, 'connectTimeoutTimer');
+            this.clearManagerTimer(manager, 'heartbeatTimeoutTimer');
+            manager.transport?.clearTimeouts?.();
+            if (!wasActive) {
+                try {
+                    manager.transport?.close?.();
+                } catch {
+                    // A failed transport can already be closed.
+                }
+            }
+            manager.connected = false;
+            manager.connecting = false;
+            manager.open = false;
+            manager.removeAllListeners?.();
+            if (manager.namespaces) {
+                manager.namespaces = {};
+            }
+        }
+    }
+
+    private disableAutomaticReconnect(socket: any): void {
+        const manager = this.socketManager(socket);
+        if (!manager) {
+            return;
+        }
+        if (manager.options) {
+            manager.options.reconnect = false;
+        }
+        manager.reconnecting = false;
+        this.clearManagerTimer(manager, 'reconnectionTimer');
+    }
+
+    private socketManager(socket: any): any | undefined {
+        return socket?.socket ?? socket?.io;
+    }
+
+    private clearManagerTimer(manager: any, name: string): void {
+        if (manager[name]) {
+            clearTimeout(manager[name]);
+            delete manager[name];
+        }
     }
 
     get handlers() {
