@@ -2,8 +2,8 @@
   "name": "overleaf-workshop-safe-sync",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "1.0.0-hershel.192",
-  "hershelBuildId": "20260823T074752Z-safe-sync-v2-rc192",
+  "version": "1.0.0-hershel.193",
+  "hershelBuildId": "20260831T035539Z-safe-sync-v2-rc193",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -398,7 +398,7 @@
       },
       {
         "command": "hershel.overleaf-workshop-safe-sync.safeSync.runE2E",
-        "title": "Run Approved Safe Sync E2E",
+        "title": "Run Bound Safe Sync E2E",
         "category": "%extension.displayName%"
       },
       {

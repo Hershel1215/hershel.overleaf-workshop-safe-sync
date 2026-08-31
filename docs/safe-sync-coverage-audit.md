@@ -29,9 +29,8 @@ digest.
 
 ## Live E2E evidence
 
-The approved retained project is `hershel-safe-sync-e2e` on
-`10.10.5.4:8888`. The exact installed `.60` release build passed its final
-review run:
+The then-authorized retained project was `hershel-safe-sync-e2e`. The exact
+installed `.60` release build passed its final review run on its bound server:
 
 ```text
 nonce       rc60-review-20260802T0501Z

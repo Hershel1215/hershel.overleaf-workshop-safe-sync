@@ -80,10 +80,11 @@ keep both. Resolution moves artifacts to `resolved`; cleanup is explicit only.
 
 ## Capability and scope
 
-The current deployment `10.10.5.4:8888` is in the validated writable policy.
-Fallback/invisible connections and unadvertised servers are read-only. A future
-server can opt in with project feature `hershelSafeSyncProtocol=legacy-ot-v1`.
-Documents reporting another OT type are rejected.
+Any configured host and port is writable when its realtime connection exposes
+authoritative legacy OT acknowledgements. Fallback/invisible connections stay
+read-only. A server may explicitly advertise
+`hershelSafeSyncProtocol=legacy-ot-v1`; an incompatible advertised protocol and
+documents reporting another OT type are rejected.
 
 Presence, chat, comments, compilation, PDF preview, and other collaboration
 features retain their upstream paths. This rewrite changes content consistency,

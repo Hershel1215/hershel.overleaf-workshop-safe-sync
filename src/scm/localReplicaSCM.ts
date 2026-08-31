@@ -456,6 +456,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     public static reclaimE2ERetainedRemoteTransactions(
         basePath: string,
         expectedProjectId: string,
+        expectedProjectName: string,
     ): Promise<boolean> {
         const instance = LocalReplicaSCMProvider.activeInstances.get(path.resolve(basePath));
         if (!instance) {
@@ -465,7 +466,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         if (
             instance.vfs.projectId !== expectedProjectId
-            || instance.vfs.projectName !== 'hershel-safe-sync-e2e'
+            || instance.vfs.projectName !== expectedProjectName
+            || !/^hershel-safe-sync-e2e(?:[-_][a-zA-Z0-9_-]+)?$/.test(expectedProjectName)
         ) {
             return Promise.reject(
                 new Error('Refusing retained-transaction reclamation outside the approved E2E project'),

@@ -42,14 +42,17 @@ The unit suite covers:
 
 ## Remote E2E project
 
-Use the authorized retained project `hershel-safe-sync-e2e` on
-`10.10.5.4:8888`. Do not run mutation tests against a manuscript.
+Open a retained Local Replica whose project name is `hershel-safe-sync-e2e` or
+starts with `hershel-safe-sync-e2e-`. The server may use any host and port. Do
+not run mutation tests against a manuscript.
 
-The contributed **Run Approved Safe Sync E2E** command and the one-time
-`safe-sync-e2e.request.json` global-storage marker are hard-bound to that exact
-server and project. They read credentials only through VS Code SecretStorage,
-write a redacted `safe-sync-e2e.result.json`, isolate fixtures under a unique
-folder, remove those fixtures at the end, and retain the project itself.
+The contributed **Run Bound Safe Sync E2E** command derives the exact server,
+project name, and immutable project ID from the current Local Replica binding.
+Its one-time `safe-sync-e2e.request.json` marker is hard-bound to those derived
+values. It reads credentials only through VS Code SecretStorage, writes a
+redacted `safe-sync-e2e.result.json`, isolates fixtures under a unique folder,
+removes those fixtures at the end, and retains the project itself. It never
+creates, restores, or selects a project by a global hard-coded address.
 
 The executable remote suite verifies the exact loaded extension build before
 any mutation. It then exercises the production Local Replica watcher for

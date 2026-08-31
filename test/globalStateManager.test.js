@@ -42,15 +42,15 @@ describe('bound Local Replica authentication bootstrap', () => {
         };
 
         await GlobalStateManager.restoreBoundServer(context, {
-            uri: 'overleaf-workshop://10.10.5.4:8888/project?user%3Duser-1%26project%3Dproject-1',
-            serverName: '10.10.5.4:8888',
+            uri: 'overleaf-workshop://10.23.45.67:4567/project?user%3Duser-1%26project%3Dproject-1',
+            serverName: '10.23.45.67:4567',
         });
 
-        assert.strictEqual(persisted['10.10.5.4:8888'].url, 'http://10.10.5.4:8888/');
-        assert.strictEqual(persisted['10.10.5.4:8888'].login.userId, 'user-1');
+        assert.strictEqual(persisted['10.23.45.67:4567'].url, 'http://10.23.45.67:4567/');
+        assert.strictEqual(persisted['10.23.45.67:4567'].login.userId, 'user-1');
         assert(GlobalStateManager.initSocketIOAPI(
             context,
-            '10.10.5.4:8888',
+            '10.23.45.67:4567',
             'project-1',
         ));
     });
@@ -78,8 +78,8 @@ describe('bound Local Replica authentication bootstrap', () => {
         };
         await assert.rejects(
             () => GlobalStateManager.restoreBoundServer(context, {
-                uri: 'overleaf-workshop://10.10.5.4:8888/project?user%3Duser-1',
-                serverName: '10.10.5.4:8888',
+                uri: 'overleaf-workshop://10.23.45.67:4567/project?user%3Duser-1',
+                serverName: '10.23.45.67:4567',
                 serverUrl: 'https://example.invalid/',
             }),
             /server URL does not match its server name/,

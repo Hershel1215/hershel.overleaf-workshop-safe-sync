@@ -7,8 +7,8 @@ const { createLocalReplicaBinding, ensureLocalReplicaBinding } = require('../out
 describe('local replica binding', () => {
     let root;
     const binding = {
-        uri: 'overleaf-workshop://10.10.5.4:8888/test?user%3Duser-1%26project%3Dproject-1',
-        serverName: '10.10.5.4:8888',
+        uri: 'overleaf-workshop://10.23.45.67:4567/test?user%3Duser-1%26project%3Dproject-1',
+        serverName: '10.23.45.67:4567',
         enableCompileNPreview: false,
         projectName: 'test',
     };
@@ -43,7 +43,7 @@ describe('local replica binding', () => {
         await mkdir(path.join(root, '.overleaf'), { recursive: true });
         await writeFile(path.join(root, '.overleaf/settings.json'), JSON.stringify({
             ...binding,
-            uri: 'overleaf-workshop://10.10.5.4:8888/other?user%3Duser-1%26project%3Dproject-2',
+            uri: 'overleaf-workshop://10.23.45.67:4567/other?user%3Duser-1%26project%3Dproject-2',
         }));
 
         await assert.rejects(

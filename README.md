@@ -38,9 +38,10 @@ local synchronization fail closed.
   `.hershel-safe-sync`; that name and valid staging names are reserved locally.
 - Credentials are stored in VS Code SecretStorage, not ordinary global state.
 
-The writable capability is currently validated for `10.10.5.4:8888`. Other
-servers remain read-only unless they advertise `hershelSafeSyncProtocol` as
-`legacy-ot-v1`.
+Writable safe-sync is available on any configured host and port whose realtime
+connection exposes authoritative legacy OT acknowledgements. A fallback
+connection, or a server that explicitly advertises an incompatible protocol,
+remains read-only.
 
 See [safe-sync operations](./docs/safe-sync-operations.md),
 [v2 design](./docs/safe-sync-v2-design.md), and

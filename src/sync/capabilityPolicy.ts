@@ -16,18 +16,18 @@ export function evaluateSafeSyncCapability(
             reason: 'The fallback connection does not expose authoritative OT acknowledgements',
         };
     }
-    if (serverAuthority === '10.10.5.4:8888' || advertisedProtocol === 'legacy-ot-v1') {
+    if (advertisedProtocol !== undefined && advertisedProtocol !== 'legacy-ot-v1') {
         return {
-            writable: true,
-            protocol: 'legacy-ot-v1',
-            reason: serverAuthority === '10.10.5.4:8888'
-                ? 'Validated deployment policy for 10.10.5.4:8888'
-                : 'Server advertised hershelSafeSyncProtocol=legacy-ot-v1',
+            writable: false,
+            protocol: 'read-only',
+            reason: `Server advertised an incompatible safe-sync protocol: ${String(advertisedProtocol)}`,
         };
     }
     return {
-        writable: false,
-        protocol: 'read-only',
-        reason: 'This server has not advertised a compatible safe-sync OT protocol',
+        writable: true,
+        protocol: 'legacy-ot-v1',
+        reason: advertisedProtocol === 'legacy-ot-v1'
+            ? 'Server advertised hershelSafeSyncProtocol=legacy-ot-v1'
+            : `Realtime legacy OT acknowledgements are available at ${serverAuthority}`,
     };
 }

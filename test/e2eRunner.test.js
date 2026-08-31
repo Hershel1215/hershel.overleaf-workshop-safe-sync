@@ -101,9 +101,10 @@ describe('safe-sync E2E runner lifecycle', () => {
 
     function request(nonce = 'approved_123') {
         return {
-            schemaVersion: 2,
-            serverName: '10.10.5.4:8888',
-            projectName: 'hershel-safe-sync-e2e',
+            schemaVersion: 3,
+            serverName: '192.0.2.45:49152',
+            projectName: 'hershel-safe-sync-e2e-ci',
+            projectId: 'project-ci-123',
             nonce,
             expectedExtensionId: identity.extensionId,
             expectedExtensionVersion: identity.extensionVersion,
@@ -112,20 +113,56 @@ describe('safe-sync E2E runner lifecycle', () => {
         };
     }
 
-    it('accepts only the approved server, project, and nonce shape', () => {
+    it('accepts any safe server authority but only a dedicated E2E project', () => {
         const approved = request();
         assert.deepStrictEqual(runner.validateRequest(approved), approved);
-        assert.throws(
-            () => runner.validateRequest({...approved, serverName: 'example.com'}),
-            /unapproved server/,
-        );
+        for (const serverName of [
+            '0.0.0.0:12345',
+            '127.0.0.1:1',
+            '203.0.113.8:65535',
+            'overleaf.example.test:8443',
+            '[2001:db8::20]:9443',
+        ]) {
+            assert.doesNotThrow(() => runner.validateRequest({...approved, serverName}));
+        }
+        assert.throws(() => runner.validateRequest({
+            ...approved,
+            serverName: 'example.test:8443/another-path',
+        }), /server authority/);
         assert.throws(
             () => runner.validateRequest({...approved, projectName: 'manuscript'}),
-            /unapproved project/,
+            /dedicated E2E project/,
+        );
+        assert.throws(
+            () => runner.validateRequest({...approved, projectId: '../unsafe'}),
+            /project id/,
         );
         assert.throws(
             () => runner.validateRequest({...approved, nonce: '../unsafe'}),
             /Invalid E2E request nonce/,
+        );
+    });
+
+    it('derives the exact dynamic target from a dedicated Local Replica binding', () => {
+        const binding = {
+            uri: 'overleaf-workshop://203.0.113.40:61234/hershel-safe-sync-e2e-ci'
+                + '?user%3Duser-1%26project%3Dproject-ci-456',
+            serverName: '203.0.113.40:61234',
+            projectName: 'hershel-safe-sync-e2e-ci',
+            enableCompileNPreview: false,
+        };
+        assert.deepStrictEqual(runner.e2eTargetFromBinding(binding), {
+            serverName: '203.0.113.40:61234',
+            projectName: 'hershel-safe-sync-e2e-ci',
+            projectId: 'project-ci-456',
+        });
+        assert.throws(
+            () => runner.e2eTargetFromBinding({...binding, serverName: '203.0.113.41:61234'}),
+            /does not match its bound server/,
+        );
+        assert.throws(
+            () => runner.e2eTargetFromBinding({...binding, projectName: 'actual-manuscript'}),
+            /dedicated E2E project/,
         );
     });
 

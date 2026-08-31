@@ -25,7 +25,7 @@ export function createLocalReplicaBinding(
     };
 }
 
-function projectIdFromUri(uri: string): { serverName: string; projectId?: string } {
+export function projectIdFromUri(uri: string): { serverName: string; projectId?: string } {
     const parsed = new URL(uri);
     if (parsed.protocol !== 'overleaf-workshop:') {
         throw new Error(`Unsupported local replica URI scheme: ${parsed.protocol}`);

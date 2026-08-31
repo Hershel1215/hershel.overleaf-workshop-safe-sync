@@ -290,12 +290,12 @@ describe('Local Replica reconcile queue depth', () => {
 describe('Local Replica exclusive E2E cleanup', () => {
     const LocalReplicaSCMProvider = loadProvider();
 
-    it('reclaims retained transactions only for the approved E2E project', async () => {
+    it('reclaims retained transactions for any explicitly bound E2E project', async () => {
         const events = [];
         const basePath = '/tmp/hershel-cleanup-retention';
         const provider = createProvider(LocalReplicaSCMProvider, basePath, events);
         provider.vfs.projectId = 'e2e-project-id';
-        provider.vfs.projectName = 'hershel-safe-sync-e2e';
+        provider.vfs.projectName = 'hershel-safe-sync-e2e-ci';
         provider.vfs.reclaimRetainedRemoteTransactionsUnderPressure = async () => {
             events.push('retention-reclaimed');
             return true;
@@ -305,6 +305,7 @@ describe('Local Replica exclusive E2E cleanup', () => {
             await LocalReplicaSCMProvider.reclaimE2ERetainedRemoteTransactions(
                 basePath,
                 'e2e-project-id',
+                'hershel-safe-sync-e2e-ci',
             ),
             true,
         );
@@ -315,6 +316,7 @@ describe('Local Replica exclusive E2E cleanup', () => {
             LocalReplicaSCMProvider.reclaimE2ERetainedRemoteTransactions(
                 basePath,
                 'e2e-project-id',
+                'hershel-safe-sync-e2e-ci',
             ),
             /approved E2E project/,
         );

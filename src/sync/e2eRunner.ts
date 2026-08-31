@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'crypto';
 import { readFileSync, statSync } from 'fs';
 import { open, rm as removeDisk, writeFile as writeDiskFile } from 'fs/promises';
 import * as path from 'path';
-import { BaseAPI, Identity, ProjectPersist, ResponseSchema } from '../api/base';
+import { BaseAPI, Identity, ResponseSchema } from '../api/base';
 import { isSocketIOTimeout, SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
 import { ROOT_NAME } from '../consts';
@@ -13,22 +13,19 @@ import { DurableDocumentSession } from './durableDocumentSession';
 import { DocumentJournal } from './documentJournal';
 import { DocumentStateStore } from './documentStateStore';
 import { sendAiGatewayRequest } from './aiGateway';
-import { assertLocalReplicaBinding, LocalReplicaBinding } from './localBinding';
+import { assertLocalReplicaBinding, LocalReplicaBinding, projectIdFromUri } from './localBinding';
 import { DetachedDocumentRecovery, ReplicaStateStore } from './replicaStateStore';
 import { TextOperation } from './textOperation';
 import { OtClientState } from './otClientState';
 import { syncDirectoryDurably, writeFileDurably } from './durableFile';
 
-const APPROVED_SERVER = '10.10.5.4:8888';
-const APPROVED_PROJECT = 'hershel-safe-sync-e2e';
-const APPROVED_PROJECT_ID = '6a6b673cee2d179ed3303782';
 const REQUEST_FILE = 'safe-sync-e2e.request.json';
 const RUNNING_FILE = 'safe-sync-e2e.running.json';
 const RESULT_FILE = 'safe-sync-e2e.result.json';
 const RELOAD_FILE = 'safe-sync-e2e.reload.json';
 const RESTART_RECOVERY_FILE = 'safe-sync-e2e.restart-recovery.json';
-export const HANDOFF_TARGET_VERSION = '1.0.0-hershel.192';
-export const HANDOFF_TARGET_BUILD_ID = '20260823T074752Z-safe-sync-v2-rc192';
+export const HANDOFF_TARGET_VERSION = '1.0.0-hershel.193';
+export const HANDOFF_TARGET_BUILD_ID = '20260831T035539Z-safe-sync-v2-rc193';
 export const E2E_RESULT_SCHEMA_VERSION = 13;
 const BINARY_FIXTURE = Uint8Array.from(Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
@@ -36,9 +33,10 @@ const BINARY_FIXTURE = Uint8Array.from(Buffer.from(
 ));
 
 interface E2ERequest {
-    schemaVersion: 2;
-    serverName: typeof APPROVED_SERVER;
-    projectName: typeof APPROVED_PROJECT;
+    schemaVersion: 3;
+    serverName: string;
+    projectName: string;
+    projectId: string;
     nonce: string;
     expectedExtensionId: string;
     expectedExtensionVersion: string;
@@ -862,11 +860,76 @@ async function writeJsonAtomic(uri: vscode.Uri, value: unknown): Promise<void> {
     }
 }
 
+function validateServerAuthority(value: unknown): asserts value is string {
+    assert(
+        typeof value === 'string'
+        && value.length > 0
+        && value.length <= 512
+        && !/[\s/?#@]/.test(value),
+        'Invalid E2E server authority',
+    );
+    let parsed: URL;
+    try {
+        parsed = new URL(`http://${value}/`);
+    } catch {
+        throw new Error('Invalid E2E server authority');
+    }
+    assert(
+        parsed.hostname.length > 0
+        && parsed.username === ''
+        && parsed.password === ''
+        && parsed.pathname === '/'
+        && parsed.search === ''
+        && parsed.hash === ''
+        && parsed.port !== '0',
+        'Invalid E2E server authority',
+    );
+}
+
+function validateE2ETarget<T extends {
+    serverName?: unknown;
+    projectName?: unknown;
+    projectId?: unknown;
+}>(value: T): asserts value is T & {serverName: string; projectName: string; projectId: string} {
+    validateServerAuthority(value.serverName);
+    assert(
+        typeof value.projectName === 'string'
+        && /^hershel-safe-sync-e2e(?:[-_][a-zA-Z0-9_-]+)?$/.test(value.projectName),
+        'E2E request must target a dedicated E2E project',
+    );
+    assert(
+        typeof value.projectId === 'string'
+        && /^[a-zA-Z0-9_-]{1,128}$/.test(value.projectId),
+        'Invalid E2E project id',
+    );
+}
+
+export function e2eTargetFromBinding(value: unknown): {
+    serverName: string;
+    projectName: string;
+    projectId: string;
+} {
+    assert(value !== null && typeof value === 'object',
+        'E2E Local Replica binding is not an object');
+    const binding = value as Partial<LocalReplicaBinding>;
+    assert(typeof binding.uri === 'string' && typeof binding.serverName === 'string',
+        'E2E Local Replica binding is missing its URI or server');
+    const uriTarget = projectIdFromUri(binding.uri);
+    const target = {
+        serverName: binding.serverName,
+        projectName: binding.projectName,
+        projectId: uriTarget.projectId,
+    };
+    validateE2ETarget(target);
+    assert(uriTarget.serverName === target.serverName,
+        'E2E Local Replica URI does not match its bound server');
+    return target;
+}
+
 export function validateRequest(value: unknown): E2ERequest {
     const request = value as Partial<E2ERequest>;
-    assert(request?.schemaVersion === 2, 'Unsupported E2E request schema');
-    assert(request.serverName === APPROVED_SERVER, 'E2E request targets an unapproved server');
-    assert(request.projectName === APPROVED_PROJECT, 'E2E request targets an unapproved project');
+    assert(request?.schemaVersion === 3, 'Unsupported E2E request schema');
+    validateE2ETarget(request);
     assert(
         typeof request.nonce === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(request.nonce),
         'Invalid E2E request nonce',
@@ -1035,21 +1098,26 @@ export function assertExpectedBuild(
         'Loaded E2E runner digest does not match the approved E2E request');
 }
 
-async function workspaceTargetsApprovedReplica(): Promise<boolean> {
+async function currentWorkspaceE2ETarget(): Promise<{
+    serverName: string;
+    projectName: string;
+    projectId: string;
+}> {
     const folders = vscode.workspace.workspaceFolders;
-    if (folders?.length !== 1 || folders[0].uri.scheme !== 'file') {
-        return false;
-    }
+    assert(folders?.length === 1 && folders[0].uri.scheme === 'file',
+        'Run E2E from one dedicated Local Replica workspace');
+    const raw = await vscode.workspace.fs.readFile(
+        vscode.Uri.joinPath(folders[0].uri, '.overleaf/settings.json'),
+    );
+    return e2eTargetFromBinding(JSON.parse(Buffer.from(raw).toString('utf8')));
+}
+
+async function workspaceTargetsApprovedReplica(request: E2ERequest): Promise<boolean> {
     try {
-        const raw = await vscode.workspace.fs.readFile(
-            vscode.Uri.joinPath(folders[0].uri, '.overleaf/settings.json'),
-        );
-        const binding = JSON.parse(Buffer.from(raw).toString('utf8')) as Partial<LocalReplicaBinding>;
-        const uri = typeof binding.uri === 'string' ? new URL(binding.uri) : undefined;
-        return binding.serverName === APPROVED_SERVER
-            && binding.projectName === APPROVED_PROJECT
-            && uri?.protocol === 'overleaf-workshop:'
-            && uri.host === APPROVED_SERVER;
+        const target = await currentWorkspaceE2ETarget();
+        return target.serverName === request.serverName
+            && target.projectName === request.projectName
+            && target.projectId === request.projectId;
     } catch {
         return false;
     }
@@ -1065,11 +1133,24 @@ async function consumeApprovedReloadHandoff(
         return false;
     }
     const marker = value as Partial<E2EReloadMarker>;
+    const requestUri = vscode.Uri.joinPath(context.globalStorageUri, REQUEST_FILE);
+    const runningUri = vscode.Uri.joinPath(context.globalStorageUri, RUNNING_FILE);
+    const queued = await readJson<unknown>(requestUri);
+    const runningValue = await readJson<unknown>(runningUri);
+    let request: E2ERequest | undefined;
+    try {
+        request = queued === undefined
+            ? validateRunningMarker(runningValue).request
+            : validateRequest(queued);
+    } catch {
+        // The marker is refused below without mutating either request file.
+    }
     if (
         marker.schemaVersion !== 1
         || marker.targetExtensionVersion !== HANDOFF_TARGET_VERSION
         || marker.targetBuildId !== HANDOFF_TARGET_BUILD_ID
-        || !await workspaceTargetsApprovedReplica()
+        || !request
+        || !await workspaceTargetsApprovedReplica(request)
     ) {
         output.appendLine('[warn] Refused an invalid or out-of-scope E2E reload handoff.');
         return false;
@@ -1077,7 +1158,9 @@ async function consumeApprovedReloadHandoff(
     const root = vscode.workspace.workspaceFolders![0].uri;
     const raw = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, '.overleaf/settings.json'));
     const binding = JSON.parse(Buffer.from(raw).toString('utf8')) as LocalReplicaBinding;
-    assertLocalReplicaBinding(binding, APPROVED_SERVER, APPROVED_PROJECT_ID);
+    assertLocalReplicaBinding(binding, request.serverName, request.projectId);
+    assert(binding.projectName === request.projectName,
+        'E2E reload binding project name does not match its request');
     await vscode.workspace.fs.delete(markerUri);
     output.appendLine(
         `Reloading the approved E2E workspace to activate ${HANDOFF_TARGET_VERSION}`
@@ -1089,7 +1172,7 @@ async function consumeApprovedReloadHandoff(
 
 async function approvedLocalReplica(
     context: vscode.ExtensionContext,
-    projectId: string,
+    request: E2ERequest,
     preservedNamespace?: string,
 ): Promise<{root: vscode.Uri; stateStore: ReplicaStateStore}> {
     const folders = vscode.workspace.workspaceFolders;
@@ -1098,13 +1181,13 @@ async function approvedLocalReplica(
     const root = folders[0].uri;
     const raw = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, '.overleaf/settings.json'));
     const binding = JSON.parse(Buffer.from(raw).toString('utf8')) as LocalReplicaBinding;
-    assertLocalReplicaBinding(binding, APPROVED_SERVER, projectId);
-    assert(binding.projectName === APPROVED_PROJECT,
+    assertLocalReplicaBinding(binding, request.serverName, request.projectId);
+    assert(binding.projectName === request.projectName,
         'Local replica project name does not match the approved E2E project');
     const stateStore = new ReplicaStateStore(
         context.globalStorageUri.fsPath,
-        APPROVED_SERVER,
-        projectId,
+        request.serverName,
+        request.projectId,
         root.fsPath,
     );
     // The provider already names every condition it is still waiting on. Carry
@@ -1164,29 +1247,6 @@ async function approvedLocalReplica(
     return {root, stateStore};
 }
 
-async function selectProject(
-    context: vscode.ExtensionContext,
-    api: BaseAPI,
-    identity: Identity,
-): Promise<{projectId: string; project: ProjectPersist | undefined}> {
-    const projects = await GlobalStateManager.fetchServerProjects(context, api, APPROVED_SERVER);
-    let project = projects.find(item => item.name === APPROVED_PROJECT && !item.trashed);
-    if (!project) {
-        const trashed = projects.find(item => item.name === APPROVED_PROJECT && item.trashed);
-        if (trashed) {
-            const restored = await api.untrashProject(identity, trashed.id);
-            assert(restored.type === 'success', `Could not restore E2E project: ${restored.message ?? 'unknown error'}`);
-            project = {...trashed, trashed: false};
-        }
-    }
-    if (project) {
-        return {projectId: project.id, project};
-    }
-    const created = await api.newProject(identity, APPROVED_PROJECT, 'none');
-    assert(created.type === 'success' && created.message, `Could not create E2E project: ${created.message ?? 'unknown error'}`);
-    return {projectId: created.message, project: undefined};
-}
-
 async function runRemoteE2E(
     context: vscode.ExtensionContext,
     request: E2ERequest,
@@ -1196,7 +1256,7 @@ async function runRemoteE2E(
     const extension = buildE2EIdentity(context);
     const steps: E2EStep[] = [];
     const evidence: E2EEvidence = {};
-    let projectId: string | undefined;
+    let projectId: string | undefined = request.projectId;
     let runFolderId: string | undefined;
     let api: BaseAPI | undefined;
     let identity: Identity | undefined;
@@ -1438,22 +1498,28 @@ async function runRemoteE2E(
         });
         const server = await step('approved target and SecretStorage login', async () => {
             const match = GlobalStateManager.getServers(context)
-                .find(item => item.server.name === APPROVED_SERVER);
-            assert(match, `Server ${APPROVED_SERVER} is not configured`);
+                .find(item => item.server.name === request.serverName);
+            assert(match, `Server ${request.serverName} is not configured`);
             const url = new URL(match.server.url);
-            assert(url.hostname === '10.10.5.4' && url.port === '8888', 'Configured server URL is outside the approved target');
-            identity = await GlobalStateManager.authenticate(context, APPROVED_SERVER);
+            assert(url.host === request.serverName,
+                'Configured server URL does not match the requested E2E target');
+            identity = await GlobalStateManager.authenticate(context, request.serverName);
             api = match.api;
             serverUrl = match.server.url;
             return match;
         });
 
-        await step('create or reuse retained E2E project', async () => {
-            const selected = await selectProject(context, api!, identity!);
-            projectId = selected.projectId;
-            assert(/^[a-zA-Z0-9_-]+$/.test(projectId), 'Server returned an invalid project id');
-            assert(projectId === APPROVED_PROJECT_ID,
-                'The retained E2E project id differs from the approved target');
+        await step('verify retained E2E project binding', async () => {
+            const projects = await GlobalStateManager.fetchServerProjects(
+                context,
+                api!,
+                request.serverName,
+            );
+            const project = projects.find(item => item.id === request.projectId);
+            assert(project && !project.trashed,
+                'The bound E2E project is absent or trashed on the requested server');
+            assert(project.name === request.projectName,
+                'The bound E2E project name differs from the requested target');
         });
 
         await step('approved Local Replica binding and clean baseline', async () => {
@@ -1463,7 +1529,7 @@ async function runRemoteE2E(
                 : validateRestartRecoveryMarker(markerValue, request.nonce);
             const approved = await approvedLocalReplica(
                 context,
-                projectId!,
+                request,
                 restartRecoveryMarker?.namespace,
             );
             localRoot = approved.root;
@@ -1541,7 +1607,11 @@ async function runRemoteE2E(
                 );
             }
             const reclaimed = await LocalReplicaSCMProvider
-                .reclaimE2ERetainedRemoteTransactions(localRoot!.fsPath, projectId!);
+                .reclaimE2ERetainedRemoteTransactions(
+                    localRoot!.fsPath,
+                    projectId!,
+                    request.projectName,
+                );
             if (reclaimed) {
                 output.appendLine(
                     '[maintenance] reclaimed old safe-sync retention transactions for E2E capacity',
@@ -1563,7 +1633,8 @@ async function runRemoteE2E(
                 projectId!,
                 'join E2E project',
             );
-            assert(project.name === APPROVED_PROJECT, 'Joined project name does not match the approved target');
+            assert(project.name === request.projectName,
+                'Joined project name does not match the approved target');
             const root = project.rootFolder[0];
             assert(root?._id, 'E2E project has no root folder');
 
@@ -1837,7 +1908,7 @@ async function runRemoteE2E(
                 );
                 await new DocumentStateStore(
                     context,
-                    APPROVED_SERVER,
+                    request.serverName,
                     projectId!,
                 ).save(detachedLegacyDocumentId, detachedState.serialize());
 
@@ -5375,8 +5446,17 @@ async function runRequestedE2E(
         requestValue = marker.request;
         recovering = true;
     }
-    if (!await workspaceTargetsApprovedReplica()) {
-        output.appendLine('Approved E2E request left unclaimed: open the hershel-safe-sync-e2e Local Replica workspace.');
+    let validatedRequest: E2ERequest | undefined;
+    try {
+        validatedRequest = validateRequest(requestValue);
+    } catch {
+        // Claim malformed input below so execute() records a redacted failure.
+    }
+    if (validatedRequest && !await workspaceTargetsApprovedReplica(validatedRequest)) {
+        output.appendLine(
+            `E2E request left unclaimed: open Local Replica ${validatedRequest.projectName}`
+            + ` on ${validatedRequest.serverName}.`,
+        );
         return;
     }
 
@@ -5410,8 +5490,12 @@ async function runRequestedE2E(
         result = {
             schemaVersion: E2E_RESULT_SCHEMA_VERSION,
             status: 'failed',
-            serverName: APPROVED_SERVER,
-            projectName: APPROVED_PROJECT,
+            serverName: typeof request.serverName === 'string'
+                ? request.serverName.slice(0, 512)
+                : 'invalid-server',
+            projectName: typeof request.projectName === 'string'
+                ? request.projectName.slice(0, 512)
+                : 'invalid-project',
             nonce: typeof request.nonce === 'string' ? request.nonce : 'invalid-request',
             ...extension,
             startedAt: now,
@@ -5428,7 +5512,7 @@ async function runRequestedE2E(
         // The result is authoritative; a stale marker can be removed manually.
     }
     const summary = result.status === 'passed'
-        ? `Safe-sync E2E passed for ${APPROVED_PROJECT}.`
+        ? `Safe-sync E2E passed for ${result.projectName} on ${result.serverName}.`
         : `Safe-sync E2E failed: ${result.error ?? 'unknown error'}`;
     output.appendLine(summary);
     if (result.status === 'passed') {
@@ -5442,10 +5526,10 @@ export function registerSafeSyncE2E(context: vscode.ExtensionContext): vscode.Di
     const output = vscode.window.createOutputChannel('Hershel Safe Sync E2E');
     const command = vscode.commands.registerCommand(`${ROOT_NAME}.safeSync.runE2E`, async () => {
         const extension = buildE2EIdentity(context);
+        const target = await currentWorkspaceE2ETarget();
         const request: E2ERequest = {
-            schemaVersion: 2,
-            serverName: APPROVED_SERVER,
-            projectName: APPROVED_PROJECT,
+            schemaVersion: 3,
+            ...target,
             nonce: `${Date.now()}-${process.pid}`,
             expectedExtensionId: extension.extensionId,
             expectedExtensionVersion: extension.extensionVersion,
@@ -5455,7 +5539,8 @@ export function registerSafeSyncE2E(context: vscode.ExtensionContext): vscode.Di
         output.show(true);
         output.appendLine(
             `Starting approved safe-sync E2E with ${extension.extensionId}`
-            + `@${extension.extensionVersion} (${extension.buildId}).`,
+            + `@${extension.extensionVersion} (${extension.buildId}) for `
+            + `${target.projectName} on ${target.serverName}.`,
         );
         const requestUri = vscode.Uri.joinPath(context.globalStorageUri, REQUEST_FILE);
         const runningUri = vscode.Uri.joinPath(context.globalStorageUri, RUNNING_FILE);
