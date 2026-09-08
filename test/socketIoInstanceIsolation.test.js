@@ -134,6 +134,47 @@ class TimedOutProjectSocket extends EventEmitter {
 }
 
 describe('SocketIOAPI instance identity isolation', () => {
+    it('does not let an old project timeout invalidate a replacement socket', async () => {
+        const SocketIOAPI = loadSocketApi();
+        let rejectOld;
+        const old = new FakeSocket();
+        old.emit = (event, ...args) => {
+            if (event === 'joinProject') rejectOld = args.at(-1);
+        };
+        const next = new FakeSocket();
+        const sockets = [old, next];
+        const client = new SocketIOAPI('http://example.test', {
+            _initSocketV0: () => sockets.shift(),
+        }, {}, 'project');
+        const joining = client.joinProject('project');
+        client.init();
+        const timeout = new Error('old project timed out');
+        timeout.name = 'SocketIOTimeoutError';
+        rejectOld(timeout);
+        await assert.rejects(joining);
+        assert.strictEqual(client.needsReinit, false);
+        client.retire();
+    });
+
+    it('does not let an old document timeout invalidate a replacement socket', async () => {
+        const SocketIOAPI = loadSocketApi();
+        const old = new ControlledMembershipSocket();
+        const next = new ControlledMembershipSocket();
+        const sockets = [old, next];
+        const client = new SocketIOAPI('http://example.test', {
+            _initSocketV0: () => sockets.shift(),
+        }, {}, 'project');
+        const joining = client.joinDoc('doc');
+        await new Promise(resolve => setImmediate(resolve));
+        client.init();
+        const timeout = new Error('old document timed out');
+        timeout.name = 'SocketIOTimeoutError';
+        old.completeNextMembershipCall(timeout);
+        await assert.rejects(joining);
+        assert.strictEqual(client.needsReinit, false);
+        client.retire();
+    });
+
     it('invalidates a socket whose project acknowledgement timed out', async () => {
         const SocketIOAPI = loadSocketApi();
         const socket = new TimedOutProjectSocket();

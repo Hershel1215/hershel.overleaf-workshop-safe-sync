@@ -39,6 +39,13 @@ The unit suite covers:
 - project/document membership acknowledgement timeouts invalidate their socket
   generation before retry, while an explicit non-timeout rejection leaves the
   serialized membership queue usable.
+- reconnect callers share one attempt; repeated settings failures exhaust the
+  retry budget; old project/document timeouts cannot invalidate a replacement
+  socket. Transport tests execute the pinned Socket.IO library with delayed
+  HTTP responses and stale WebSocket messages, including the `not opened`
+  failure that used to occur during queue flushing.
+- a delayed editor callback for an already-journaled batch cannot be prepended
+  to the next typing batch, while a real undo back to that text still applies.
 
 ## Remote E2E project
 

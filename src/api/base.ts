@@ -262,14 +262,9 @@ export class BaseAPI {
     _initSocketV0(identity:Identity, query?:string) {
         const url = new URL(this.url).origin + (query ?? '');
         return (require('socket.io-client').connect as any)(url, {
-            // Enable auto-reconnect to avoid creating new TCP connections on transient failures.
-            // Creating new connections without proper teardown of old ones causes TCP RST packets
-            // when the server sends data on abandoned connections (see issue #309).
-            // Note: socket.io-client 0.9.x uses space-separated option names.
-            reconnect: true,
-            'reconnection delay': 1000,
-            'reconnection limit': 16000,
-            'max reconnection attempts': 10,
+            // VirtualFileSystem owns the bounded reconnect loop. A second
+            // reconnect loop here can revive a transport it already replaced.
+            reconnect: false,
             'force new connection': true,
             extraHeaders: {
                 'Origin': new URL(this.url).origin,

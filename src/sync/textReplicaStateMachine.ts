@@ -355,6 +355,11 @@ export class TextReplicaStateMachine {
             || this.isExpectedEditorProjection(content, observedAncestor)
             || content === this.editorContent
             || (content === this.canonicalContent && !this.input.hasBufferedInput)
+            // Let the queued path classify an old journaled observation;
+            // prepending it here would submit the completed batch again.
+            || (observedAncestor !== this.editorContent && (
+                content === this.canonicalContent || content === this.input.lastSubmittedTarget
+            ))
             || !this.input.tryUpdateTransition(observedAncestor, content)
         ) {
             return false;

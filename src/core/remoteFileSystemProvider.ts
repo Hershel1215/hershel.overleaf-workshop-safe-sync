@@ -308,15 +308,14 @@ export class VirtualFileSystem extends vscode.Disposable {
     private userId: string;
     private isDirty: boolean = true;
     private initializing?: Promise<ProjectEntity>;
+    private initializationError?: Error;
+    private lastConnectionError?: Error;
     private retirementPromise?: Promise<void>;
     private connectionReady = false;
     private retryConnection: number = 0;
-    private retryTimer?: NodeJS.Timeout;
     /** Whether a "Reconnecting..." notification is currently shown */
     private reconnectingNotification: boolean = false;
     private retiring = false;
-    /** Timestamp of last disconnect for debounce */
-    private lastDisconnectTime: number = 0;
     /** Whether event handlers have been registered on the current socket */
     private handlersRegistered: boolean = false;
     private outputBuildId?: string;
@@ -432,10 +431,6 @@ export class VirtualFileSystem extends vscode.Disposable {
         // Publish the terminal promise before disposing managers. Their dispose
         // callbacks can re-enter VFS retirement through the owning SCM.
         const retirement = Promise.resolve().then(async () => {
-            if (this.retryTimer) {
-                clearTimeout(this.retryTimer);
-                this.retryTimer = undefined;
-            }
             this.disposeRuntimeManagers();
             this.socket.retire();
             const results = await Promise.allSettled([
@@ -465,24 +460,29 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (this.retiring) {
             throw new Error('Remote project session is retiring for replica handoff');
         }
-        // A membership RPC that timed out invalidates the socket without
-        // disconnecting the project: root stays resolved and connectionReady
-        // stays true. Readiness that ignores the transport therefore answers
-        // "ready" forever on a socket that refuses every joinDoc, and callers
-        // that treat the refusal as transient retry against it indefinitely.
-        // An invalidated transport is not ready, and the reconnect it needs
-        // has to be a fresh attempt: an initializing promise that settled
-        // before the invalidation would resolve immediately and rebuild
-        // nothing.
+        // Readiness and retry ownership are separate: an invalid transport
+        // must not start a second initializer while the first is backing off.
         const transportInvalidated = this.socket.needsReinit;
         if (this.root && this.connectionReady && !transportInvalidated) {
             return Promise.resolve(this.root);
         }
 
-        if (!this.initializing || transportInvalidated) {
-            this.initializing = this.initializingPromise;
+        if (this.initializing) {
+            return this.initializing;
         }
-        return this.initializing;
+        if (this.initializationError) {
+            throw this.initializationError;
+        }
+        // Publish ownership before any synchronous socket event can re-enter.
+        const initializing = Promise.resolve().then(() => this.initializingPromise);
+        this.initializing = initializing;
+        try {
+            return await initializing;
+        } finally {
+            if (this.initializing === initializing) {
+                this.initializing = undefined;
+            }
+        }
     }
 
     private get initializingPromise(): Promise<ProjectEntity> {
@@ -493,28 +493,31 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         // if retry connection exhausted, show error
         if (this.retryConnection >= MAX_RETRIES) {
-            this.retryConnection = 0;
-            this.initializing = undefined;
-            this.reconnectingNotification = false;
+            const error = this.lastConnectionError ?? new Error(vscode.l10n.t('Connection lost'));
+            this.initializationError = error;
             vscode.window.showErrorMessage(
                 vscode.l10n.t('Connection lost: {serverName}', {serverName:this.serverName}),
                 vscode.l10n.t('Reload'),
                 vscode.l10n.t('Retry'),
-            ).then((choice) => {
+            ).then(async (choice) => {
                 if (this.retiring) {
                     return;
                 }
                 if (choice === vscode.l10n.t('Reload')) {
                     vscode.commands.executeCommand("workbench.action.reloadWindow");
                 } else if (choice === vscode.l10n.t('Retry')) {
+                    await this.initializing?.catch(() => {});
+                    if (this.retiring) {
+                        return;
+                    }
                     this.retryConnection = 0;
-                    this.handlersRegistered = false;
+                    this.initializationError = undefined;
+                    this.lastConnectionError = undefined;
                     this.socket.init(); // Recreate socket after all auto-reconnect attempts exhausted
-                    this.initializing = this.initializingPromise;
-                    this.init().catch(() => {});
+                    await this.init().catch(() => {});
                 }
             });
-            throw new Error( vscode.l10n.t('Connection lost') );
+            throw error;
         }
 
         // exponential backoff delay: 1s, 2s, 4s, 8s, 16s
@@ -528,18 +531,11 @@ export class VirtualFileSystem extends vscode.Disposable {
                 title: vscode.l10n.t('Reconnecting to {serverName}...', {serverName:this.serverName}),
                 cancellable: false,
             }, async () => {
-                // Keep the notification visible while reconnecting
-                await new Promise<void>((resolve) => {
-                    const check = () => {
-                        if (this.retiring || this.root || this.retryConnection >= MAX_RETRIES) {
-                            this.reconnectingNotification = false;
-                            resolve();
-                        } else {
-                            setTimeout(check, 500);
-                        }
-                    };
-                    check();
-                });
+                try {
+                    await this.initializing?.catch(() => {});
+                } finally {
+                    this.reconnectingNotification = false;
+                }
             });
         }
 
@@ -555,13 +551,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                 throw new Error('Remote project session is retiring for replica handoff');
             }
 
-            // Only recreate the socket when the connection scheme has changed
-            // (e.g., v1→v2 after connectionRejected). For transient disconnects,
-            // socket.io's built-in auto-reconnect handles re-establishing the TCP
-            // connection without creating a new one — avoiding TCP RST packets.
+            // One owner rebuilds a rejected, disconnected, or timed-out transport.
             if (this.socket.needsReinit) {
                 this.socket.init();
-                this.handlersRegistered = false;
             }
 
             // Register event handlers once on the current socket
@@ -574,18 +566,21 @@ export class VirtualFileSystem extends vscode.Disposable {
             try {
                 const project = await this.socket.joinProject(this.projectId);
                 this.assertNotRetiring();
-                // Reset retry counter on success
-                this.retryConnection = 0;
-                this.reconnectingNotification = false;
                 // fetch project settings
                 const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
                 this.assertNotRetiring();
                 const settings = await this.api.getProjectSettings(identity, this.projectId);
                 this.assertNotRetiring();
-                project.settings = settings.settings!;
+                if (!settings.settings) {
+                    throw new Error('Could not load Overleaf project settings; check the server login');
+                }
+                project.settings = settings.settings;
                 this.root = project;
                 await this.resumeDocumentSessionTransports();
                 this.assertNotRetiring();
+                if (this.socket.needsReinit) {
+                    throw new Error('Overleaf transport changed during project initialization');
+                }
                 this.connectionReady = true;
                 const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==URI_SCHEME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
                 // Register: [collaboration] ClientManager on Statusbar
@@ -606,13 +601,16 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
                 // trigger the first compile
                 vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
+                this.retryConnection = 0;
+                this.lastConnectionError = undefined;
                 return project;
-            } catch {
+            } catch (error) {
                 if (this.retiring) {
                     throw this.retirementError();
                 }
                 this.connectionReady = false;
                 this.root = undefined;
+                this.lastConnectionError = error instanceof Error ? error : new Error(String(error));
                 this.retryConnection += 1;
                 return this.initializingPromise;
             }
@@ -643,13 +641,6 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     toggleInvisibleMode() {
-        // Clear disconnect debounce to prevent false retry trigger during mode switch
-        this.lastDisconnectTime = 0;
-        this.handlersRegistered = false; // Will re-register on the new socket scheme
-        if (this.retryTimer) {
-            clearTimeout(this.retryTimer);
-            this.retryTimer = undefined;
-        }
         this.socket.toggleAlternativeConnectionScheme(this.origin.toString(), this.root);
         this.socket.disconnect(); // jump to `onDisconnected` handler
     }
@@ -790,47 +781,17 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.connectionReady = false;
                 this.suspendDocumentSessionTransports();
                 this.root = undefined;
-                // Debounce: ignore rapid disconnect/reconnect cycles (within 2 seconds)
-                const now = Date.now();
-                if (now - this.lastDisconnectTime < 2000 && !this.socket.needsReinit) {
-                    console.log("Disconnected: debounced (too soon since last disconnect)");
+                // The active initializer owns its retries, including a timeout
+                // emitted during backoff. Exhaustion stays stopped until Retry.
+                if (this.initializing || this.initializationError) {
                     return;
                 }
-                this.lastDisconnectTime = now;
-                // Clear any pending retry timer
-                if (this.retryTimer) {
-                    clearTimeout(this.retryTimer);
-                }
-                // Publish the reconnect promise immediately as a readiness
-                // barrier. Its retry counter supplies the 1s backoff, while
-                // document operations wait instead of opening a session on
-                // the disconnected socket or resolved old project promise.
                 this.retryConnection += 1;
-                const previousInitialization = this.initializing;
-                const reconnect = Promise.resolve(previousInitialization)
-                    .catch(() => undefined)
-                    .then(() => {
-                        if (this.retiring) {
-                            throw this.retirementError();
-                        }
-                        if (this.root && this.connectionReady && !this.socket.needsReinit) {
-                            return this.root;
-                        }
-                        return this.initializingPromise;
-                    });
-                this.initializing = reconnect;
-                void reconnect.catch(() => {});
+                void this.init().catch(() => {});
             },
             onConnectionAccepted: (publicId:string) => {
                 if (this.retiring) {
                     return;
-                }
-                this.retryConnection = 0;
-                this.reconnectingNotification = false;
-                this.lastDisconnectTime = 0;
-                if (this.retryTimer) {
-                    clearTimeout(this.retryTimer);
-                    this.retryTimer = undefined;
                 }
                 this.publicId = publicId;
             },

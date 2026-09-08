@@ -32,7 +32,7 @@ function loadVirtualFileSystem(authenticate, events) {
                     getConfiguration: () => ({get: (_key, fallback) => fallback}),
                 },
                 window: {
-                    showErrorMessage: async () => undefined,
+                    showErrorMessage: async () => { events.push('connection-error'); },
                     showWarningMessage: async () => undefined,
                     withProgress: async (_options, task) => task(),
                 },
@@ -134,6 +134,71 @@ function createVfs(VirtualFileSystem, options, events) {
 }
 
 describe('VirtualFileSystem retirement fence', () => {
+    it('shares one reconnect attempt while an invalidated transport is backing off', async () => {
+        const events = [];
+        const joining = deferred();
+        let joins = 0;
+        const VFS = loadVirtualFileSystem(async () => ({}), events);
+        const vfs = createVfs(VFS, {
+            joinProject: () => { joins++; return joining.promise; },
+            getProjectSettings: async () => ({settings: {}}),
+        }, events);
+        vfs.retryConnection = 1;
+        vfs.socket.needsReinit = true;
+        vfs.socket.init = () => { vfs.socket.needsReinit = false; };
+        vfs.socket.updateEventHandlers = () => {};
+        const attempts = Array.from({length: 8}, () => vfs.init());
+        await new Promise(resolve => setTimeout(resolve, 1100));
+        joining.resolve({});
+        await Promise.all(attempts);
+        assert.strictEqual(joins, 1, 'parallel callers started independent reconnect loops');
+    });
+
+    it('stops after the retry budget when project settings keep failing', async () => {
+        const events = [];
+        const VFS = loadVirtualFileSystem(async () => ({}), events);
+        let joins = 0;
+        const vfs = createVfs(VFS, {
+            joinProject: async () => { joins++; return {}; },
+            getProjectSettings: async () => {
+                // Bound the broken implementation so the regression cannot hang.
+                if (joins > 7) vfs.retiring = true;
+                throw new Error('settings transport unavailable');
+            },
+        }, events);
+        const realSetTimeout = global.setTimeout;
+        global.setTimeout = (fn, _ms, ...args) => realSetTimeout(fn, 0, ...args);
+        try {
+            await assert.rejects(vfs.init());
+            const attempts = joins;
+            await assert.rejects(vfs.init());
+            assert.strictEqual(attempts, 5, 'partial join success reset the retry budget');
+            assert.strictEqual(joins, attempts, 'a later observer restarted exhausted retries');
+            assert.strictEqual(events.filter(e => e === 'connection-error').length, 1);
+        } finally {
+            global.setTimeout = realSetTimeout;
+        }
+    });
+
+    it('does not append another remote watcher when rebuilding a socket', async () => {
+        const events = [];
+        const VFS = loadVirtualFileSystem(async () => ({}), events);
+        const vfs = createVfs(VFS, {
+            joinProject: async () => ({}),
+            getProjectSettings: async () => ({settings: {}}),
+        }, events);
+        vfs.handlersRegistered = false;
+        let watchers = 0;
+        vfs.socket.updateEventHandlers = () => { watchers++; };
+        vfs.socket.init = () => { vfs.socket.needsReinit = false; };
+        await vfs.init();
+        for (let i = 0; i < 4; i++) {
+            vfs.socket.needsReinit = true;
+            await vfs.init();
+        }
+        assert.strictEqual(watchers, 1, 'SocketIOAPI already reattaches its registered handlers');
+    });
+
     it('publishes one monotonic retirement before manager disposal can re-enter it', async () => {
         const events = [];
         const VirtualFileSystem = loadVirtualFileSystem(async () => ({}), events);
@@ -168,6 +233,7 @@ describe('VirtualFileSystem retirement fence', () => {
         }, events);
 
         const initialization = vfs.init();
+        await nextTurn(); // Enter joinProject before testing in-flight retirement.
         let retirementSettled = false;
         const retirement = vfs.retireForReplicaHandoff().then(() => {
             retirementSettled = true;

@@ -134,6 +134,8 @@ export class SocketIOAPI {
     private transportInvalidated = false;
     /** Whether the current socket generation already told handlers it went away. */
     private disconnectAnnounced = false;
+    private generation = 0;
+    private retired = false;
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -144,6 +146,10 @@ export class SocketIOAPI {
     }
 
     init() {
+        if (this.retired) {
+            throw new Error('Socket.IO client is permanently retired');
+        }
+        const generation = ++this.generation;
         this._publicId = undefined;
 
         if (this.socket) {
@@ -167,8 +173,9 @@ export class SocketIOAPI {
         }
         this.transportInvalidated = false;
         this.disconnectAnnounced = false;
+        const socket = this.socket;
         // create emit
-        (this.socket.emit)[require('util').promisify.custom] = (event:string, ...args:any[]) => {
+        (socket.emit)[require('util').promisify.custom] = (event:string, ...args:any[]) => {
             return new Promise((resolve, reject) => {
                 let settled = false;
                 const timer = setTimeout(() => {
@@ -176,13 +183,15 @@ export class SocketIOAPI {
                     reject(new SocketIOTimeoutError(event, SOCKET_EVENT_TIMEOUT_MS));
                 }, SOCKET_EVENT_TIMEOUT_MS);
                 try {
-                    this.socket.emit(event, ...args, (err:any, ...data:any[]) => {
+                    socket.emit(event, ...args, (err:any, ...data:any[]) => {
                         if (settled) {
                             return;
                         }
                         settled = true;
                         clearTimeout(timer);
-                        if (err) {
+                        if (generation !== this.generation || this.retired) {
+                            reject(new TransportInvalidatedError(event));
+                        } else if (err) {
                             reject(err);
                         } else {
                             resolve(data);
@@ -224,6 +233,7 @@ export class SocketIOAPI {
             // Registered before any caller handler, so a real transport
             // disconnect is always recorded before the fallback below can run.
             this.disconnectAnnounced = true;
+            this.transportInvalidated = true;
         });
         this.socket.on('connect_failed', () => {
             console.log('SocketIOAPI: connect_failed');
@@ -269,6 +279,8 @@ export class SocketIOAPI {
 
     /** Permanently retire this client without allowing late handlers to run. */
     retire() {
+        this.retired = true;
+        this._publicId = undefined;
         this._handlers = [];
         if (this.socket) {
             this.permanentlyRetireSocket(this.socket);
@@ -284,6 +296,20 @@ export class SocketIOAPI {
      */
     private permanentlyRetireSocket(socket: any): void {
         const manager = this.socketManager(socket);
+        if (manager?.destroyed) {
+            return;
+        }
+        if (manager) {
+            // The pinned transport patch checks this before late HTTP/WS callbacks.
+            manager.destroyed = true;
+            const handshake = manager.handshakeRequest;
+            manager.handshakeRequest = undefined;
+            try {
+                handshake?.abort();
+            } catch {
+                // Complete transport cleanup even if the HTTP request is already closed.
+            }
+        }
         this.disableAutomaticReconnect(socket);
         const wasActive = manager?.connected || manager?.connecting || manager?.open;
         socket.removeAllListeners?.();
@@ -464,8 +490,15 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async joinProject(project_id:string): Promise<ProjectEntity> {
+        const generation = this.generation;
+        const socket = this.socket;
+        if (this.retired) {
+            throw new Error('Socket.IO client is permanently retired');
+        }
+        let timeout: NodeJS.Timeout;
+        let onRejected: ((err: any) => void) | undefined;
         const timeoutPromise: Promise<ProjectEntity> = new Promise((_, reject) => {
-            setTimeout(() => {
+            timeout = setTimeout(() => {
                 reject(new SocketIOTimeoutError('joinProject', SOCKET_EVENT_TIMEOUT_MS));
             }, SOCKET_EVENT_TIMEOUT_MS);
         });
@@ -476,17 +509,23 @@ export class SocketIOAPI {
             case 'v1':
                 const joinPromise = this.emit('joinProject', {project_id})
                 .then((returns:[ProjectEntity, string, number]) => {
+                    if (generation !== this.generation || this.retired) {
+                        throw new TransportInvalidatedError('joinProject');
+                    }
                     const [project, permissionsLevel, protocolVersion] = returns;
                     this.record = Promise.resolve(project);
                     return project;
                 });
                 const rejectPromise = new Promise((_, reject) => {
-                    this.socket.on('connectionRejected', (err:any) => {
+                    onRejected = (err:any) => {
                         // Only fall back to v2 if we haven't already tried it;
                         // otherwise let the outer retry logic handle backoff
-                        this.scheme = 'v2';
+                        if (generation === this.generation && !this.retired) {
+                            this.scheme = 'v2';
+                        }
                         reject(err.message);
-                    });
+                    };
+                    socket.on('connectionRejected', onRejected);
                 });
                 result = Promise.race([joinPromise, rejectPromise, timeoutPromise]);
                 break;
@@ -500,9 +539,14 @@ export class SocketIOAPI {
                 // project membership generation we no longer understand.
                 // Reusing this socket makes the retry observationally
                 // ambiguous, so the next attempt must start a fresh transport.
-                this.invalidateTransport();
+                this.invalidateTransport(generation);
             }
             throw error;
+        }).finally(() => {
+            clearTimeout(timeout);
+            if (onRejected) {
+                socket.removeListener('connectionRejected', onRejected);
+            }
         });
     }
 
@@ -546,9 +590,13 @@ export class SocketIOAPI {
         event: string,
         task: () => Promise<T>,
     ): Promise<T> {
-        const execute = () => this.transportInvalidated
-            ? Promise.reject<T>(new TransportInvalidatedError(event))
-            : task();
+        let generation: number;
+        const execute = () => {
+            generation = this.generation;
+            return this.transportInvalidated || this.retired
+                ? Promise.reject<T>(new TransportInvalidatedError(event))
+                : task();
+        };
         const raw = this.membershipChain.then(execute, execute);
         const result = raw.catch(error => {
             if (!isSocketIOTimeout(error)) {
@@ -561,15 +609,15 @@ export class SocketIOAPI {
                 && error.event === event
                 ? error
                 : new SocketIOTimeoutError(event, timeoutMs);
-            this.invalidateTransport();
+            this.invalidateTransport(generation);
             throw contextual;
         });
         this.membershipChain = result.then(() => undefined, () => undefined);
         return result;
     }
 
-    private invalidateTransport(): void {
-        if (this.transportInvalidated) {
+    private invalidateTransport(generation = this.generation): void {
+        if (this.transportInvalidated || this.retired || generation !== this.generation) {
             return;
         }
         this.transportInvalidated = true;
@@ -586,7 +634,8 @@ export class SocketIOAPI {
         // set forever and every later membership RPC is refused against it.
         // Announce the loss ourselves when the socket did not.
         setTimeout(() => {
-            if (this.socket !== invalidated || this.disconnectAnnounced) {
+            if (this.retired || generation !== this.generation
+                || this.socket !== invalidated || this.disconnectAnnounced) {
                 return;
             }
             this.disconnectAnnounced = true;

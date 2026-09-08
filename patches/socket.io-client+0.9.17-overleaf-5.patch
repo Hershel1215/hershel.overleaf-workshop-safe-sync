@@ -1,8 +1,22 @@
 diff --git a/node_modules/socket.io-client/lib/socket.js b/node_modules/socket.io-client/lib/socket.js
-index 07c1c3f..e208abc 100644
+index 07c1c3f..2cd0818 100644
 --- a/node_modules/socket.io-client/lib/socket.js
 +++ b/node_modules/socket.io-client/lib/socket.js
-@@ -152,11 +152,27 @@
+@@ -118,6 +118,7 @@
+       , options = this.options;
+ 
+     function complete (data) {
++      if (self.destroyed) return;
+       if (data instanceof Error) {
+         self.connecting = false;
+         self.onError(data.message);
+@@ -147,16 +148,35 @@
+       });
+     } else {
+       var xhr = io.util.request();
++      this.handshakeRequest = xhr;
+ 
+       xhr.open('GET', url, true);
        if (this.isXDomain()) {
          xhr.withCredentials = true;
        }
@@ -13,8 +27,10 @@ index 07c1c3f..e208abc 100644
 +        });
 +      }
        xhr.onreadystatechange = function () {
++        if (self.destroyed) return;
          if (xhr.readyState == 4) {
            xhr.onreadystatechange = empty;
++          if (self.handshakeRequest === xhr) self.handshakeRequest = undefined;
  
            if (xhr.status == 200) {
 +            // extract set-cookie headers
@@ -30,8 +46,41 @@ index 07c1c3f..e208abc 100644
              complete(xhr.responseText);
            } else if (xhr.status == 403) {
              self.onError(xhr.responseText);
-@@ -229,7 +245,7 @@
+@@ -199,7 +219,7 @@
+    */
+ 
+   Socket.prototype.connect = function (fn) {
+-    if (this.connecting) {
++    if (this.destroyed || this.connecting) {
+       return this;
+     }
+ 
+@@ -207,6 +227,7 @@
+     self.connecting = true;
+     
+     this.handshake(function (sid, heartbeat, close, transports) {
++      if (self.destroyed) return;
+       self.sessionid = sid;
+       self.closeTimeout = close * 1000;
+       self.heartbeatTimeout = heartbeat * 1000;
+@@ -219,20 +240,26 @@
+       self.setHeartbeatTimeout();
+ 
+       function connect (transports){
++        if (self.destroyed) return;
+         self.onClose()
+-        if (self.transport) self.transport.clearTimeouts();
++        if (self.transport) {
++          self.transport.clearTimeouts();
++          self.transport.close();
++        }
+ 
+         self.transport = self.getTransport(transports);
+         if (!self.transport) return self.publish('connect_failed');
+ 
+         // once the transport is ready
          self.transport.ready(self, function () {
++          if (self.destroyed) return;
            self.connecting = true;
            self.publish('connecting', self.transport.name);
 -          self.transport.open();
@@ -39,7 +88,11 @@ index 07c1c3f..e208abc 100644
  
            if (self.options['connect timeout']) {
              self.connectTimeoutTimer = setTimeout(function () {
-@@ -369,6 +385,12 @@
++              if (self.destroyed) return;
+               if (!self.connected) {
+                 self.connecting = false;
+ 
+@@ -369,6 +396,12 @@
      ].join('/') + '/?disconnect=1';
  
      xhr.open('GET', uri, false);
@@ -52,8 +105,16 @@ index 07c1c3f..e208abc 100644
      xhr.send(null);
  
      // handle disconnection immediately
+@@ -498,6 +531,7 @@
+    */
+ 
+   Socket.prototype.reconnect = function () {
++    if (this.destroyed) return;
+     this.reconnecting = true;
+     this.reconnectionAttempts = 0;
+     this.reconnectionDelay = this.options['reconnection delay'];
 diff --git a/node_modules/socket.io-client/lib/transports/websocket.js b/node_modules/socket.io-client/lib/transports/websocket.js
-index 0dfa483..d878bbb 100644
+index 0dfa483..0027935 100644
 --- a/node_modules/socket.io-client/lib/transports/websocket.js
 +++ b/node_modules/socket.io-client/lib/transports/websocket.js
 @@ -50,7 +50,7 @@
@@ -65,7 +126,7 @@ index 0dfa483..d878bbb 100644
      var query = io.util.query(this.socket.options.query)
        , self = this
        , Socket
-@@ -63,7 +63,9 @@
+@@ -63,20 +63,31 @@
        Socket = global.MozWebSocket || global.WebSocket;
      }
  
@@ -73,6 +134,28 @@ index 0dfa483..d878bbb 100644
 +    this.websocket = new Socket(this.prepareUrl() + query, {
 +      headers: extraHeaders || {}
 +    });
++    var websocket = this.websocket;
++    function current () {
++      return !self.socket.destroyed && self.socket.transport === self
++        && self.websocket === websocket;
++    }
  
      this.websocket.onopen = function () {
++      if (!current()) return;
        self.onOpen();
+       self.socket.setBuffer(false);
+     };
+     this.websocket.onmessage = function (ev) {
++      if (!current()) return;
+       self.onData(ev.data);
+     };
+     this.websocket.onclose = function () {
++      if (!current()) return;
+       self.onClose();
+       self.socket.setBuffer(true);
+     };
+     this.websocket.onerror = function (e) {
++      if (!current()) return;
+       self.onError(e);
+     };
+ 

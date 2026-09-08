@@ -93,6 +93,46 @@ describe('text replica projection state machine', () => {
         };
     }
 
+    it('does not buffer an already-journaled callback ahead of a newer editor batch', async () => {
+        const state = harness({canonicalContent: 'a', canonicalSequence: 0});
+        try {
+            state.setEditor('ab');
+            assert(state.machine.tryBufferEditorChange('ab', 'a'));
+            await state.machine.flushInput(true);
+            state.setEditor('abc');
+            assert(state.machine.tryBufferEditorChange('abc', 'ab'));
+            // A delayed callback for the first batch follows the next key.
+            if (!state.machine.tryBufferEditorChange('ab', 'a')) {
+                await state.machine.onEditorChanged('ab', 'a', true);
+            }
+            await state.machine.flushInput(true);
+            assert.strictEqual(state.machine.canonical, 'abc');
+            assert.deepStrictEqual(state.isolations, []);
+        } finally {
+            state.machine.dispose();
+        }
+    });
+
+    it('still journals a real undo back to the last submitted editor text', async () => {
+        const state = harness({canonicalContent: 'a', canonicalSequence: 0});
+        try {
+            state.setEditor('ab');
+            assert(state.machine.tryBufferEditorChange('ab', 'a'));
+            await state.machine.flushInput(true);
+            state.setEditor('abc');
+            assert(state.machine.tryBufferEditorChange('abc', 'ab'));
+            state.setEditor('ab');
+            if (!state.machine.tryBufferEditorChange('ab', 'abc')) {
+                await state.machine.onEditorChanged('ab', 'abc', true);
+            }
+            await state.machine.flushInput(true);
+            assert.strictEqual(state.machine.canonical, 'ab');
+            assert.deepStrictEqual(state.isolations, []);
+        } finally {
+            state.machine.dispose();
+        }
+    });
+
     it('ignores a projection published before a commit it already applied', async () => {
         const state = harness({canonicalContent: 'BASE\n', canonicalSequence: 10});
         // The session state a projection was read from, before the local

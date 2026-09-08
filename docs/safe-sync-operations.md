@@ -40,6 +40,12 @@ before watchers observe it; rename that local item rather than deleting it.
 Text edits are normally batched for 150 ms with a 300 ms hard cut. A binary must remain unchanged for
 at least 500 ms before upload or conflict capture.
 
+Project initialization shares one reconnect attempt across all readers. It
+backs off after failures and stops after five attempts with one Retry/Reload
+notification. Only complete initialization resets the budget; accepting a
+socket or joining a project while settings still fail does not reset it. Retry
+starts a new budget. The loading indicator closes on success or exhaustion.
+
 ## Codex and Claude writes
 
 For a write that may overlap VS Code or Overleaf editing, run **Copy AI Gateway
