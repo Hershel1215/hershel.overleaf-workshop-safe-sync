@@ -78,6 +78,7 @@ export interface ConflictDocumentRecovery {
 
 export interface ConflictRecord {
     path: string;
+    resolution?: 'ignored';
     artifactDirectory: string;
     reason: string;
     createdAt: string;

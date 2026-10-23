@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { isUtf8 } from 'buffer';
 import { minimatch } from 'minimatch';
 
 export const CONFLICT_DIRECTORY = '.overleaf/conflicts';
@@ -25,12 +26,14 @@ export const DEFAULT_IGNORE_PATTERNS = [
     '**/*.xdv',
     '**/.output',
     '**/.output/**',
+    '**/.latex-build',
+    '**/.latex-build/**',
     '**/main.pdf',
     '**/output.pdf',
 ];
 
 const TEXT_EXTENSIONS = new Set([
-    '.bbx', '.bib', '.cbx', '.cls', '.csv', '.json', '.latex', '.md',
+    '.bbx', '.bib', '.bst', '.cbx', '.cls', '.csv', '.dtx', '.ins', '.json', '.latex', '.md',
     '.sty', '.tex', '.txt', '.yaml', '.yml',
 ]);
 
@@ -107,13 +110,8 @@ export function isEditableTextCandidate(path: string, content: Uint8Array): bool
     const normalized = normalizeRelativePath(path).toLowerCase();
     const dot = normalized.lastIndexOf('.');
     const extension = dot >= 0 ? normalized.slice(dot) : '';
-    if (!TEXT_EXTENSIONS.has(extension)) {
+    if (!TEXT_EXTENSIONS.has(extension) && normalized.split('/').at(-1) !== 'makefile') {
         return false;
     }
-    try {
-        new TextDecoder('utf-8', { fatal: true }).decode(content);
-        return true;
-    } catch {
-        return false;
-    }
+    return isUtf8(content);
 }

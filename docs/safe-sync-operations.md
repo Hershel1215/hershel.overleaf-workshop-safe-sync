@@ -25,6 +25,19 @@ installed upstream extension.
 
 Until step 6, the replica is read-only and no source endpoint is modified.
 
+`.latex-build/**` stays local and is excluded from synchronization. Resource
+conflicts on ignored paths are archived with `resolution: ignored` when no
+document or projection recovery remains pending. The local files, remote files,
+and recovery backups are preserved. LaTeX `.bst`, `.dtx`, `.ins`, and `makefile`
+files outside ignored directories use document synchronization when their
+content is valid UTF-8 within the supported size limit.
+
+After compiling the source, verify these classifications against an actual
+unpacked Elsevier template with
+`node scripts/verify-real-latex-files.cjs /path/to/elsarticle`.
+The check reads the six template files, validates their sync policy, and prints
+their SHA-256 hashes.
+
 `.hershel-safe-sync` and `.hershel-safe-sync.staging-<uuid>` are reserved remote
 transaction namespaces. They are never projected locally or uploaded as user
 content. If either name already exists at the local replica root, startup stops

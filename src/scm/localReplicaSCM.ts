@@ -3830,6 +3830,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
 
             this.markReconcilePhase('ensure-replicas', actionCount);
+            if (await this.archiveIgnoredResourceConflict()) {
+                continue;
+            }
             if (await this.ensureTextReplicas(scan)) {
                 continue;
             }
@@ -7310,11 +7313,41 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const choice: ConflictResolution = resolution === useRemote
             ? 'remote'
             : resolution === useLocal ? 'local' : 'both';
-        try {
-            await this.enqueueConflictResolution(record.path, choice);
-        } catch (error) {
-            vscode.window.showErrorMessage(this.asError(error).message);
+        await this.enqueueConflictResolution(record.path, choice);
+        vscode.window.showInformationMessage(`Safe-sync conflict resolved: ${record.path}`);
+    }
+
+    /** 按忽略规则归档资源冲突，保留两端文件及全部备份。 */
+    private async archiveIgnoredResourceConflict(): Promise<boolean> {
+        const state = this.requireState();
+        const record = Object.values(state.conflicts).find(candidate => (
+            this.isIgnored(candidate.path)
+            && candidate.localType === 'file'
+            && candidate.baseType !== 'doc'
+            && candidate.remoteType !== 'doc'
+            && !candidate.projectionRecoveryTransactionId
+            && !candidate.documentRecoveries?.length
+        ));
+        if (!record) {
+            return false;
         }
+        if (state.pendingAction || this.textReplicas.has(record.path)) {
+            throw new Error(`Cannot archive an active synchronization operation: ${record.path}`);
+        }
+        const pending = await this.vfs.inspectPendingDocumentRecoveries();
+        if (pending.some(recovery => recovery.lastKnownPath === record.path
+            || recovery.documentId === record.baselineEntityId
+            || recovery.documentId === record.remoteEntityId)) {
+            throw new Error(`Cannot archive pending document recovery: ${record.path}`);
+        }
+        await this.recoverConflictArtifactLocation(record);
+        record.resolution = 'ignored';
+        await this.moveConflictToResolved(record);
+        const conflicts = {...state.conflicts};
+        delete conflicts[record.path];
+        await this.stateStore.save({...state, conflicts});
+        state.conflicts = conflicts;
+        return true;
     }
 
     private async showDetachedDocumentRecovery(): Promise<void> {
@@ -7436,6 +7469,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
         let restoredSiblingPath: string | undefined;
         if (resolution !== 'remote') {
+            if (record.localFile && record.localType === 'file'
+                && record.baseType === undefined && record.remoteType === undefined) {
+                const archived = await vscode.workspace.fs.readFile(this.localUri(record.localFile));
+                if (contentHash(archived) !== record.localHash) {
+                    throw new Error(`Archived local content changed: ${record.path}`);
+                }
+                if (isEditableTextCandidate(record.path, archived)) {
+                    record.localType = 'doc';
+                }
+            }
             if (resolution === 'local' && record.localType) {
                 this.resolutionTypeOverrides ??= new Map<string, BaselineFileType>();
                 this.resolutionTypeOverrides.set(record.path, record.localType);
