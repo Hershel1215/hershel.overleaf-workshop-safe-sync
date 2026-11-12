@@ -45,6 +45,13 @@ interface SCMRecord {
     scm: BaseSCM;
     enabled: boolean;
     triggers: vscode.Disposable[];
+    /**
+     * True while the source control is still starting. A local replica's
+     * startup scans both endpoints and can take minutes on a slow link; the
+     * record is listed meanwhile so the menu never looks as if the replica
+     * were missing and invites creating a second one.
+     */
+    starting: boolean;
 }
 
 export class SCMCollectionProvider extends vscode.Disposable {
@@ -77,6 +84,11 @@ export class SCMCollectionProvider extends vscode.Disposable {
         this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         this.statusBarItem.command = `${ROOT_NAME}.projectSCM.configSCM`;
         this.statusListener = EventBus.on('scmStatusChangeEvent', () => {this.updateStatus();});
+        // initSCMs() may already have listed a starting record before the
+        // status bar item existed.
+        if (this.scms.length > 0) {
+            this.updateStatus();
+        }
     }
 
     private updateStatus() {
@@ -88,10 +100,11 @@ export class SCMCollectionProvider extends vscode.Disposable {
         tooltip.supportThemeIcons = true;
 
         // update status bar item tooltip
+        let numStarting = 0;
         if (this.scms.length===0) {
             tooltip.appendMarkdown(`*${vscode.l10n.t('Click to configure.')}*\n\n`);
         } else {
-            for (const {scm,enabled} of this.scms) {
+            for (const {scm,enabled,starting} of this.scms) {
                 const icon = scm.iconPath.id;
                 const label = (scm.constructor as any).label;
                 const uri = scm.baseUri.toString();
@@ -100,6 +113,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
                 //
                 if (!enabled) {
                     tooltip.appendMarkdown(`&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*${vscode.l10n.t('Disabled')}.*\n\n`);
+                } else if (starting) {
+                    numStarting++;
+                    tooltip.appendMarkdown(`&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*${vscode.l10n.t('Starting: scanning local and Overleaf files')}...*\n\n`);
                 } else if (scm.status.status==='idle') {
                     tooltip.appendMarkdown(`&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*${vscode.l10n.t('Synced')}.*\n\n`);
                 } else {
@@ -116,7 +132,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
         this.statusBarItem.tooltip = tooltip;
 
         // update status bar item text
-        if (numPush!==0) {
+        if (numStarting!==0) {
+            this.statusBarItem.text = `$(sync~spin)`;
+        } else if (numPush!==0) {
             this.statusBarItem.text = `$(cloud-upload)`;
         } else if (numPull!==0) {
             this.statusBarItem.text = `$(cloud-download)`;
@@ -170,15 +188,30 @@ export class SCMCollectionProvider extends vscode.Disposable {
                 settings: {} as JSON,
             });
         }
-        // insert into collection
+        // insert into collection before startup so the menu lists it at once
+        const record: SCMRecord = {scm, enabled, triggers: [], starting: enabled};
+        this.scms.push(record);
+        this.updateStatus();
         try {
             const triggers = enabled ? await scm.triggers : [];
-            this.scms.push({scm,enabled,triggers});
+            if (!this.scms.includes(record)) {
+                // Removed while starting: nothing owns these triggers anymore.
+                triggers.forEach(trigger => trigger.dispose());
+                return undefined;
+            }
+            record.triggers = triggers;
+            record.starting = false;
             this.updateStatus();
             return scm;
         } catch (error) {
             // permanently remove failed scm
             // this.vfs.setProjectSCMPersist(scm.scmKey, undefined);
+            const index = this.scms.indexOf(record);
+            if (index !== -1) {
+                this.scms.splice(index, 1);
+            }
+            record.starting = false;
+            this.updateStatus();
             if (scm instanceof LocalReplicaSCMProvider) {
                 scm.dispose();
             }
@@ -239,6 +272,13 @@ export class SCMCollectionProvider extends vscode.Disposable {
 
     private configSCM(scmItem: SCMRecord) {
         const baseUri = scmItem.scm.baseUri.toString();
+        if (scmItem.starting) {
+            vscode.window.showInformationMessage(vscode.l10n.t(
+                '"{scm}" is still starting: it is scanning local and Overleaf files. Its settings open once startup finishes.',
+                {scm: (scmItem.scm.constructor as any).label},
+            ));
+            return Promise.resolve();
+        }
         const settingItems = scmItem.scm.settingItems as SettingItem[];
         const status = scmItem.enabled? scmItem.scm.status.status : 'disabled';
         const quickPickItems = [
@@ -298,8 +338,10 @@ export class SCMCollectionProvider extends vscode.Disposable {
             const { scm } = item;
             return {
                 label: (scm.constructor as any).label,
-                iconPath: scm.iconPath,
-                description: scm.baseUri.toString(),
+                iconPath: item.starting ? new vscode.ThemeIcon('sync~spin') : scm.iconPath,
+                description: item.starting
+                    ? `${vscode.l10n.t('Starting')}... ${scm.baseUri.toString()}`
+                    : scm.baseUri.toString(),
                 item,
             };
         });
