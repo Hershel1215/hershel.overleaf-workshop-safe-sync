@@ -107,6 +107,19 @@ class StaleLocalSnapshotError extends Error {
 
 class BaselineSelectionChangedError extends Error {}
 
+/** Progress sink for an explicit baseline selection; increments are percentages. */
+type BaselineProgress = (update: { message?: string; increment?: number }) => void;
+
+function formatByteSize(bytes: number): string {
+    if (bytes < 1024) {
+        return `${bytes} B`;
+    }
+    if (bytes < 1024 * 1024) {
+        return `${(bytes / 1024).toFixed(1)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 class DetachedRecoveryPathAppearedError extends Error {}
 
 class LocalProjectionConflictError extends Error {
@@ -6998,7 +7011,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private async initializeBaseline(): Promise<void> {
-        if (!this.state || this.pausedError) {
+        if (!this.state) {
+            vscode.window.showWarningMessage('Safe sync is still loading this replica; select the baseline once it is ready.');
+            return;
+        }
+        if (this.pausedError) {
+            const retry = 'Retry paused safe sync';
+            const choice = await vscode.window.showErrorMessage(
+                `Safe sync is paused, so no baseline can be selected: ${this.pausedError.message}`,
+                retry,
+            );
+            if (choice === retry) {
+                await this.retryPausedProject();
+            }
             return;
         }
         if (
@@ -7058,37 +7083,74 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (confirmation !== 'Initialize') {
             return;
         }
-        await this.reconcileQueue.run(async () => {
-            if (this.disposed || this.handoffInProgress) {
-                throw new Error('Safe-sync ownership retirement is in progress');
+        const fromRemote = selection.label === remoteChoice;
+        let failure: Error | undefined;
+        let initialized = false;
+        await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: fromRemote
+                    ? 'Initializing safe-sync baseline from Overleaf'
+                    : 'Initializing safe-sync baseline from local files',
+            },
+            async progress => {
+                progress.report({ message: 'waiting for the current synchronization to finish' });
+                const report: BaselineProgress = update => {
+                    progress.report(update);
+                    if (update.message) {
+                        this.output.appendLine(`[baseline] ${update.message}`);
+                    }
+                };
+                await this.reconcileQueue.run(async () => {
+                    if (this.disposed || this.handoffInProgress) {
+                        throw new Error('Safe-sync ownership retirement is in progress');
+                    }
+                    try {
+                        if (fromRemote) {
+                            await this.initializeFromRemote(scan, report);
+                        } else {
+                            await this.initializeFromLocal(scan, report);
+                        }
+                        initialized = true;
+                        this.scheduleReconcile('baseline initialized', 0);
+                    } catch (error) {
+                        if (error instanceof BaselineSelectionChangedError) {
+                            const state = this.requireState();
+                            state.initialized = false;
+                            state.pendingAction = undefined;
+                            await this.stateStore.save(state);
+                            this.status = {
+                                status: 'need-attention',
+                                message: 'Baseline selection changed during copy; review a fresh report',
+                            };
+                            vscode.window.showWarningMessage(error.message);
+                            return;
+                        }
+                        failure = this.asError(error);
+                        this.output.appendLine(`[baseline] not initialized: ${failure.message}`);
+                        await this.handleReconcileError(error);
+                    }
+                });
+            },
+        );
+        if (initialized) {
+            vscode.window.showInformationMessage('Safe-sync baseline initialized; synchronization is now writable.');
+        } else if (failure) {
+            const showReport = 'Show safe-sync report';
+            const choice = await vscode.window.showErrorMessage(
+                `Safe-sync baseline was not initialized: ${failure.message}. `
+                    + 'Files copied so far are kept, so running Initialize again continues with the remaining files.',
+                showReport,
+            );
+            if (choice === showReport) {
+                this.output.show(true);
             }
-            try {
-                if (selection.label === remoteChoice) {
-                    await this.initializeFromRemote(scan);
-                } else {
-                    await this.initializeFromLocal(scan);
-                }
-                this.scheduleReconcile('baseline initialized', 0);
-            } catch (error) {
-                if (error instanceof BaselineSelectionChangedError) {
-                    const state = this.requireState();
-                    state.initialized = false;
-                    state.pendingAction = undefined;
-                    await this.stateStore.save(state);
-                    this.status = {
-                        status: 'need-attention',
-                        message: 'Baseline selection changed during copy; review a fresh report',
-                    };
-                    vscode.window.showWarningMessage(error.message);
-                    return;
-                }
-                await this.handleReconcileError(error);
-            }
-        });
+        }
     }
 
-    private async initializeFromRemote(scan: ScanPair): Promise<void> {
+    private async initializeFromRemote(scan: ScanPair, report?: BaselineProgress): Promise<void> {
         const state = this.requireState();
+        report?.({ message: 'archiving differing local files' });
         await this.archiveBootstrap('overleaf-baseline', 'local', scan.local, scan.remote);
         const localExtras = this.topLevelSnapshots(
             [...scan.local.values()].filter(snapshot => !scan.remote.has(snapshot.path)),
@@ -7099,6 +7161,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const remoteEntries = [...scan.remote.values()].sort((left, right) => (
             left.path.split('/').length - right.path.split('/').length
         ));
+        report?.({ message: 'writing Overleaf files into the local replica' });
         for (const remote of remoteEntries) {
             const local = scan.local.get(remote.path);
             if (local?.fileType !== remote.fileType && local) {
@@ -7111,6 +7174,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             }
         }
+        report?.({ message: 'verifying that both sides match' });
         const finalScan = await this.scanBoth();
         this.assertEndpointsEqual(finalScan);
         state.initialized = true;
@@ -7119,8 +7183,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         await this.stateStore.save(state);
     }
 
-    private async initializeFromLocal(scan: ScanPair): Promise<void> {
+    private async initializeFromLocal(scan: ScanPair, report?: BaselineProgress): Promise<void> {
         const state = this.requireState();
+        report?.({ message: 'archiving differing Overleaf files' });
         await this.archiveBootstrap('local-baseline', 'remote', scan.remote, scan.local);
         const localVariants = new Map(
             [...scan.local].filter(([, snapshot]) => snapshot.localVariants !== undefined),
@@ -7170,6 +7235,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const localEntries = [...working.local.values()].sort((left, right) => (
             left.path.split('/').length - right.path.split('/').length
         ));
+        const needsCopy = (local: ReplicaSnapshot): boolean => {
+            const remote = working.remote.get(local.path);
+            return local.fileType !== 'folder'
+                && (!remote || remote.fileType !== local.fileType || remote.hash !== local.hash);
+        };
+        const copies = localEntries.filter(needsCopy);
+        const copyBytes = copies.reduce((total, local) => total + (local.content?.byteLength ?? 0), 0);
+        let copied = 0;
+        report?.({ message: `copying ${copies.length} files (${formatByteSize(copyBytes)}) to Overleaf` });
         for (const local of localEntries) {
             const remote = working.remote.get(local.path);
             if (local.fileType === 'folder') {
@@ -7180,6 +7254,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
             if (!local.content) {
                 throw new Error(`Local content was not scanned for ${local.path}`);
+            }
+            const copying = needsCopy(local);
+            if (copying) {
+                copied++;
+                report?.({
+                    message: `copying ${copied}/${copies.length}: ${local.path} `
+                        + `(${formatByteSize(local.content.byteLength)})`,
+                });
             }
             if (!remote || remote.fileType !== local.fileType) {
                 await this.vfs.createTypedFile(this.remoteUri(local.path), local.content, local.fileType);
@@ -7216,7 +7298,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     this.remoteUri(local.path), remote.entityId!, remote.hash, local.content,
                 );
             }
+            if (copying && copyBytes > 0) {
+                report?.({ increment: 100 * local.content.byteLength / copyBytes });
+            }
         }
+        report?.({ message: 'verifying that both sides match' });
         const finalScan = await this.scanBoth();
         this.assertEndpointsEqual(finalScan);
         state.initialized = true;

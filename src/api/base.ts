@@ -15,16 +15,89 @@ function getSetCookie(res: any): string[] {
 }
 
 /**
- * Per-attempt ceiling for every HTTP call to Overleaf.
+ * Per-attempt ceiling for every HTTP call to Overleaf, before any payload
+ * allowance is added.
  *
  * fetch has no default timeout. A server that accepts the connection and then
  * stops reading leaves the promise pending for the life of the process, which
  * wedges whatever resource action issued it and every reconciliation queued
- * behind that action. Generous enough for a large upload on a slow link, and
- * an expiry is reported as a network error, so the existing retry and backoff
- * treat it like any other transient failure.
+ * behind that action. An expiry is reported as a network error, so the
+ * existing retry and backoff treat it like any other transient failure.
  */
 const HTTP_REQUEST_TIMEOUT_MS = 60_000;
+
+/**
+ * Slowest sustained transfer rate that still counts as progress.
+ *
+ * One fixed ceiling cannot serve both a 2 KB JSON call and a 7 MB figure: on a
+ * 10 KB/s cross-border link the figure needs twelve minutes, so a flat 60 s
+ * limit aborted it on every attempt and baseline selection could never
+ * finish. Each transfer instead gets the base ceiling plus the time its
+ * payload needs at this rate.
+ */
+const MIN_TRANSFER_BYTES_PER_SECOND = 4 * 1024;
+
+/**
+ * A request body above this size is not sent again after a timeout: the
+ * deadline already allowed it the floor rate, so an immediate resend of the
+ * whole body only multiplies the wait for the queue behind it.
+ */
+const LARGE_REQUEST_BODY_BYTES = 1024 * 1024;
+
+export interface TransferPolicy {
+    baseTimeoutMs: number;
+    minBytesPerSecond: number;
+}
+
+const DEFAULT_TRANSFER_POLICY: TransferPolicy = {
+    baseTimeoutMs: HTTP_REQUEST_TIMEOUT_MS,
+    minBytesPerSecond: MIN_TRANSFER_BYTES_PER_SECOND,
+};
+
+/** Time allowed to move `bytes` over HTTP under `policy`. */
+export function transferTimeoutMs(bytes: number, policy: TransferPolicy = DEFAULT_TRANSFER_POLICY): number {
+    const payload = Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+    return policy.baseTimeoutMs + Math.ceil(payload * 1000 / policy.minBytesPerSecond);
+}
+
+/**
+ * Abort deadline for one HTTP attempt. It starts sized for the request body
+ * and is re-armed once the response headers announce the response size.
+ */
+class TransferDeadline {
+    private readonly controller = new AbortController();
+    private timer: NodeJS.Timeout | undefined;
+    readonly signal: AbortSignal = this.controller.signal;
+
+    constructor(timeoutMs: number) {
+        this.reset(timeoutMs);
+    }
+
+    get expired(): boolean {
+        return this.signal.aborted;
+    }
+
+    reset(timeoutMs: number): void {
+        this.clear();
+        this.timer = setTimeout(() => {
+            const reason = new Error('The operation was aborted due to timeout');
+            reason.name = 'TimeoutError';
+            this.controller.abort(reason);
+        }, timeoutMs);
+    }
+
+    clear(): void {
+        if (this.timer !== undefined) {
+            clearTimeout(this.timer);
+            this.timer = undefined;
+        }
+    }
+}
+
+function responseContentLength(res: { headers: { get(name: string): string | null } }): number {
+    const length = Number(res.headers.get('content-length'));
+    return Number.isFinite(length) && length > 0 ? length : 0;
+}
 
 export interface Identity {
     csrfToken: string;
@@ -213,9 +286,11 @@ export interface ResponseSchema {
 export class BaseAPI {
     private url: string;
     private identity?: Identity;
+    private readonly transferPolicy: TransferPolicy;
 
-    constructor(url:string) {
+    constructor(url:string, transferPolicy: Partial<TransferPolicy> = {}) {
         this.url = url;
+        this.transferPolicy = {...DEFAULT_TRANSFER_POLICY, ...transferPolicy};
     }
 
     private async getCsrfToken(): Promise<Identity> {
@@ -394,9 +469,18 @@ export class BaseAPI {
         // and every later reconciliation waits behind it. Bound the wait so a
         // stalled connection becomes an ordinary transient error instead.
         let lastError: {statusCode?: number, message?: string} = {};
+        const content_type = body instanceof FormData ? body.getHeaders() : {'Content-Type': 'application/json'};
+        const raw_body = type !== 'POST' ? undefined
+            : body instanceof FormData ? body.getBuffer() : JSON.stringify({
+                _csrf: this.identity!.csrfToken,
+                ...body
+            });
+        const requestBodyBytes = raw_body === undefined ? 0
+            : typeof raw_body === 'string' ? Buffer.byteLength(raw_body) : raw_body.length;
 
         for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
-            const signal = AbortSignal.timeout(HTTP_REQUEST_TIMEOUT_MS);
+            const deadline = new TransferDeadline(transferTimeoutMs(requestBodyBytes, this.transferPolicy));
+            const signal = deadline.signal;
             try {
                 let res = undefined;
                 switch(type) {
@@ -411,11 +495,6 @@ export class BaseAPI {
                         });
                         break;
                     case 'POST':
-                        const content_type = body instanceof FormData ? body.getHeaders() : {'Content-Type': 'application/json'};
-                        const raw_body = body instanceof FormData ? body.getBuffer() : JSON.stringify({
-                            _csrf: this.identity!.csrfToken,
-                            ...body
-                        });
                         res = await fetch(this.url+route, {
                             method: 'POST', redirect: 'manual', signal,
                             headers: {
@@ -442,6 +521,9 @@ export class BaseAPI {
                         break;
                 };
 
+                if (res) {
+                    deadline.reset(transferTimeoutMs(responseContentLength(res), this.transferPolicy));
+                }
                 if (res && (res.status===200 || res.status===204)) {
                     const _res = res.status===200 ? await res.text() : undefined;
                     const response = callback && callback(_res);
@@ -467,7 +549,8 @@ export class BaseAPI {
                 }
             } catch (err: any) {
                 const errMsg = err?.message || String(err);
-                if (this.isTransientError(undefined, errMsg) && attempt < MAX_HTTP_RETRIES) {
+                const largeBodyTimedOut = deadline.expired && requestBodyBytes > LARGE_REQUEST_BODY_BYTES;
+                if (!largeBodyTimedOut && this.isTransientError(undefined, errMsg) && attempt < MAX_HTTP_RETRIES) {
                     const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000);
                     console.log(`HTTP fetch error on ${route}: ${errMsg}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
                     await new Promise(r => setTimeout(r, delayMs));
@@ -475,8 +558,13 @@ export class BaseAPI {
                 }
                 return {
                     type: 'error',
-                    message: errMsg
+                    message: largeBodyTimedOut
+                        ? `${errMsg} (${requestBodyBytes} byte upload did not finish within `
+                            + `${Math.round(transferTimeoutMs(requestBodyBytes, this.transferPolicy) / 1000)} s)`
+                        : errMsg
                 };
+            } finally {
+                deadline.clear();
             }
         }
 
@@ -492,22 +580,28 @@ export class BaseAPI {
 
         let content: Buffer[] = [];
         while(true) {
-            const res = await fetch(this.url+route, {
-                method: 'GET', redirect: 'manual',
-                signal: AbortSignal.timeout(HTTP_REQUEST_TIMEOUT_MS),
-                headers: {
-                    'Connection': 'keep-alive',
-                    'Cookie': this.identity.cookies,
+            const deadline = new TransferDeadline(this.transferPolicy.baseTimeoutMs);
+            try {
+                const res = await fetch(this.url+route, {
+                    method: 'GET', redirect: 'manual',
+                    signal: deadline.signal,
+                    headers: {
+                        'Connection': 'keep-alive',
+                        'Cookie': this.identity.cookies,
+                    }
+                });
+                deadline.reset(transferTimeoutMs(responseContentLength(res), this.transferPolicy));
+                if (res.status===200) {
+                    content.push(Buffer.from(await res.arrayBuffer()));
+                    break;
                 }
-            });
-            if (res.status===200) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-                break;
-            }
-            else if (res.status===206) {
-                content.push(Buffer.from(await res.arrayBuffer()));
-            } else {
-                break;
+                else if (res.status===206) {
+                    content.push(Buffer.from(await res.arrayBuffer()));
+                } else {
+                    break;
+                }
+            } finally {
+                deadline.clear();
             }
         };
 
