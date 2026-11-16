@@ -471,6 +471,24 @@ describe('replica persistence', () => {
         await second.release();
     });
 
+    it('reclaims a lock whose owner process exited even while its heartbeat is fresh', async () => {
+        // Window reload: the old extension host exits without releasing and
+        // the new host starts a few seconds later, well inside the TTL.
+        const {spawnSync} = require('child_process');
+        const exited = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+        const key = '/reload-handoff';
+        const digest = createHash('sha256').update(key).digest('hex');
+        const lockDirectory = path.join(root, 'safe-sync', 'locks', `${digest}.lock`);
+        await mkdir(lockDirectory, {recursive: true});
+        await writeFile(path.join(lockDirectory, 'owner.json'), JSON.stringify({
+            instanceId: 'previous-host', pid: exited.pid, heartbeat: Date.now(),
+        }));
+        const lock = await ReplicaLock.acquire(root, key, {heartbeatMs: 100000});
+        const owner = JSON.parse(await readFile(path.join(lockDirectory, 'owner.json'), 'utf8'));
+        assert.strictEqual(owner.pid, process.pid);
+        await lock.release();
+    });
+
     it('publishes owner metadata atomically before another acquisition can inspect the lock', async () => {
         const key = '/atomic-owner-publication';
         const digest = createHash('sha256').update(key).digest('hex');

@@ -42,12 +42,12 @@ export class ReplicaLock {
         rootDirectory: string,
         key: string,
         options: {
+            /** @deprecated Ownership is decided by the owner pid; kept for callers. */
             ttlMs?: number;
             heartbeatMs?: number;
             onLost?: (error: Error) => void;
         } = {},
     ): Promise<ReplicaLock> {
-        const ttlMs = options.ttlMs ?? 15000;
         const heartbeatMs = options.heartbeatMs ?? 5000;
         const lock = new ReplicaLock(rootDirectory, key, heartbeatMs, options.onLost ?? (() => {}));
         await mkdir(path.dirname(lock.lockDirectory), { recursive: true, mode: 0o700 });
@@ -69,13 +69,14 @@ export class ReplicaLock {
                 }
                 try {
                     const owner = await lock.readOwner();
-                    if (
-                        owner
-                        && (
-                            Date.now() - owner.heartbeat <= ttlMs
-                            || ReplicaLock.isProcessAlive(owner.pid)
-                        )
-                    ) {
+                    // The owner pid is authoritative on this machine. A
+                    // process that no longer exists cannot hold the lock even
+                    // if its last heartbeat is younger than the TTL; that is
+                    // the normal state right after a window reload, when the
+                    // old extension host exits without releasing and the new
+                    // host starts a few seconds later. A live pid keeps the
+                    // lock even with a stale heartbeat (a busy host is not dead).
+                    if (owner && ReplicaLock.isProcessAlive(owner.pid)) {
                         throw new ReplicaLockedError(owner);
                     }
                     await rm(lock.lockDirectory, { recursive: true, force: true });
