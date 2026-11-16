@@ -41,6 +41,26 @@ enum UserColors {
     DARK_BROWN = '#804000',
 }
 
+// Remote collaborator cursors arrive as untrusted numbers. vscode.Range throws
+// "Invalid arguments" for negative, fractional or missing coordinates.
+function cursorCoordinate(value: unknown): number {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0
+        ? Math.floor(value)
+        : 0;
+}
+
+function cursorRange(row: unknown, column: unknown): vscode.Range {
+    const line = cursorCoordinate(row);
+    const character = cursorCoordinate(column);
+    return new vscode.Range(line, character, line, character);
+}
+
+function cursorSelection(row: unknown, column: unknown): vscode.Selection {
+    const line = cursorCoordinate(row);
+    const character = cursorCoordinate(column);
+    return new vscode.Selection(line, character, line, character);
+}
+
 function formatTime(timestamp:number) {
     timestamp = Math.floor(timestamp / 1000);
     const hours = Math.floor(timestamp / 3600);
@@ -122,7 +142,7 @@ export class ClientManager {
             const selectedUser = await vscode.window.showQuickPick(
                 Object.keys(this.onlineUsers).map(clientId => {
                     const user = this.onlineUsers[clientId];
-                    const docPath = user.doc_id ? this.vfs._resolveById(user.doc_id)?.path.slice(1) : undefined;
+                    const docPath = user.doc_id ? this.resolveDocById(user.doc_id)?.path.slice(1) : undefined;
                     const cursorInfo = user.row ? vscode.l10n.t('At {docPath}, Line {row}', {docPath, row:user.row+1}) : undefined;
 
                     return {
@@ -140,13 +160,13 @@ export class ClientManager {
         }
 
         const user = this.onlineUsers[id];
-        const docPath = this.vfs._resolveById(user.doc_id)?.path;
+        const docPath = this.resolveDocById(user.doc_id)?.path;
         if (docPath === undefined) { return; }
 
         const uri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===URI_SCHEME) ?
                     this.vfs.pathToUri(docPath) : await LocalReplicaSCMProvider.pathToUri(docPath);
         uri && vscode.window.showTextDocument(uri, {
-            selection: new vscode.Selection(user.row, user.column, user.row, user.column),
+            selection: cursorSelection(user.row, user.column),
             preview: false,
         });
     }
@@ -155,7 +175,7 @@ export class ClientManager {
 
     private refreshDecorations(visibleTextEditors: readonly vscode.TextEditor[]) {
         Object.values(this.onlineUsers).forEach(async user => {
-            const docPath = this.vfs._resolveById(user.doc_id)?.path;
+            const docPath = this.resolveDocById(user.doc_id)?.path;
             if (docPath === undefined) { return; }
 
             const uri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===URI_SCHEME) ?
@@ -164,6 +184,20 @@ export class ClientManager {
             const selection = user.selection;
             selection && editor?.setDecorations(selection.decoration, selection.ranges);
         });
+    }
+
+    /**
+     * Collaboration UI is best-effort. The project tree is absent while the
+     * VFS reconnects, and a collaborator may sit in a document that was just
+     * deleted; neither is an error worth an uncaught exception every 500 ms.
+     */
+    private resolveDocById(docId?: string) {
+        if (!docId) { return undefined; }
+        try {
+            return this.vfs._resolveById(docId);
+        } catch {
+            return undefined;
+        }
     }
 
     private async updatePosition(clientId:string, docId: string, row: number, column: number, details?:UpdateUserSchema) {
@@ -185,7 +219,7 @@ export class ClientManager {
 
         const selection = this.onlineUsers[clientId].selection;
         // remove decoration
-        const oldDoc = this.vfs._resolveById(this.onlineUsers[clientId]?.doc_id);
+        const oldDoc = this.resolveDocById(this.onlineUsers[clientId]?.doc_id);
         if (oldDoc && oldDoc.fileEntity._id !== docId && selection) {
             const oldUri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===URI_SCHEME) ?
                         this.vfs.pathToUri(oldDoc.path) : await LocalReplicaSCMProvider.pathToUri(oldDoc.path);
@@ -195,7 +229,7 @@ export class ClientManager {
         }
 
         // update decoration
-        const newDoc = this.vfs._resolveById(docId);
+        const newDoc = this.resolveDocById(docId);
         if (newDoc === undefined) { return; }
         const newUri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===URI_SCHEME) ?
                     this.vfs.pathToUri(newDoc.path) : await LocalReplicaSCMProvider.pathToUri(newDoc.path);
@@ -215,7 +249,7 @@ export class ClientManager {
                 decoration,
                 hoverMessage,
                 ranges: [{
-                    range: new vscode.Range(row, column, row, column),
+                    range: cursorRange(row, column),
                     hoverMessage: hoverMessage,
                 }],
             };
@@ -223,7 +257,7 @@ export class ClientManager {
             newEditor?.setDecorations(_selection.decoration, _selection.ranges);
         } else {
             selection.ranges = [{
-                range: new vscode.Range(row, column, row, column),
+                range: cursorRange(row, column),
                 hoverMessage: selection.hoverMessage,
             }];
             newEditor?.setDecorations(selection.decoration, selection.ranges);
@@ -231,7 +265,7 @@ export class ClientManager {
     }
 
     private async removePosition(clientId:string) {
-        const doc = this.vfs._resolveById(this.onlineUsers[clientId]?.doc_id);
+        const doc = this.resolveDocById(this.onlineUsers[clientId]?.doc_id);
         if (doc === undefined) { return; }
         // const uri = this.vfs.pathToUri(doc.path);
         const uri = (vscode.workspace.workspaceFolders?.[0].uri.scheme===URI_SCHEME) ?
@@ -307,7 +341,7 @@ export class ClientManager {
 
                         const jumpArgs = JSON.stringify([user.id]);
                         const jumpCommandUri = vscode.Uri.parse(`command:${ROOT_NAME}.collaboration.jumpToUser?${encodeURIComponent(jumpArgs)}`);
-                        const docPath = user.doc_id ? this.vfs._resolveById(user.doc_id)?.path.slice(1) : undefined;
+                        const docPath = user.doc_id ? this.resolveDocById(user.doc_id)?.path.slice(1) : undefined;
                         const cursorInfo = user.row ? ` at <a href="${jumpCommandUri}">${docPath}#L${user.row+1}</a>` : '';
             
                         const since_last_update = user.last_updated_at ? formatTime(Date.now() - user.last_updated_at) : '';
@@ -410,7 +444,14 @@ export class ClientManager {
                     }
                 }
 
-                const doc = uri && await this.vfs._resolveUri(uri);
+                // Local-only files (conflict archives under .overleaf, ignored
+                // build outputs) have no remote entity to share a cursor in.
+                let doc;
+                try {
+                    doc = uri && await this.vfs._resolveUri(uri);
+                } catch {
+                    return;
+                }
                 const docId = doc?.fileEntity?._id;
                 if (docId) {
                     this.socket.updatePosition(docId, e.selections[0].active.line, e.selections[0].active.character);
