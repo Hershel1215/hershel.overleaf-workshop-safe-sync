@@ -164,7 +164,8 @@ export class DocumentSession {
      */
     submitSnapshotAgainstAncestor(ancestor: string, target: string): Promise<string> {
         return this.submitPlannedSnapshot(currentContent => {
-            if (currentContent === ancestor) {
+            // Target already reached; see DurableDocumentSession.
+            if (currentContent === ancestor || currentContent === target) {
                 return target;
             }
             const currentOperation = TextOperation.fromDiff(ancestor, currentContent);

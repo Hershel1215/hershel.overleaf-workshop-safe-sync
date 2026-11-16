@@ -269,7 +269,10 @@ export class DurableDocumentSession {
         operationId?: string,
     ): Promise<AcceptedDocumentOperation> {
         return this.acceptPlannedSnapshot(currentContent => {
-            if (currentContent === ancestor) {
+            // A snapshot whose target is already the document has nothing left
+            // to apply. Rebasing it from a stale ancestor would transform the
+            // change over itself and insert it twice.
+            if (currentContent === ancestor || currentContent === target) {
                 return target;
             }
             const currentOperation = TextOperation.fromDiff(ancestor, currentContent);

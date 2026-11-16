@@ -352,6 +352,13 @@ export class TextReplicaStateMachine {
             this.disposed
             || this.isIsolated
             || observedAncestor === undefined
+            // While onDiskObserved is committing an external write,
+            // canonicalContent is still the pre-write text, so the guards below
+            // cannot recognise VS Code's reload of the same bytes. Buffering it
+            // here would submit the write a second time (transform(A, A)
+            // duplicates every insert). Defer to the queued path, which runs
+            // after the disk commit and sees these bytes as canonical.
+            || this.diskMutationInProgress
             || this.isExpectedEditorProjection(content, observedAncestor)
             || content === this.editorContent
             || (content === this.canonicalContent && !this.input.hasBufferedInput)
