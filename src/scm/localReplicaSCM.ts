@@ -5224,7 +5224,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    private async scanBoth(): Promise<ScanPair> {
+    private async scanBoth(remoteScope?: string): Promise<ScanPair> {
         const projectionEpoch = this.localProjectionCas.observationEpoch;
         const baselineAtStart = new Map(
             Object.entries(this.state?.entries ?? {})
@@ -5234,7 +5234,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.markReconcilePhase('scan:init', iteration);
         await this.vfs.init();
         this.markReconcilePhase('scan:remote', iteration);
-        const remote = await this.scanRemote();
+        const remote = await this.scanRemote(remoteScope);
         this.markReconcilePhase('scan:local', iteration);
         const local = await this.scanLocal(remote);
         return { local, remote, projectionEpoch, baselineAtStart };
@@ -5256,15 +5256,51 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         );
     }
 
-    private async scanRemote(): Promise<Map<string, ReplicaSnapshot>> {
+    private async scanRemote(scope?: string): Promise<Map<string, ReplicaSnapshot>> {
         const result = new Map<string, ReplicaSnapshot>();
         const entities = this.vfs.walk(entity => entity._type !== 'outputs');
+        const pendingFiles: Array<() => Promise<ReplicaSnapshot>> = [];
+        const flushFiles = async (): Promise<void> => {
+            const snapshots = await Promise.all(pendingFiles.map(read => read()));
+            pendingFiles.length = 0;
+            for (const snapshot of snapshots) {
+                result.set(snapshot.path, snapshot);
+            }
+        };
         for (const { entity, path: entityPath } of entities) {
             const filePath = normalizeRelativePath(entityPath);
             if (!filePath || this.isIgnored(filePath)) {
                 continue;
             }
+            if (scope && filePath !== scope && !filePath.startsWith(`${scope}/`)) {
+                continue;
+            }
             this.assertSafePath(filePath);
+            if (entity._type === 'file') {
+                pendingFiles.push(async () => {
+                    const snapshot = this.state && isPathConflicted(filePath, this.state)
+                        ? await this.vfs.readAuthoritativeFileWithoutRecovery(this.remoteUri(filePath))
+                        : await this.vfs.readAuthoritativeFile(this.remoteUri(filePath));
+                    return {
+                        path: filePath,
+                        fileType: snapshot.fileType,
+                        entityId: snapshot.entityId,
+                        hash: contentHash(snapshot.content),
+                        content: snapshot.content,
+                        text: snapshot.fileType === 'doc'
+                            ? new TextDecoder('utf-8', { fatal: true }).decode(snapshot.content)
+                            : undefined,
+                        readonly: entity.readonly,
+                    };
+                });
+                if (pendingFiles.length >= 6) {
+                    await flushFiles();
+                }
+                continue;
+            }
+            if (pendingFiles.length > 0) {
+                await flushFiles();
+            }
             if (entity._type === 'folder') {
                 result.set(filePath, {
                     path: filePath,
@@ -5275,7 +5311,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 });
                 continue;
             }
-            if (entity._type !== 'doc' && entity._type !== 'file') {
+            if (entity._type !== 'doc') {
                 continue;
             }
             const snapshot = this.state && isPathConflicted(filePath, this.state)
@@ -5293,6 +5329,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 text,
                 readonly: entity.readonly,
             });
+        }
+        if (pendingFiles.length > 0) {
+            await flushFiles();
         }
         attachTreeHashes(result);
         this.attachRemoteStructureHashes(result);
@@ -7507,51 +7546,55 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         await this.drainTextConflictTasks();
         await this.drainIsolatedRevisionTasks(filePath);
         this.clearProjectionReceiptsUnder(filePath);
-        let scan = await this.scanBoth();
+        let scan = await this.scanBoth(filePath);
         await this.archiveResolutionCandidates(record, scan);
         await this.drainIsolatedRevisionTasks(filePath);
         await this.adjudicateDocumentRecoveries(record, scan);
         // Recovery commit closes old WAL owners. Re-observe remote state only
         // afterwards so a late, already-accepted server operation is included
         // in the candidate the user is choosing between.
-        scan = await this.scanBoth();
+        scan = await this.scanBoth(filePath);
         await this.archiveResolutionCandidates(record, scan);
-        const local = scan.local.get(filePath);
-        const remote = scan.remote.get(filePath);
-        if (remote) {
-            await this.journalAction(
-                'resolve-conflict',
-                filePath,
-                local,
-                remote,
-                remote.hash,
-                () => this.restoreRemotePath(filePath, scan),
-                undefined,
-                remote.entityId,
-            );
-        } else if (local) {
-            await this.journalAction(
-                'delete-local',
-                filePath,
-                local,
-                undefined,
-                undefined,
-                () => this.restoreRemotePath(filePath, scan),
-            );
-        }
-
-        const canonicalScan = await this.scanBoth();
-        if (!this.isSubtreeConverged(filePath, canonicalScan)) {
-            throw new Error(`Conflict resolution did not converge ${filePath}`);
-        }
-        if (state.pendingAction) {
-            if (!this.pendingActionCompleted(state.pendingAction, canonicalScan)) {
-                throw new Error(`Conflict resolution journal did not complete for ${filePath}`);
+        let restoreScan = scan;
+        // 保留本地时直接提交本地内容，远端版本仅用于归档和并发校验。
+        if (resolution !== 'local') {
+            const local = scan.local.get(filePath);
+            const remote = scan.remote.get(filePath);
+            if (remote) {
+                await this.journalAction(
+                    'resolve-conflict',
+                    filePath,
+                    local,
+                    remote,
+                    remote.hash,
+                    () => this.restoreRemotePath(filePath, scan),
+                    undefined,
+                    remote.entityId,
+                );
+            } else if (local) {
+                await this.journalAction(
+                    'delete-local',
+                    filePath,
+                    local,
+                    undefined,
+                    undefined,
+                    () => this.restoreRemotePath(filePath, scan),
+                );
             }
-            state.pendingAction = undefined;
+
+            restoreScan = await this.scanBoth();
+            if (!this.isSubtreeConverged(filePath, restoreScan)) {
+                throw new Error(`Conflict resolution did not converge ${filePath}`);
+            }
+            if (state.pendingAction) {
+                if (!this.pendingActionCompleted(state.pendingAction, restoreScan)) {
+                    throw new Error(`Conflict resolution journal did not complete for ${filePath}`);
+                }
+                state.pendingAction = undefined;
+            }
+            await this.refreshConvergedState(state, restoreScan, filePath);
+            await this.stateStore.save(state);
         }
-        await this.refreshConvergedState(state, canonicalScan, filePath);
-        await this.stateStore.save(state);
 
         let restoredSiblingPath: string | undefined;
         if (resolution !== 'remote') {
@@ -7583,13 +7626,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 await this.copyLocalTree(
                     record.localFile,
                     target,
-                    resolution === 'local' ? canonicalScan.local : undefined,
+                    resolution === 'local' ? restoreScan.local : undefined,
                     record.localType,
                 );
             } else if (resolution === 'local') {
-                const canonicalLocal = canonicalScan.local.get(record.path);
-                if (canonicalLocal) {
-                    await this.deleteLocalSnapshot(record.path, canonicalLocal, canonicalScan.local);
+                const currentLocal = restoreScan.local.get(record.path);
+                if (currentLocal) {
+                    await this.deleteLocalSnapshot(record.path, currentLocal, restoreScan.local);
                 }
             }
         }
@@ -7639,7 +7682,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         let mutationCount = 0;
         let maximumMutations = 32;
         while (mutationCount <= maximumMutations) {
-            let scan = await this.scanBoth();
+            let scan = await this.scanBoth(filePath);
             const subtreeSize = [...new Set([
                 ...scan.local.keys(),
                 ...scan.remote.keys(),
@@ -7664,6 +7707,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
 
             if (this.isSubtreeConverged(filePath, scan)) {
+                scan = await this.scanBoth();
+                if (!this.isSubtreeConverged(filePath, scan)) {
+                    mutationCount++;
+                    continue;
+                }
                 await this.refreshConvergedState(state, scan, resolvedConflictPath);
                 await this.stateStore.save(state);
                 return;
@@ -8019,7 +8067,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         _scan: ScanPair,
         attempt = 0,
     ): Promise<void> {
-        let current = await this.scanBoth();
+        let current = await this.scanBoth(filePath);
         const remoteEntries = [...current.remote.values()]
             .filter(snapshot => snapshot.path === filePath || snapshot.path.startsWith(`${filePath}/`))
             .sort((left, right) => left.path.split('/').length - right.path.split('/').length);
@@ -8028,7 +8076,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (localRoot) {
                 await this.deleteLocalSnapshot(filePath, localRoot, current.local);
             }
-            const verification = await this.scanBoth();
+            const verification = await this.scanBoth(filePath);
             const divergence = this.describeSubtreeDivergence(filePath, verification);
             if (divergence === undefined) {
                 return;
@@ -8050,12 +8098,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         for (const extra of localExtras) {
             await this.deleteLocalSnapshot(extra.path, extra, current.local);
         }
-        current = await this.scanBoth();
+        current = await this.scanBoth(filePath);
         for (const remote of remoteEntries) {
             let local = current.local.get(remote.path);
             if (local && local.fileType !== remote.fileType) {
                 await this.deleteLocalSnapshot(remote.path, local, current.local);
-                current = await this.scanBoth();
+                current = await this.scanBoth(filePath);
                 local = current.local.get(remote.path);
             }
             if (!local || local.fileType !== remote.fileType || local.hash !== remote.hash) {
@@ -8063,10 +8111,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     remote,
                     local?.fileType === remote.fileType ? local : undefined,
                 );
-                current = await this.scanBoth();
+                current = await this.scanBoth(filePath);
             }
         }
-        const verification = await this.scanBoth();
+        const verification = await this.scanBoth(filePath);
         const divergence = this.describeSubtreeDivergence(filePath, verification);
         if (divergence !== undefined) {
             if (attempt >= 4) {
