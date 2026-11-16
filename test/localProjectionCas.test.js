@@ -101,6 +101,13 @@ describe('local projection compare-and-swap', () => {
         assert.strictEqual(await readFile(target, 'utf8'), 'REMOTE');
     });
 
+    it('ignores stray files such as Finder .DS_Store in the transaction root', async () => {
+        const transactionRoot = path.join(root, '.overleaf', 'projections');
+        await writeFile(path.join(transactionRoot, '.DS_Store'), bytes('finder metadata'));
+        assert.deepStrictEqual(await new LocalProjectionCas(root).recover(), []);
+        assert.deepStrictEqual(await readdir(transactionRoot), ['.DS_Store']);
+    });
+
     it('never interprets partially unlinked cleanup children as a live transaction', async () => {
         const transactionRoot = path.join(root, '.overleaf', 'projections');
         const partialStates = [

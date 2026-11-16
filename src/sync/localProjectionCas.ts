@@ -8,6 +8,7 @@ import {
 } from 'fs';
 import {
     link,
+    lstat,
     open,
     readFile,
     readdir,
@@ -113,6 +114,18 @@ export class LocalProjectionCas {
             if (entry.startsWith(COMPLETED_TRANSACTION_PREFIX)) {
                 await rm(transactionDirectory, {recursive: true, force: true});
                 continue;
+            }
+            // Transactions are always directories. Skip stray files such as
+            // Finder's .DS_Store instead of failing replica startup with ENOTDIR.
+            try {
+                if (!(await lstat(transactionDirectory)).isDirectory()) {
+                    continue;
+                }
+            } catch (error) {
+                if (errorCode(error) === 'ENOENT') {
+                    continue;
+                }
+                throw error;
             }
             let metadata: ProjectionTransaction;
             try {
