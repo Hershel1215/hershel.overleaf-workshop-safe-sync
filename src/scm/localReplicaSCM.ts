@@ -7438,7 +7438,30 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const choice: ConflictResolution = resolution === useRemote
             ? 'remote'
             : resolution === useLocal ? 'local' : 'both';
-        await this.enqueueConflictResolution(record.path, choice);
+        // A resolution archives both sides, waits for queued synchronization,
+        // and round-trips the server, which can take minutes. Without visible
+        // progress a running resolution reads as one that never started.
+        const startedAt = Date.now();
+        this.output.appendLine(`[resolve] ${record.path}: started (${choice})`);
+        try {
+            await vscode.window.withProgress(
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: `Resolving safe-sync conflict: ${record.path}`,
+                    cancellable: false,
+                },
+                () => this.enqueueConflictResolution(record.path, choice),
+            );
+        } catch (error) {
+            const message = this.asError(error).message;
+            this.output.appendLine(`[resolve] ${record.path}: failed: ${message}`);
+            void vscode.window.showErrorMessage(
+                `Safe-sync conflict resolution failed for ${record.path}: ${message}`,
+            );
+            return;
+        }
+        const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+        this.output.appendLine(`[resolve] ${record.path}: resolved in ${seconds} s`);
         vscode.window.showInformationMessage(`Safe-sync conflict resolved: ${record.path}`);
     }
 
