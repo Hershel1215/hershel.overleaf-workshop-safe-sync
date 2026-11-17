@@ -245,6 +245,48 @@ class DocumentRecoveryAdvancedError extends Error {}
 
 class DocumentRecoveryPendingError extends Error {}
 
+const DOCUMENT_ADMISSION_RETRY_BASE_MS = 1000;
+const DOCUMENT_ADMISSION_RETRY_MAX_MS = 30000;
+const DOCUMENT_ADMISSION_RETRY_POLL_MS = 250;
+
+/**
+ * Whether opening a document session failed for a reason a later attempt can
+ * clear by itself: the server or network did not answer. These failures
+ * happen before the operation reaches the WAL, so nothing has been journaled
+ * and retrying the same snapshot is exact. Anything that proves a fork, a
+ * fence, or uncertain WAL ownership is not transient and must surface.
+ */
+export function isTransientDocumentAdmissionFailure(error: unknown): boolean {
+    if (isSocketIOTimeout(error)) {
+        return true;
+    }
+    if (
+        !(error instanceof Error)
+        || error instanceof DocumentSessionRetiredError
+        || error instanceof DocumentOtHistoryError
+        || error instanceof DocumentRecoveryIsolationError
+        || error instanceof DocumentSessionFactoryCleanupError
+        || error instanceof ConcurrentRemoteResourceError
+    ) {
+        return false;
+    }
+    if (/retiring/i.test(error.message)) {
+        return false;
+    }
+    const code = (error as NodeJS.ErrnoException).code;
+    return [
+        'ECONNRESET',
+        'ECONNREFUSED',
+        'ETIMEDOUT',
+        'EAI_AGAIN',
+        'ENETUNREACH',
+        'ENOTFOUND',
+        'EPIPE',
+    ].includes(code ?? '')
+        || /waiting for project reconnection|timed out|disconnected|network|socket hang up|connection lost/i
+            .test(error.message);
+}
+
 export class File implements vscode.FileStat {
     type: vscode.FileType;
     name: string;
@@ -2277,7 +2319,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         const finishAdmission = this.admitDocumentAccept(fileEntity._id);
         try {
             for (let attempt = 0; attempt < 2; attempt++) {
-                const session = await this.getDocumentSession(
+                const session = await this.getDocumentSessionForAccept(
                     fileEntity,
                     resolvedPath,
                 );
@@ -2354,6 +2396,59 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
         const session = await this.getDocumentSession(document, resolvedPath);
         return session.inspectOperation(operationId);
+    }
+
+    /**
+     * Open the session an accept journals through, waiting out a server or
+     * network that does not answer. Opening happens before the operation
+     * reaches the WAL, so a retry submits exactly the same snapshot. Failing
+     * here instead used to isolate the document as a path conflict that only
+     * a manual resolution could clear, for content that never diverged.
+     * Retirement, recovery fences, and every non-transient failure still
+     * surface immediately.
+     */
+    private async getDocumentSessionForAccept(
+        doc: DocumentEntity,
+        path: string,
+    ): Promise<DurableDocumentSession> {
+        for (let retry = 0; ; retry++) {
+            try {
+                return await this.getDocumentSession(doc, path);
+            } catch (error) {
+                if (this.retiring || !isTransientDocumentAdmissionFailure(error)) {
+                    throw error;
+                }
+                const delayMs = Math.min(
+                    DOCUMENT_ADMISSION_RETRY_BASE_MS * Math.pow(2, retry),
+                    DOCUMENT_ADMISSION_RETRY_MAX_MS,
+                );
+                console.warn(
+                    `[safe-sync] Opening ${path} failed transiently; retrying in ${delayMs} ms:`,
+                    error instanceof Error ? error.message : String(error),
+                );
+                await this.waitForDocumentAdmissionRetry(doc._id, delayMs);
+                this.assertNotRetiring();
+                this.assertDocumentRecoveryAvailable(doc._id);
+            }
+        }
+    }
+
+    /** Sleep before a retry, waking early when the document may no longer be opened. */
+    private async waitForDocumentAdmissionRetry(documentId: string, delayMs: number): Promise<void> {
+        const deadline = Date.now() + delayMs;
+        while (Date.now() < deadline) {
+            if (
+                this.retiring
+                || this.documentRecoveryFences.has(documentId)
+                || this.documentRecoveryIsolations?.has(documentId)
+            ) {
+                return;
+            }
+            await new Promise(resolve => setTimeout(
+                resolve,
+                Math.min(DOCUMENT_ADMISSION_RETRY_POLL_MS, Math.max(0, deadline - Date.now())),
+            ));
+        }
     }
 
     private admitDocumentAccept(documentId: string): () => void {

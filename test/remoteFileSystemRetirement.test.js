@@ -614,6 +614,131 @@ describe('VirtualFileSystem retirement fence', () => {
         ]);
     });
 
+    describe('transient document admission failures', () => {
+        function joinTimeout(event) {
+            const error = new Error(`Socket.IO ${event} acknowledgement timed out after 10000 ms`);
+            error.name = 'SocketIOTimeoutError';
+            return error;
+        }
+
+        function admissionVfs(openSession) {
+            const events = [];
+            const VirtualFileSystem = loadVirtualFileSystem(async () => ({}), events);
+            const vfs = createVfs(VirtualFileSystem, {
+                joinProject: async () => ({}),
+                getProjectSettings: async () => ({settings: {}}),
+            }, events);
+            const document = {_id: 'doc-id', name: 'main.tex'};
+            vfs.root = {};
+            vfs.connectionReady = true;
+            vfs._resolveById = () => ({fileType: 'doc', fileEntity: document, path: '/main.tex'});
+            vfs.getDocumentSession = openSession;
+            vfs.observeLogicalDocumentOperation = (_e, _p, _o, _s, acknowledgement) => acknowledgement;
+            return {vfs, events};
+        }
+
+        it('retries a join timeout instead of failing the commit', async function() {
+            this.timeout(10000);
+            const accepts = [];
+            let opens = 0;
+            const {vfs} = admissionVfs(async () => {
+                opens++;
+                if (opens === 1) {
+                    throw joinTimeout('joinProject');
+                }
+                return {
+                    acceptSnapshotAgainstAncestor: async (...args) => {
+                        accepts.push(args);
+                        return {opId: 'op', content: 'aLb', acknowledgement: Promise.resolve('aLb')};
+                    },
+                };
+            });
+
+            const accepted = await vfs.acceptDocumentSnapshotAgainstAncestor(
+                {path: '/main.tex'}, 'ab', 'aLb', true, 'doc-id',
+            );
+
+            assert.strictEqual(accepted.content, 'aLb');
+            assert.strictEqual(opens, 2);
+            // The snapshot reaches the WAL exactly once, after the retry.
+            assert.deepStrictEqual(accepts, [['ab', 'aLb', true]]);
+        });
+
+        it('retries while the project is still reconnecting', async function() {
+            this.timeout(10000);
+            let opens = 0;
+            const {vfs} = admissionVfs(async () => {
+                opens++;
+                if (opens === 1) {
+                    throw new Error('Remote document session is waiting for project reconnection');
+                }
+                return {
+                    acceptSnapshotAgainstAncestor: async () => (
+                        {content: 'aLb', acknowledgement: Promise.resolve('aLb')}
+                    ),
+                };
+            });
+
+            const accepted = await vfs.acceptDocumentSnapshotAgainstAncestor(
+                {path: '/main.tex'}, 'ab', 'aLb', true, 'doc-id',
+            );
+            assert.strictEqual(accepted.content, 'aLb');
+            assert.strictEqual(opens, 2);
+        });
+
+        it('surfaces a non-transient open failure immediately', async () => {
+            let opens = 0;
+            const {vfs} = admissionVfs(async () => {
+                opens++;
+                throw new Error('Safe text synchronization requires the realtime Overleaf OT protocol');
+            });
+
+            await assert.rejects(
+                vfs.acceptDocumentSnapshotAgainstAncestor(
+                    {path: '/main.tex'}, 'ab', 'aLb', true, 'doc-id',
+                ),
+                /requires the realtime Overleaf OT protocol/,
+            );
+            assert.strictEqual(opens, 1);
+        });
+
+        it('stops retrying once the session starts retiring', async function() {
+            this.timeout(10000);
+            let opens = 0;
+            const {vfs} = admissionVfs(async () => {
+                opens++;
+                throw joinTimeout('joinProject');
+            });
+
+            const accepting = vfs.acceptDocumentSnapshotAgainstAncestor(
+                {path: '/main.tex'}, 'ab', 'aLb', true, 'doc-id',
+            );
+            await new Promise(resolve => setTimeout(resolve, 50));
+            vfs.retiring = true;
+
+            await assert.rejects(accepting, /retiring/);
+            assert.strictEqual(opens, 1);
+        });
+
+        it('classifies transient and non-transient admission failures', () => {
+            const {isTransientDocumentAdmissionFailure} = require('../out/core/remoteFileSystemProvider');
+            const {DocumentSessionRetiredError} = require('../out/sync/durableDocumentSession');
+            const reset = Object.assign(new Error('read'), {code: 'ECONNRESET'});
+
+            assert.strictEqual(isTransientDocumentAdmissionFailure(joinTimeout('joinDoc')), true);
+            assert.strictEqual(isTransientDocumentAdmissionFailure(reset), true);
+            assert.strictEqual(isTransientDocumentAdmissionFailure(
+                new Error('Remote document session is retiring for replica handoff'),
+            ), false);
+            assert.strictEqual(isTransientDocumentAdmissionFailure(
+                new DocumentSessionRetiredError('Document recovery is being discarded for doc-id'),
+            ), false);
+            assert.strictEqual(isTransientDocumentAdmissionFailure(
+                new Error('Expected an Overleaf document at /main.tex'),
+            ), false);
+        });
+    });
+
     it('catches up a suspended WAL owner before reconnect becomes writable', async () => {
         const events = [];
         const VirtualFileSystem = loadVirtualFileSystem(async () => ({}), events);
