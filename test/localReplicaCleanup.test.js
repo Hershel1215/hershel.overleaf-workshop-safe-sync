@@ -7757,4 +7757,224 @@ describe('Local Replica projection atomicity', () => {
         assert.strictEqual(new TextDecoder().decode(disk.bytes), localAfterProjection);
         assert(!converged.includes('remote remote'));
     });
+
+    it('treats timeouts, fetch failures, and invalidated recovery transport as transient with geometric backoff', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        provider.state = {schemaVersion: 1, entries: {}, conflicts: {}};
+        provider.lastScan = {local: new Map(), remote: new Map()};
+        provider.output = {appendLine: () => {}};
+        provider.failProject = error => assert.fail(`paused project: ${error.message}`);
+        provider.isolatePathFailure = (filePath, error) => assert.fail(
+            `isolated ${filePath} for transient error: ${error.message}`,
+        );
+        const scheduled = [];
+        provider.scheduleReconcile = (reason, delay) => scheduled.push({reason, delay});
+
+        const abortedTimeout = new Error('The operation was aborted due to timeout');
+        abortedTimeout.name = 'TimeoutError';
+        const fetchFailure = new TypeError('fetch failed', {
+            cause: Object.assign(new Error('Body Timeout Error'), {code: 'UND_ERR_BODY_TIMEOUT'}),
+        });
+        const recoveryInvalidated = new Error(
+            'Document membership transport was invalidated during project recovery',
+        );
+        const errors = [
+            abortedTimeout,
+            fetchFailure,
+            recoveryInvalidated,
+            abortedTimeout,
+            fetchFailure,
+            recoveryInvalidated,
+            abortedTimeout,
+        ];
+
+        for (const error of errors) {
+            provider.currentActionPath = 'figures/plot.png';
+            await provider.handleReconcileError(error);
+            assert.strictEqual(provider.currentActionPath, undefined);
+        }
+
+        assert.deepStrictEqual(
+            scheduled.map(entry => entry.delay),
+            [1000, 2000, 4000, 8000, 16000, 30000, 30000],
+        );
+        assert.strictEqual(provider.pausedError, undefined);
+    });
+
+    it('caps concurrent remote binary downloads at 2 during scanRemote', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: false,
+            updatedAt: new Date(0).toISOString(),
+            entries: {},
+            conflicts: {},
+        };
+        provider.remoteUri = pathname => ({path: `/${pathname}`});
+        provider.isIgnored = () => false;
+        provider.assertSafePath = () => {};
+
+        const entities = Array.from({length: 6}, (_, index) => ({
+            entity: {_id: `file-${index}`, _type: 'file', readonly: false},
+            path: `figures/fig-${index}.png`,
+        }));
+        let active = 0;
+        let maxActive = 0;
+        let reads = 0;
+        provider.vfs = {
+            walk: () => entities,
+            readAuthoritativeFile: async uri => {
+                active += 1;
+                maxActive = Math.max(maxActive, active);
+                reads += 1;
+                await new Promise(resolve => setTimeout(resolve, 15));
+                active -= 1;
+                return {
+                    entityId: `file-${uri.path}`,
+                    fileType: 'file',
+                    content: new TextEncoder().encode(uri.path),
+                };
+            },
+        };
+
+        const scan = await provider.scanRemote();
+        assert.strictEqual(reads, 6);
+        assert.strictEqual(maxActive, 2);
+        assert.strictEqual(scan.size, 6);
+    });
+
+    it('reuses verified baseline bytes for unchanged immutable binaries and downloads all edge cases live', async () => {
+        const LocalReplicaSCMProvider = loadProvider();
+        const provider = Object.create(LocalReplicaSCMProvider.prototype);
+
+        const unchangedBytes = Buffer.from('unchanged-binary');
+        const changedBytes = Buffer.from('changed-remote-binary');
+        const conflictedBytes = Buffer.from('conflicted-remote-binary');
+        const pendingBytes = Buffer.from('pending-remote-binary');
+        const linkedBytes = Buffer.from('linked-remote-binary');
+        const corruptMissingBytes = Buffer.from('redownloaded-after-corrupt-baseline');
+
+        const baselines = new Map([
+            [contentHash(unchangedBytes), unchangedBytes],
+            [contentHash(conflictedBytes), conflictedBytes],
+            [contentHash(pendingBytes), pendingBytes],
+            [contentHash(linkedBytes), linkedBytes],
+            ['expected-valid-hash', Buffer.from('corrupt-bytes-on-disk')],
+        ]);
+
+        provider.stateStore = {
+            readBaseline: async hash => baselines.get(hash),
+        };
+        provider.state = {
+            schemaVersion: 1,
+            replicaId: 'replica',
+            initialized: true,
+            updatedAt: new Date(0).toISOString(),
+            entries: {
+                'figures/unchanged.png': {
+                    entityId: 'id-unchanged',
+                    fileType: 'file',
+                    hash: contentHash(unchangedBytes),
+                },
+                'figures/changed.png': {
+                    entityId: 'id-changed-old',
+                    fileType: 'file',
+                    hash: contentHash(Buffer.from('old-bytes')),
+                },
+                'figures/conflicted.png': {
+                    entityId: 'id-conflicted',
+                    fileType: 'file',
+                    hash: contentHash(conflictedBytes),
+                },
+                'figures/pending.png': {
+                    entityId: 'id-pending',
+                    fileType: 'file',
+                    hash: contentHash(pendingBytes),
+                },
+                'figures/linked.png': {
+                    entityId: 'id-linked',
+                    fileType: 'file',
+                    hash: contentHash(linkedBytes),
+                },
+                'figures/corrupt.png': {
+                    entityId: 'id-corrupt',
+                    fileType: 'file',
+                    hash: 'expected-valid-hash',
+                },
+            },
+            conflicts: {
+                'figures/conflicted.png': {
+                    path: 'figures/conflicted.png',
+                    reason: 'conflict',
+                    artifactDirectory: '.overleaf/conflicts/unresolved/c1',
+                    createdAt: new Date(0).toISOString(),
+                },
+            },
+            pendingAction: {
+                id: 'pending-1',
+                kind: 'push',
+                path: 'figures/pending.png',
+                startedAt: new Date(0).toISOString(),
+            },
+        };
+        provider.remoteUri = pathname => ({path: `/${pathname}`});
+        provider.isIgnored = () => false;
+        provider.assertSafePath = () => {};
+
+        const liveContentByPath = {
+            '/figures/changed.png': {id: 'id-changed-new', content: changedBytes},
+            '/figures/conflicted.png': {id: 'id-conflicted', content: conflictedBytes},
+            '/figures/pending.png': {id: 'id-pending', content: pendingBytes},
+            '/figures/linked.png': {id: 'id-linked', content: linkedBytes},
+            '/figures/corrupt.png': {id: 'id-corrupt', content: corruptMissingBytes},
+            '/figures/unchanged.png': {id: 'id-unchanged', content: unchangedBytes},
+        };
+        const downloadedNormal = [];
+        const downloadedWithoutRecovery = [];
+        provider.vfs = {
+            walk: () => [
+                {entity: {_id: 'id-unchanged', _type: 'file', linkedFileData: null}, path: 'figures/unchanged.png'},
+                {entity: {_id: 'id-changed-new', _type: 'file', linkedFileData: null}, path: 'figures/changed.png'},
+                {entity: {_id: 'id-conflicted', _type: 'file', linkedFileData: null}, path: 'figures/conflicted.png'},
+                {entity: {_id: 'id-pending', _type: 'file', linkedFileData: null}, path: 'figures/pending.png'},
+                {entity: {_id: 'id-linked', _type: 'file', linkedFileData: {provider: 'url'}}, path: 'figures/linked.png'},
+                {entity: {_id: 'id-corrupt', _type: 'file', linkedFileData: null}, path: 'figures/corrupt.png'},
+            ],
+            readAuthoritativeFile: async uri => {
+                downloadedNormal.push(uri.path);
+                const entry = liveContentByPath[uri.path];
+                return {entityId: entry.id, fileType: 'file', content: entry.content};
+            },
+            readAuthoritativeFileWithoutRecovery: async uri => {
+                downloadedWithoutRecovery.push(uri.path);
+                const entry = liveContentByPath[uri.path];
+                return {entityId: entry.id, fileType: 'file', content: entry.content};
+            },
+        };
+
+        const fullScan = await provider.scanRemote();
+        assert.deepStrictEqual(downloadedNormal.sort(), [
+            '/figures/changed.png',
+            '/figures/corrupt.png',
+            '/figures/linked.png',
+            '/figures/pending.png',
+        ]);
+        assert.deepStrictEqual(downloadedWithoutRecovery, ['/figures/conflicted.png']);
+        assert.strictEqual(
+            Buffer.compare(Buffer.from(fullScan.get('figures/unchanged.png').content), unchangedBytes),
+            0,
+        );
+        assert.strictEqual(
+            Buffer.compare(Buffer.from(fullScan.get('figures/corrupt.png').content), corruptMissingBytes),
+            0,
+        );
+
+        // Scoped scans always fetch live even when baseline matches.
+        downloadedNormal.length = 0;
+        await provider.scanRemote('figures/unchanged.png');
+        assert.deepStrictEqual(downloadedNormal, ['/figures/unchanged.png']);
+    });
 });

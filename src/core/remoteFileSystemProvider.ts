@@ -44,6 +44,8 @@ const DOCUMENT_RECONNECT_RETRY_BASE_MS = 250;
 const DOCUMENT_RECONNECT_RETRY_MAX_MS = 10000;
 const REMOTE_MUTATION_OBSERVATION_TIMEOUT_MS = 5000;
 const REMOTE_MUTATION_OBSERVATION_INTERVAL_MS = 50;
+const INITIALIZATION_MAX_RETRIES = 5;
+const INITIALIZATION_RECOVERY_COOLDOWN_MS = 60_000;
 export const EMPTY_REMOTE_FOLDER_TREE_HASH = contentHash(
     new TextEncoder().encode('[]'),
 );
@@ -273,8 +275,7 @@ export function isTransientDocumentAdmissionFailure(error: unknown): boolean {
     if (/retiring/i.test(error.message)) {
         return false;
     }
-    const code = (error as NodeJS.ErrnoException).code;
-    return [
+    const transientCodes = new Set([
         'ECONNRESET',
         'ECONNREFUSED',
         'ETIMEDOUT',
@@ -282,9 +283,40 @@ export function isTransientDocumentAdmissionFailure(error: unknown): boolean {
         'ENETUNREACH',
         'ENOTFOUND',
         'EPIPE',
-    ].includes(code ?? '')
-        || /waiting for project reconnection|timed out|disconnected|network|socket hang up|connection lost/i
-            .test(error.message);
+        'UND_ERR_CONNECT_TIMEOUT',
+        'UND_ERR_HEADERS_TIMEOUT',
+        'UND_ERR_BODY_TIMEOUT',
+        'UND_ERR_SOCKET',
+        'UND_ERR_ABORTED',
+    ]);
+    const transientMessage = /waiting for project reconnection|timed out|\btimeout\b|aborted due to timeout|fetch failed|transport was invalidated|transport changed during project initialization|disconnected|network|socket hang up|connection lost/i;
+    const visited = new Set<unknown>();
+    let current: unknown = error;
+    for (let depth = 0; depth <= 4 && current !== null && current !== undefined; depth++) {
+        if (visited.has(current)) {
+            break;
+        }
+        visited.add(current);
+        if (isSocketIOTimeout(current)) {
+            return true;
+        }
+        if (typeof current === 'object') {
+            const record = current as {name?: unknown; code?: unknown; message?: unknown; cause?: unknown};
+            if (record.name === 'TimeoutError') {
+                return true;
+            }
+            if (typeof record.code === 'string' && transientCodes.has(record.code)) {
+                return true;
+            }
+            if (typeof record.message === 'string' && transientMessage.test(record.message)) {
+                return true;
+            }
+            current = record.cause;
+        } else {
+            break;
+        }
+    }
+    return false;
 }
 
 export class File implements vscode.FileStat {
@@ -351,12 +383,15 @@ export class VirtualFileSystem extends vscode.Disposable {
     private isDirty: boolean = true;
     private initializing?: Promise<ProjectEntity>;
     private initializationError?: Error;
+    private initializationErrorAt?: number;
     private lastConnectionError?: Error;
     private retirementPromise?: Promise<void>;
     private connectionReady = false;
     private retryConnection: number = 0;
     /** Whether a "Reconnecting..." notification is currently shown */
     private reconnectingNotification: boolean = false;
+    private connectionLostNotified = false;
+    private initializationRecoveryProbe = false;
     private retiring = false;
     /** Whether event handlers have been registered on the current socket */
     private handlersRegistered: boolean = false;
@@ -513,7 +548,17 @@ export class VirtualFileSystem extends vscode.Disposable {
             return this.initializing;
         }
         if (this.initializationError) {
-            throw this.initializationError;
+            const elapsed = this.initializationErrorAt === undefined
+                ? 0
+                : Date.now() - this.initializationErrorAt;
+            if (elapsed < INITIALIZATION_RECOVERY_COOLDOWN_MS) {
+                throw this.initializationError;
+            }
+            this.initializationError = undefined;
+            this.initializationErrorAt = undefined;
+            this.lastConnectionError = undefined;
+            this.retryConnection = INITIALIZATION_MAX_RETRIES - 1;
+            this.initializationRecoveryProbe = true;
         }
         // Publish ownership before any synchronous socket event can re-enter.
         const initializing = Promise.resolve().then(() => this.initializingPromise);
@@ -528,42 +573,53 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private get initializingPromise(): Promise<ProjectEntity> {
-        const MAX_RETRIES = 5;
         const BASE_DELAY_MS = 1000; // 1 second base delay
 
         this.assertNotRetiring();
 
         // if retry connection exhausted, show error
-        if (this.retryConnection >= MAX_RETRIES) {
+        if (this.retryConnection >= INITIALIZATION_MAX_RETRIES) {
             const error = this.lastConnectionError ?? new Error(vscode.l10n.t('Connection lost'));
             this.initializationError = error;
-            vscode.window.showErrorMessage(
-                vscode.l10n.t('Connection lost: {serverName}', {serverName:this.serverName}),
-                vscode.l10n.t('Reload'),
-                vscode.l10n.t('Retry'),
-            ).then(async (choice) => {
-                if (this.retiring) {
-                    return;
-                }
-                if (choice === vscode.l10n.t('Reload')) {
-                    vscode.commands.executeCommand("workbench.action.reloadWindow");
-                } else if (choice === vscode.l10n.t('Retry')) {
-                    await this.initializing?.catch(() => {});
+            this.initializationErrorAt = Date.now();
+            this.initializationRecoveryProbe = false;
+            if (!this.connectionLostNotified) {
+                this.connectionLostNotified = true;
+                vscode.window.showErrorMessage(
+                    vscode.l10n.t('Connection lost: {serverName}', {serverName:this.serverName}),
+                    vscode.l10n.t('Reload'),
+                    vscode.l10n.t('Retry'),
+                ).then(async (choice) => {
                     if (this.retiring) {
                         return;
                     }
-                    this.retryConnection = 0;
-                    this.initializationError = undefined;
-                    this.lastConnectionError = undefined;
-                    this.socket.init(); // Recreate socket after all auto-reconnect attempts exhausted
-                    await this.init().catch(() => {});
-                }
-            });
+                    if (choice === vscode.l10n.t('Reload')) {
+                        vscode.commands.executeCommand("workbench.action.reloadWindow");
+                    } else if (choice === vscode.l10n.t('Retry')) {
+                        await this.initializing?.catch(() => {});
+                        if (this.retiring) {
+                            return;
+                        }
+                        this.retryConnection = 0;
+                        this.initializationError = undefined;
+                        this.initializationErrorAt = undefined;
+                        this.lastConnectionError = undefined;
+                        this.connectionLostNotified = false;
+                        this.initializationRecoveryProbe = false;
+                        this.socket.init(); // Recreate socket after all auto-reconnect attempts exhausted
+                        await this.init().catch(() => {});
+                    }
+                });
+            }
             throw error;
         }
 
-        // exponential backoff delay: 1s, 2s, 4s, 8s, 16s
-        const delayMs = this.retryConnection > 0 ? Math.min(BASE_DELAY_MS * Math.pow(2, this.retryConnection - 1), 16000) : 0;
+        const isRecoveryProbe = Boolean(this.initializationRecoveryProbe);
+        this.initializationRecoveryProbe = false;
+        // exponential backoff delay: 1s, 2s, 4s, 8s, 16s (skip on immediate cooldown probe)
+        const delayMs = !isRecoveryProbe && this.retryConnection > 0
+            ? Math.min(BASE_DELAY_MS * Math.pow(2, this.retryConnection - 1), 16000)
+            : 0;
 
         // Show reconnecting notification on first retry
         if (this.retryConnection === 1 && !this.reconnectingNotification) {
@@ -594,7 +650,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
 
             // One owner rebuilds a rejected, disconnected, or timed-out transport.
-            if (this.socket.needsReinit) {
+            if (this.socket.needsReinit || (isRecoveryProbe && typeof this.socket.init === 'function')) {
                 this.socket.init();
             }
 
@@ -645,6 +701,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                 vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
                 this.retryConnection = 0;
                 this.lastConnectionError = undefined;
+                this.initializationError = undefined;
+                this.initializationErrorAt = undefined;
+                this.connectionLostNotified = false;
+                this.initializationRecoveryProbe = false;
                 return project;
             } catch (error) {
                 if (this.retiring) {

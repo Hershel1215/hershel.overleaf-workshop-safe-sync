@@ -76,6 +76,9 @@ export interface EventsHandler {
 
 type ConnectionScheme = 'Alt' | 'v1' | 'v2';
 
+/** Allow cross-border Socket.IO handshake and joinProject/joinDoc round trips to finish. */
+const SOCKET_EVENT_TIMEOUT_MS = 30000;
+
 /**
  * An acknowledgement timeout is a transport observation failure, not an OT
  * rejection.  Keeping it typed lets callers retry reads/reconnect without
@@ -84,7 +87,7 @@ type ConnectionScheme = 'Alt' | 'v1' | 'v2';
 export class SocketIOTimeoutError extends Error {
     readonly code = 'SOCKET_IO_TIMEOUT';
 
-    constructor(readonly event: string, readonly timeoutMs = 10000) {
+    constructor(readonly event: string, readonly timeoutMs = SOCKET_EVENT_TIMEOUT_MS) {
         super(`Socket.IO ${event} acknowledgement timed out after ${timeoutMs} ms`);
         this.name = 'SocketIOTimeoutError';
     }
@@ -112,8 +115,6 @@ export function isSocketIOTimeout(error: unknown): boolean {
         || (typeof error === 'string' && error === 'timeout')
         || (error instanceof Error && error.name === 'SocketIOTimeoutError');
 }
-
-const SOCKET_EVENT_TIMEOUT_MS = 10000;
 
 export class SocketIOAPI {
     private scheme: ConnectionScheme = 'v1';

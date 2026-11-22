@@ -27,7 +27,10 @@ npm run test:unit
 npm run lint
 npm run compile
 
-readarray -t identity < <(node - <<'NODE'
+identity=()
+while IFS= read -r line; do
+  identity+=("$line")
+done < <(node - <<'NODE'
 const manifest = require('./package.json');
 if (manifest.publisher !== 'hershel' || manifest.name !== 'overleaf-workshop-safe-sync') {
     throw new Error(`Unexpected extension identity: ${manifest.publisher}.${manifest.name}`);

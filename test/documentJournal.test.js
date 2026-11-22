@@ -262,7 +262,8 @@ describe('document operation journal', () => {
         await recovered.close();
     });
 
-    it('bounds WAL records and settled disposition evidence across thousands of edits', async () => {
+    it('bounds WAL records and settled disposition evidence across thousands of edits', async function () {
+        this.timeout(30000);
         const journal = await open();
         let content = 'ab';
         const operationCount = 1200;

@@ -47,6 +47,7 @@ const LARGE_REQUEST_BODY_BYTES = 1024 * 1024;
 export interface TransferPolicy {
     baseTimeoutMs: number;
     minBytesPerSecond: number;
+    retryBaseDelayMs?: number;
 }
 
 const DEFAULT_TRANSFER_POLICY: TransferPolicy = {
@@ -58,6 +59,18 @@ const DEFAULT_TRANSFER_POLICY: TransferPolicy = {
 export function transferTimeoutMs(bytes: number, policy: TransferPolicy = DEFAULT_TRANSFER_POLICY): number {
     const payload = Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
     return policy.baseTimeoutMs + Math.ceil(payload * 1000 / policy.minBytesPerSecond);
+}
+
+/** Per-chunk ceiling so active streams renew without waiting a multi-minute floor. */
+function downloadChunkTimeoutMs(remainingBytes: number, policy: TransferPolicy): number {
+    return Math.min(transferTimeoutMs(remainingBytes, policy), policy.baseTimeoutMs * 2);
+}
+
+class HttpStatusDownloadError extends Error {
+    constructor(readonly status: number, route: string, body: string) {
+        super(`HTTP ${status} downloading ${route}${body ? `: ${body}` : ''}`);
+        this.name = 'HttpStatusDownloadError';
+    }
 }
 
 /**
@@ -578,8 +591,10 @@ export class BaseAPI {
     protected async download(route:string) {
         if (this.identity===undefined) { return Promise.reject(); }
 
-        let content: Buffer[] = [];
-        while(true) {
+        const MAX_HTTP_RETRIES = 2;
+        const retryBaseDelayMs = this.transferPolicy.retryBaseDelayMs ?? 1000;
+
+        for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
             const deadline = new TransferDeadline(this.transferPolicy.baseTimeoutMs);
             try {
                 const res = await fetch(this.url+route, {
@@ -590,22 +605,72 @@ export class BaseAPI {
                         'Cookie': this.identity.cookies,
                     }
                 });
-                deadline.reset(transferTimeoutMs(responseContentLength(res), this.transferPolicy));
-                if (res.status===200) {
-                    content.push(Buffer.from(await res.arrayBuffer()));
-                    break;
-                }
-                else if (res.status===206) {
-                    content.push(Buffer.from(await res.arrayBuffer()));
+                if (res.status === 200 || res.status === 206) {
+                    const announcedLength = responseContentLength(res);
+                    deadline.reset(downloadChunkTimeoutMs(announcedLength, this.transferPolicy));
+                    const chunks: Buffer[] = [];
+                    let receivedBytes = 0;
+                    const body = res.body as unknown as AsyncIterable<Uint8Array> | null;
+                    if (body && typeof body[Symbol.asyncIterator] === 'function') {
+                        for await (const rawChunk of body) {
+                            const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+                            if (chunk.length > 0) {
+                                chunks.push(chunk);
+                                receivedBytes += chunk.length;
+                                const remaining = announcedLength > 0
+                                    ? Math.max(0, announcedLength - receivedBytes)
+                                    : 0;
+                                deadline.reset(downloadChunkTimeoutMs(remaining, this.transferPolicy));
+                            }
+                        }
+                    } else {
+                        const buf = Buffer.from(await res.arrayBuffer());
+                        receivedBytes = buf.length;
+                        if (buf.length > 0) {
+                            chunks.push(buf);
+                        }
+                    }
+                    if (
+                        res.status === 200
+                        && announcedLength > 0
+                        && !res.headers.get('content-encoding')
+                        && receivedBytes !== announcedLength
+                    ) {
+                        throw new Error(
+                            `Truncated download for ${route}: received ${receivedBytes} of ${announcedLength} bytes`,
+                        );
+                    }
+                    return Buffer.concat(chunks);
+                } else if (this.isTransientError(res.status)) {
+                    const errorBody = await res.text().catch(() => '');
+                    if (attempt < MAX_HTTP_RETRIES) {
+                        const delayMs = Math.min(retryBaseDelayMs * Math.pow(2, attempt), 4000);
+                        console.log(`HTTP ${res.status} downloading ${route}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
+                        await new Promise(r => setTimeout(r, delayMs));
+                        continue;
+                    }
+                    throw new HttpStatusDownloadError(res.status, route, errorBody);
                 } else {
-                    break;
+                    const errorBody = await res.text().catch(() => '');
+                    throw new HttpStatusDownloadError(res.status, route, errorBody);
                 }
+            } catch (err: any) {
+                if (err instanceof HttpStatusDownloadError) {
+                    throw err;
+                }
+                const errMsg = err?.message || String(err);
+                if (this.isTransientError(undefined, errMsg) && attempt < MAX_HTTP_RETRIES) {
+                    const delayMs = Math.min(retryBaseDelayMs * Math.pow(2, attempt), 4000);
+                    console.log(`HTTP download error on ${route}: ${errMsg}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_HTTP_RETRIES})`);
+                    await new Promise(r => setTimeout(r, delayMs));
+                    continue;
+                }
+                throw err;
             } finally {
                 deadline.clear();
             }
-        };
-
-        return Buffer.concat(content);
+        }
+        throw new Error(`Download failed after ${MAX_HTTP_RETRIES + 1} attempts: ${route}`);
     }
 
     async logout(identity:Identity): Promise<ResponseSchema> {

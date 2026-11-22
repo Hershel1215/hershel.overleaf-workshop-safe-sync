@@ -180,6 +180,58 @@ describe('VirtualFileSystem retirement fence', () => {
         }
     });
 
+    it('probes recovery after cooldown without repeating the connection-lost prompt', async () => {
+        const events = [];
+        const VFS = loadVirtualFileSystem(async () => ({}), events);
+        let joins = 0;
+        let failSettings = true;
+        let socketInits = 0;
+        const vfs = createVfs(VFS, {
+            joinProject: async () => { joins++; return {}; },
+            getProjectSettings: async () => {
+                if (failSettings) {
+                    throw new Error('settings transport unavailable');
+                }
+                return {settings: {}};
+            },
+        }, events);
+        vfs.socket.init = () => {
+            socketInits++;
+            vfs.socket.needsReinit = false;
+        };
+        const realSetTimeout = global.setTimeout;
+        global.setTimeout = (fn, _ms, ...args) => realSetTimeout(fn, 0, ...args);
+        try {
+            await assert.rejects(vfs.init());
+            assert.strictEqual(joins, 5);
+            assert.strictEqual(events.filter(e => e === 'connection-error').length, 1);
+
+            // Within the 60s cooldown, init() still refuses immediately.
+            await assert.rejects(vfs.init());
+            assert.strictEqual(joins, 5);
+
+            // After cooldown expires, a failing probe re-enters cooldown without spamming toasts.
+            vfs.initializationErrorAt = Date.now() - 61_000;
+            await assert.rejects(vfs.init());
+            assert.strictEqual(joins, 6);
+            assert.strictEqual(socketInits, 1);
+            assert.strictEqual(events.filter(e => e === 'connection-error').length, 1);
+
+            // Once the server recovers and cooldown passes, the next probe succeeds and clears error state.
+            failSettings = false;
+            vfs.initializationErrorAt = Date.now() - 61_000;
+            await vfs.init();
+            assert.strictEqual(joins, 7);
+            assert.strictEqual(socketInits, 2);
+            assert.strictEqual(vfs.connectionReady, true);
+            assert.strictEqual(vfs.initializationError, undefined);
+            assert.strictEqual(vfs.initializationErrorAt, undefined);
+            assert.strictEqual(vfs.retryConnection, 0);
+        } finally {
+            global.setTimeout = realSetTimeout;
+        }
+    });
+
     it('does not append another remote watcher when rebuilding a socket', async () => {
         const events = [];
         const VFS = loadVirtualFileSystem(async () => ({}), events);
@@ -724,9 +776,20 @@ describe('VirtualFileSystem retirement fence', () => {
             const {isTransientDocumentAdmissionFailure} = require('../out/core/remoteFileSystemProvider');
             const {DocumentSessionRetiredError} = require('../out/sync/durableDocumentSession');
             const reset = Object.assign(new Error('read'), {code: 'ECONNRESET'});
+            const abortedTimeout = new Error('The operation was aborted due to timeout');
+            abortedTimeout.name = 'TimeoutError';
+            const fetchBodyTimeout = new TypeError('fetch failed', {
+                cause: Object.assign(new Error('Body Timeout Error'), {code: 'UND_ERR_BODY_TIMEOUT'}),
+            });
+            const recoveryInvalidated = new Error(
+                'Document membership transport was invalidated during project recovery',
+            );
 
             assert.strictEqual(isTransientDocumentAdmissionFailure(joinTimeout('joinDoc')), true);
             assert.strictEqual(isTransientDocumentAdmissionFailure(reset), true);
+            assert.strictEqual(isTransientDocumentAdmissionFailure(abortedTimeout), true);
+            assert.strictEqual(isTransientDocumentAdmissionFailure(fetchBodyTimeout), true);
+            assert.strictEqual(isTransientDocumentAdmissionFailure(recoveryInvalidated), true);
             assert.strictEqual(isTransientDocumentAdmissionFailure(
                 new Error('Remote document session is retiring for replica handoff'),
             ), false);

@@ -8,6 +8,7 @@ import {
     DocumentProjectionChange,
     DocumentRecoveryIsolationError,
     EMPTY_REMOTE_FOLDER_TREE_HASH,
+    FileRefEntity,
     IsolatedDocumentRecovery,
     PendingDocumentRecovery,
     PreparedDocumentRecovery,
@@ -88,6 +89,8 @@ const TEXT_DEBOUNCE_MS = 350;
 const PROJECTION_OBSERVATION_RETRY_MS = 25;
 const BINARY_STABILITY_MS = 500;
 const LOCAL_DELETE_STABILITY_MS = 500;
+const REMOTE_FILE_SCAN_CONCURRENCY = 2;
+const MAX_RECONCILE_RETRY_DELAY_MS = 30_000;
 const REMOTE_DELETE_STABILITY_MS = 500;
 const REMOTE_CAPACITY_RETRY_MS = 30000;
 const MAX_RECONCILE_ACTIONS = 100;
@@ -297,6 +300,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private reconcileStarts = 0;
     /** Consecutive transient-failure retries, for the retry backoff. */
     private transientRetryStreak = 0;
+    /** Consecutive reconcile failures, for bounded exponential retry backoff. */
+    private reconcileRetryStreak = 0;
     private textIsolationEvents = 0;
     private projectPauseEvents = 0;
     private handoffInProgress = false;
@@ -3622,6 +3627,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return delay;
     }
 
+    private nextReconcileRetryDelay(): number {
+        const streak = this.reconcileRetryStreak ?? 0;
+        const delay = Math.min(1000 * 2 ** streak, MAX_RECONCILE_RETRY_DELAY_MS);
+        this.reconcileRetryStreak = streak + 1;
+        return delay;
+    }
+
     private scheduleReconcile(reason: string, delayMs = TEXT_DEBOUNCE_MS): void {
         if (this.disposed || this.handoffInProgress || this.pausedError) {
             return;
@@ -3675,6 +3687,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // condition the last retry was backing off from is
                         // over, so the next one starts from the fast delay.
                         this.transientRetryStreak = 0;
+                        this.reconcileRetryStreak = 0;
                     } catch (error) {
                         await this.handleReconcileError(error);
                     }
@@ -5259,6 +5272,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async scanRemote(scope?: string): Promise<Map<string, ReplicaSnapshot>> {
         const result = new Map<string, ReplicaSnapshot>();
         const entities = this.vfs.walk(entity => entity._type !== 'outputs');
+        const baselineFileByEntityId = new Map<string, BaselineEntry>();
+        if (this.state?.initialized) {
+            for (const entry of Object.values(this.state.entries)) {
+                if (entry.fileType === 'file' && entry.entityId) {
+                    baselineFileByEntityId.set(entry.entityId, entry);
+                }
+            }
+        }
+        const lastScanFileByEntityId = new Map<string, ReplicaSnapshot>();
+        if (this.lastScan?.remote) {
+            for (const entry of this.lastScan.remote.values()) {
+                if (entry.fileType === 'file' && entry.entityId && entry.content !== undefined) {
+                    lastScanFileByEntityId.set(entry.entityId, entry);
+                }
+            }
+        }
         const pendingFiles: Array<() => Promise<ReplicaSnapshot>> = [];
         const flushFiles = async (): Promise<void> => {
             const snapshots = await Promise.all(pendingFiles.map(read => read()));
@@ -5277,6 +5306,45 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
             this.assertSafePath(filePath);
             if (entity._type === 'file') {
+                const fileRef = entity as FileRefEntity;
+                const canReuseCachedBinary = scope === undefined
+                    && this.state?.initialized === true
+                    && !isPathConflicted(filePath, this.state)
+                    && this.state.pendingAction?.path !== filePath
+                    && this.state.pendingAction?.targetPath !== filePath
+                    && (fileRef.linkedFileData === null || fileRef.linkedFileData === undefined)
+                    && Boolean(entity._id);
+                if (canReuseCachedBinary) {
+                    const baselineEntry = baselineFileByEntityId.get(entity._id);
+                    if (baselineEntry && typeof this.stateStore?.readBaseline === 'function') {
+                        const cachedBytes = await this.stateStore.readBaseline(baselineEntry.hash);
+                        if (cachedBytes && contentHash(cachedBytes) === baselineEntry.hash) {
+                            result.set(filePath, {
+                                path: filePath,
+                                fileType: 'file',
+                                entityId: entity._id,
+                                hash: baselineEntry.hash,
+                                content: cachedBytes,
+                                text: undefined,
+                                readonly: entity.readonly,
+                            });
+                            continue;
+                        }
+                    }
+                    const previous = lastScanFileByEntityId.get(entity._id);
+                    if (previous?.content && contentHash(previous.content) === previous.hash) {
+                        result.set(filePath, {
+                            path: filePath,
+                            fileType: 'file',
+                            entityId: entity._id,
+                            hash: previous.hash,
+                            content: previous.content,
+                            text: undefined,
+                            readonly: entity.readonly,
+                        });
+                        continue;
+                    }
+                }
                 pendingFiles.push(async () => {
                     const snapshot = this.state && isPathConflicted(filePath, this.state)
                         ? await this.vfs.readAuthoritativeFileWithoutRecovery(this.remoteUri(filePath))
@@ -5293,7 +5361,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         readonly: entity.readonly,
                     };
                 });
-                if (pendingFiles.length >= 6) {
+                if (pendingFiles.length >= REMOTE_FILE_SCAN_CONCURRENCY) {
                     await flushFiles();
                 }
                 continue;
@@ -8529,7 +8597,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (this.isTransientFailure(normalized)) {
             this.currentActionPath = undefined;
             this.output.appendLine(`[retry] ${normalized.message}`);
-            this.scheduleReconcile(normalized.message, 1000);
+            this.scheduleReconcile(normalized.message, this.nextReconcileRetryDelay());
             return;
         }
         const filePath = actionPath ?? this.pathFromError(normalized);
@@ -8540,7 +8608,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // Keep the queue live and require an explicit report for diagnosis.
         this.currentActionPath = undefined;
         this.output.appendLine(`[retry] unscoped safe-sync error: ${normalized.message}`);
-        this.scheduleReconcile(normalized.message, 1000);
+        this.scheduleReconcile(normalized.message, this.nextReconcileRetryDelay());
     }
 
     private async isolateRetainedRemoteCandidate(
@@ -8674,24 +8742,61 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private isTransientFailure(error: Error): boolean {
-        const code = (error as NodeJS.ErrnoException).code;
-        return [
+        const transientNames = new Set([
+            'TimeoutError',
+            'SocketIOTimeoutError',
+            'TransportInvalidatedError',
+        ]);
+        const transientCodes = new Set([
             'ECONNRESET',
             'ECONNREFUSED',
             'ETIMEDOUT',
             'EAI_AGAIN',
             'ENETUNREACH',
+            'ENOTFOUND',
             'EPIPE',
-        ].includes(code ?? '')
-            || /timed out|network|socket|disconnected|temporarily unavailable|HTTP [45]\d\d/i.test(
-                error.message,
-            )
-            // The Overleaf API reports a failed request as "<status>: <body>",
-            // with no "HTTP" for the test above to find, so a 500 read as an
-            // ordinary path failure. The server refusing one attempt is not a
-            // divergence: isolating it archived a conflict and demanded a
-            // manual resolution for content that never forked.
-            || /(?:^|:\s)[45]\d\d:\s/.test(error.message);
+            'UND_ERR_CONNECT_TIMEOUT',
+            'UND_ERR_HEADERS_TIMEOUT',
+            'UND_ERR_BODY_TIMEOUT',
+            'UND_ERR_SOCKET',
+            'UND_ERR_ABORTED',
+        ]);
+        const transientMessage = /\btimeout\b|timed out|aborted due to timeout|fetch failed|truncated download|transport was invalidated|transport changed during project initialization|waiting for project reconnection|connection lost|network|socket|disconnected|temporarily unavailable|HTTP [45]\d\d/i;
+        const visited = new Set<unknown>();
+        let current: unknown = error;
+        for (let depth = 0; depth <= 4 && current !== null && current !== undefined; depth++) {
+            if (visited.has(current)) {
+                break;
+            }
+            visited.add(current);
+            if (typeof current === 'object') {
+                const record = current as {name?: unknown; code?: unknown; message?: unknown; cause?: unknown};
+                if (typeof record.name === 'string' && transientNames.has(record.name)) {
+                    return true;
+                }
+                if (typeof record.code === 'string' && transientCodes.has(record.code)) {
+                    return true;
+                }
+                if (
+                    typeof record.message === 'string'
+                    && (
+                        transientMessage.test(record.message)
+                        // The Overleaf API reports a failed request as "<status>: <body>",
+                        // with no "HTTP" for the test above to find, so a 500 read as an
+                        // ordinary path failure. The server refusing one attempt is not a
+                        // divergence: isolating it archived a conflict and demanded a
+                        // manual resolution for content that never forked.
+                        || /(?:^|:\s)[45]\d\d:\s/.test(record.message)
+                    )
+                ) {
+                    return true;
+                }
+                current = record.cause;
+            } else {
+                break;
+            }
+        }
+        return false;
     }
 
     private pathFromError(error: Error): string | undefined {
